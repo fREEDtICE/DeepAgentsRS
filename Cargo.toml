@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/deepagents",
+  "crates/deepagents-cli",
+  "crates/deepagents-acp",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/deepagents"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+chrono = { version = "0.4", features = ["clock"] }
