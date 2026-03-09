@@ -1,8 +1,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
+use crate::approval::{ApprovalPolicy, ExecutionMode};
+use crate::audit::AuditSink;
+use crate::provider::ProviderToolCall;
 use crate::state::AgentState;
 use crate::types::Message;
+use crate::DeepAgent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -26,6 +31,8 @@ pub struct ToolResultRecord {
     pub output: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,4 +74,42 @@ fn default_provider_timeout_ms() -> u64 {
 #[async_trait]
 pub trait Runtime: Send + Sync {
     async fn run(&self, messages: Vec<Message>) -> RunOutput;
+}
+
+pub struct ToolCallContext<'a> {
+    pub agent: &'a DeepAgent,
+    pub tool_call: &'a ProviderToolCall,
+    pub call_id: &'a str,
+    pub messages: &'a mut Vec<Message>,
+    pub state: &'a mut AgentState,
+    pub root: &'a str,
+    pub mode: ExecutionMode,
+    pub approval: Option<&'a Arc<dyn ApprovalPolicy>>,
+    pub audit: Option<&'a Arc<dyn AuditSink>>,
+    pub runtime_middlewares: &'a [Arc<dyn RuntimeMiddleware>],
+    pub task_depth: usize,
+}
+
+pub struct HandledToolCall {
+    pub output: serde_json::Value,
+    pub error: Option<String>,
+}
+
+#[async_trait]
+pub trait RuntimeMiddleware: Send + Sync {
+    async fn before_run(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
+        Ok(messages)
+    }
+
+    async fn patch_provider_step(
+        &self,
+        step: crate::provider::ProviderStep,
+        _next_call_id: &mut u64,
+    ) -> anyhow::Result<crate::provider::ProviderStep> {
+        Ok(step)
+    }
+
+    async fn handle_tool_call(&self, _ctx: &mut ToolCallContext<'_>) -> anyhow::Result<Option<HandledToolCall>> {
+        Ok(None)
+    }
 }

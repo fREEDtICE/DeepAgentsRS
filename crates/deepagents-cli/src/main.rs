@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use deepagents::approval::{redact_command, ApprovalDecision, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode};
 use deepagents::audit::{AuditEvent, AuditSink};
+use deepagents::memory::MemoryStore;
 use deepagents::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
@@ -47,10 +48,83 @@ enum Cmd {
         mock_script: Option<String>,
         #[arg(long)]
         plugin: Vec<String>,
+        #[arg(long = "skills-source")]
+        skills_source: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        skills_skip_invalid: bool,
+        #[arg(long = "memory-source")]
+        memory_source: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        memory_allow_host_paths: bool,
+        #[arg(long, default_value_t = 30000)]
+        memory_max_injected_chars: usize,
+        #[arg(long, default_value_t = false)]
+        memory_disable: bool,
         #[arg(long, default_value_t = 8)]
         max_steps: usize,
         #[arg(long, default_value_t = 1000)]
         provider_timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCmd {
+    Init {
+        dir: String,
+    },
+    Validate {
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    List {
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCmd {
+    Put {
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        value: String,
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    Query {
+        #[arg(long)]
+        prefix: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        store: Option<String>,
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    Compact {
+        #[arg(long)]
+        store: Option<String>,
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
@@ -312,6 +386,12 @@ async fn main() -> Result<()> {
             provider,
             mock_script,
             plugin,
+            skills_source,
+            skills_skip_invalid,
+            memory_source,
+            memory_allow_host_paths,
+            memory_max_injected_chars,
+            memory_disable,
             max_steps,
             provider_timeout_ms,
             pretty,
@@ -337,6 +417,39 @@ async fn main() -> Result<()> {
                 ));
             }
 
+            let subagent_registry = deepagents::subagents::builtins::default_registry()?;
+            let subagent_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+                std::sync::Arc::new(deepagents::subagents::SubAgentMiddleware::new(subagent_registry));
+            let patch_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+                std::sync::Arc::new(deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware::new());
+            let mut runtime_middlewares: Vec<std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware>> =
+                vec![patch_mw];
+
+            if !memory_disable {
+                let sources = if memory_source.is_empty() {
+                    vec![".deepagents/AGENTS.md".to_string(), "AGENTS.md".to_string()]
+                } else {
+                    memory_source
+                };
+                let mut options = deepagents::runtime::MemoryLoadOptions::default();
+                options.allow_host_paths = memory_allow_host_paths;
+                options.max_injected_chars = memory_max_injected_chars;
+                let memory_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+                    std::sync::Arc::new(deepagents::runtime::MemoryMiddleware::new(root.clone(), sources, options));
+                runtime_middlewares.push(memory_mw);
+            }
+
+            if !skills_source.is_empty() {
+                let options = deepagents::skills::loader::SkillsLoadOptions {
+                    skip_invalid_sources: skills_skip_invalid,
+                    strict: true,
+                };
+                let skills_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+                    std::sync::Arc::new(deepagents::runtime::SkillsMiddleware::new(skills_source, options));
+                runtime_middlewares.push(skills_mw);
+            }
+            runtime_middlewares.push(subagent_mw);
+
             let runtime = deepagents::runtime::simple::SimpleRuntime::new(
                 agent,
                 provider,
@@ -349,12 +462,17 @@ async fn main() -> Result<()> {
                 audit_sink,
                 root.clone(),
                 mode,
-            );
+            )
+            .with_runtime_middlewares(runtime_middlewares);
 
             let out = runtime
                 .run(vec![deepagents::types::Message {
                     role: "user".to_string(),
                     content: input,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    status: None,
                 }])
                 .await;
 
@@ -368,7 +486,162 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("runtime_error"));
             }
         }
+        Cmd::Skill { cmd } => match cmd {
+            SkillCmd::Init { dir } => {
+                init_skill_template(&dir)?;
+            }
+            SkillCmd::Validate { sources, pretty } => {
+                let loaded = load_skills_from_sources(&sources)?;
+                let out = serde_json::to_value(&loaded)?;
+                print_json_value(out, pretty)?;
+            }
+            SkillCmd::List { sources, pretty } => {
+                let loaded = load_skills_from_sources(&sources)?;
+                let out = serde_json::json!({
+                    "skills": loaded.metadata,
+                    "tools": loaded.tools,
+                    "diagnostics": loaded.diagnostics
+                });
+                print_json_value(out, pretty)?;
+            }
+        },
+        Cmd::Memory { cmd } => match cmd {
+            MemoryCmd::Put {
+                key,
+                value,
+                tag,
+                store,
+                pretty,
+            } => {
+                if looks_like_secret(&value) {
+                    return Err(anyhow!("invalid_request: value looks like a secret"));
+                }
+                let store_path = resolve_memory_store_path(&root, store.as_deref());
+                let store = deepagents::memory::FileMemoryStore::new(store_path);
+                store.load().await?;
+                store
+                    .put(deepagents::memory::MemoryEntry {
+                        key,
+                        value,
+                        tags: tag,
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                        last_accessed_at: String::new(),
+                        access_count: 0,
+                    })
+                    .await?;
+                let report = store.evict_if_needed().await?;
+                store.flush().await?;
+                let _ = store.render_agents_md().await;
+                let out = serde_json::json!({ "status": "ok", "eviction": report });
+                print_json_value(out, pretty)?;
+            }
+            MemoryCmd::Query {
+                prefix,
+                tag,
+                limit,
+                store,
+                pretty,
+            } => {
+                let store_path = resolve_memory_store_path(&root, store.as_deref());
+                let store = deepagents::memory::FileMemoryStore::new(store_path);
+                store.load().await?;
+                let entries = store
+                    .query(deepagents::memory::MemoryQuery {
+                        prefix,
+                        tag,
+                        limit: Some(limit),
+                    })
+                    .await?;
+                let out = serde_json::json!({ "entries": entries });
+                print_json_value(out, pretty)?;
+            }
+            MemoryCmd::Compact { store, pretty } => {
+                let store_path = resolve_memory_store_path(&root, store.as_deref());
+                let store = deepagents::memory::FileMemoryStore::new(store_path);
+                store.load().await?;
+                let report = store.evict_if_needed().await?;
+                store.flush().await?;
+                let _ = store.render_agents_md().await;
+                let out = serde_json::json!({ "status": "ok", "eviction": report });
+                print_json_value(out, pretty)?;
+            }
+        },
     }
+    Ok(())
+}
+
+fn resolve_memory_store_path(root: &str, store: Option<&str>) -> std::path::PathBuf {
+    if let Some(s) = store {
+        return std::path::PathBuf::from(s);
+    }
+    std::path::PathBuf::from(root)
+        .join(".deepagents")
+        .join("memory_store.json")
+}
+
+fn looks_like_secret(s: &str) -> bool {
+    let v = s.to_lowercase();
+    if v.contains("begin private key") {
+        return true;
+    }
+    if v.contains("aws_secret_access_key") {
+        return true;
+    }
+    if v.contains("api_key") && v.contains("=") {
+        return true;
+    }
+    if s.trim_start().starts_with("sk-") {
+        return true;
+    }
+    false
+}
+
+fn load_skills_from_sources(sources: &[String]) -> Result<deepagents::skills::LoadedSkills> {
+    if sources.is_empty() {
+        return Err(anyhow!("--source is required"));
+    }
+    let options = deepagents::skills::loader::SkillsLoadOptions {
+        skip_invalid_sources: false,
+        strict: true,
+    };
+    Ok(deepagents::skills::loader::load_skills(sources, options)?)
+}
+
+fn print_json_value(value: serde_json::Value, pretty: bool) -> Result<()> {
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", serde_json::to_string(&value)?);
+    }
+    Ok(())
+}
+
+fn init_skill_template(dir: &str) -> Result<()> {
+    let path = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&path)?;
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "sample-skill".to_string())
+        .to_lowercase()
+        .replace(' ', "-");
+    let skill_md = format!(
+        "---\nname: {}\ndescription: Describe what this skill does and when to use it.\n---\n\n# {}\n\n## When to Use\n- \n\n## Steps\n- \n",
+        name, name
+    );
+    let tools_json = serde_json::json!({
+        "tools": [{
+            "name": name,
+            "description": "Describe the tool behavior.",
+            "input_schema": { "type": "object", "properties": { "file_path": { "type": "string" } }, "required": [] },
+            "steps": [{ "tool_name": "read_file", "arguments": { "file_path": "README.md", "limit": 20 } }],
+            "policy": { "allow_filesystem": true, "allow_execute": false, "allow_network": false }
+        }]
+    });
+    std::fs::write(path.join("SKILL.md"), skill_md)?;
+    std::fs::write(path.join("tools.json"), serde_json::to_vec_pretty(&tools_json)?)?;
     Ok(())
 }
 

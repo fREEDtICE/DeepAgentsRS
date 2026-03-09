@@ -5,7 +5,9 @@ pub mod middleware;
 pub mod provider;
 pub mod runtime;
 pub mod skills;
+pub mod memory;
 pub mod state;
+pub mod subagents;
 pub mod tools;
 pub mod types;
 

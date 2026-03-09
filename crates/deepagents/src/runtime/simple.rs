@@ -8,8 +8,11 @@ use crate::approval::{redact_command, ApprovalDecision, ApprovalPolicy, Approval
 use crate::audit::{AuditEvent, AuditSink};
 use crate::provider::{Provider, ProviderRequest, ProviderStep, ProviderToolCall};
 use crate::runtime::protocol::{
-    RunOutput, Runtime, RuntimeConfig, RuntimeError, ToolCallRecord, ToolResultRecord, ToolSpec,
+    HandledToolCall, RunOutput, Runtime, RuntimeConfig, RuntimeError, RuntimeMiddleware, ToolCallContext, ToolCallRecord,
+    ToolResultRecord, ToolSpec,
 };
+use crate::runtime::patch_tool_calls::tool_calls_from_provider_calls;
+use crate::runtime::tool_compat::{normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages, NormalizedToolCall};
 use crate::skills::{SkillCall, SkillPlugin};
 use crate::state::AgentState;
 use crate::types::Message;
@@ -31,6 +34,9 @@ pub struct SimpleRuntime {
     audit: Option<Arc<dyn AuditSink>>,
     root: String,
     mode: ExecutionMode,
+    runtime_middlewares: Vec<Arc<dyn RuntimeMiddleware>>,
+    initial_state: AgentState,
+    task_depth: usize,
 }
 
 impl SimpleRuntime {
@@ -53,20 +59,62 @@ impl SimpleRuntime {
             audit,
             root,
             mode,
+            runtime_middlewares: Vec::new(),
+            initial_state: AgentState::default(),
+            task_depth: 0,
         }
+    }
+
+    pub fn with_runtime_middlewares(mut self, middlewares: Vec<Arc<dyn RuntimeMiddleware>>) -> Self {
+        self.runtime_middlewares = middlewares;
+        self
+    }
+
+    pub fn with_initial_state(mut self, state: AgentState) -> Self {
+        self.initial_state = state;
+        self
+    }
+
+    pub fn with_task_depth(mut self, depth: usize) -> Self {
+        self.task_depth = depth;
+        self
     }
 }
 
 #[async_trait]
 impl Runtime for SimpleRuntime {
     async fn run(&self, mut messages: Vec<Message>) -> RunOutput {
-        let mut state = AgentState::default();
+        messages = normalize_messages(messages);
+        let mut state = self.initial_state.clone();
         let mut tool_calls: Vec<ToolCallRecord> = Vec::new();
         let mut tool_results: Vec<ToolResultRecord> = Vec::new();
         let mut next_call_id = 1u64;
 
+        if !self.runtime_middlewares.is_empty() {
+            for mw in &self.runtime_middlewares {
+                match mw.before_run(messages, &mut state).await {
+                    Ok(m) => messages = m,
+                    Err(e) => {
+                        return RunOutput {
+                            final_text: String::new(),
+                            tool_calls,
+                            tool_results,
+                            state,
+                            error: Some(RuntimeError {
+                                code: "middleware_error".to_string(),
+                                message: e.to_string(),
+                            }),
+                            trace: Some(serde_json::json!({ "terminated_at_step": 0, "reason": "middleware_before_run_error" })),
+                        };
+                    }
+                }
+            }
+        }
+
+        tool_results = tool_results_from_messages(&messages);
+
         for step_idx in 0..self.config.max_steps {
-            let tool_specs = self.agent_tools();
+            let tool_specs = self.agent_tools(&state);
             let skill_specs = self
                 .skills
                 .iter()
@@ -81,7 +129,7 @@ impl Runtime for SimpleRuntime {
                 last_tool_results: tool_results.clone(),
             };
 
-            let provider_step = match timeout(
+            let mut provider_step = match timeout(
                 Duration::from_millis(self.config.provider_timeout_ms),
                 self.provider.step(req),
             )
@@ -116,7 +164,38 @@ impl Runtime for SimpleRuntime {
                 }
             };
 
+            if !self.runtime_middlewares.is_empty() {
+                for mw in &self.runtime_middlewares {
+                    match mw.patch_provider_step(provider_step, &mut next_call_id).await {
+                        Ok(s) => provider_step = s,
+                        Err(e) => {
+                            return RunOutput {
+                                final_text: String::new(),
+                                tool_calls,
+                                tool_results,
+                                state,
+                                error: Some(RuntimeError {
+                                    code: "middleware_error".to_string(),
+                                    message: e.to_string(),
+                                }),
+                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_patch_provider_step_error" })),
+                            };
+                        }
+                    }
+                }
+            }
+
             match provider_step {
+                ProviderStep::AssistantMessage { text } => {
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: text,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        status: None,
+                    });
+                }
                 ProviderStep::FinalText { text } => {
                     return RunOutput {
                         final_text: text,
@@ -169,6 +248,14 @@ impl Runtime for SimpleRuntime {
                     .await;
                 }
                 ProviderStep::ToolCalls { calls } => {
+                    messages.push(Message {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        tool_calls: Some(tool_calls_from_provider_calls(&calls)),
+                        tool_call_id: None,
+                        name: None,
+                        status: None,
+                    });
                     self.execute_calls(
                         calls,
                         &mut messages,
@@ -197,7 +284,7 @@ impl Runtime for SimpleRuntime {
 }
 
 impl SimpleRuntime {
-    fn agent_tools(&self) -> Vec<ToolSpec> {
+    fn agent_tools(&self, state: &AgentState) -> Vec<ToolSpec> {
         let mut out = Vec::new();
         for (name, desc) in [
             ("ls", "Lists files and directories in a given path."),
@@ -208,11 +295,22 @@ impl SimpleRuntime {
             ("glob", "Glob match file paths."),
             ("grep", "Search for a literal text pattern across files."),
             ("execute", "Executes a shell command in an isolated sandbox environment."),
+            ("task", "Launch a sub-agent and assign a task to it."),
         ] {
             out.push(ToolSpec {
                 name: name.to_string(),
                 description: desc.to_string(),
             });
+        }
+        if let Some(v) = state.extra.get("skills_tools") {
+            if let Ok(skills) = serde_json::from_value::<Vec<crate::skills::SkillToolSpec>>(v.clone()) {
+                for s in skills {
+                    out.push(ToolSpec {
+                        name: s.name,
+                        description: s.description,
+                    });
+                }
+            }
         }
         out
     }
@@ -240,35 +338,120 @@ impl SimpleRuntime {
         next_call_id: &mut u64,
     ) {
         for call in calls {
-            let call_id = call
-                .call_id
-                .clone()
-                .unwrap_or_else(|| {
-                    let id = format!("call-{}", *next_call_id);
-                    *next_call_id += 1;
-                    id
-                });
+            let normalized = normalize_tool_call_for_execution(call, next_call_id);
+            let (call, error) = match normalized {
+                NormalizedToolCall::Valid(c) => (c, None),
+                NormalizedToolCall::Invalid { call, error } => (call, Some(error)),
+            };
 
-            if !call.arguments.is_object() {
+            let call_id = call.call_id.clone().unwrap_or_default();
+            let tool_name = call.tool_name.clone();
+
+            if let Some(err) = error {
                 tool_calls.push(ToolCallRecord {
-                    tool_name: call.tool_name.clone(),
+                    tool_name: tool_name.clone(),
                     arguments: call.arguments.clone(),
                     call_id: Some(call_id.clone()),
                 });
                 tool_results.push(ToolResultRecord {
-                    tool_name: call.tool_name.clone(),
-                    call_id: Some(call_id),
+                    tool_name: tool_name.clone(),
+                    call_id: Some(call_id.clone()),
                     output: serde_json::Value::Null,
-                    error: Some("invalid_tool_call: arguments must be object".to_string()),
+                    error: Some(err.clone()),
+                    status: Some("error".to_string()),
+                });
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: serde_json::to_string(&serde_json::json!({
+                        "tool_call_id": call_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "status": "error",
+                        "error": err.clone(),
+                        "content": err,
+                    }))
+                    .unwrap_or_default(),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                    name: Some(tool_name),
+                    status: Some("error".to_string()),
                 });
                 continue;
             }
 
             tool_calls.push(ToolCallRecord {
-                tool_name: call.tool_name.clone(),
+                tool_name: tool_name.clone(),
                 arguments: call.arguments.clone(),
                 call_id: Some(call_id.clone()),
             });
+
+            if !self.runtime_middlewares.is_empty() {
+                let mut ctx = ToolCallContext {
+                    agent: &self.agent,
+                    tool_call: &call,
+                    call_id: &call_id,
+                    messages,
+                    state,
+                    root: &self.root,
+                    mode: self.mode,
+                    approval: self.approval.as_ref(),
+                    audit: self.audit.as_ref(),
+                    runtime_middlewares: &self.runtime_middlewares,
+                    task_depth: self.task_depth,
+                };
+                let mut handled: Option<HandledToolCall> = None;
+                for mw in &self.runtime_middlewares {
+                    match mw.handle_tool_call(&mut ctx).await {
+                        Ok(Some(h)) => {
+                            handled = Some(h);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            handled = Some(HandledToolCall {
+                                output: serde_json::Value::Null,
+                                error: Some(format!("middleware_error: {e}")),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if let Some(HandledToolCall { output, error }) = handled {
+                    let status = if error.is_some() { "error" } else { "success" }.to_string();
+                    let tool_name = tool_name.clone();
+                    let cid = call_id.clone();
+                    let content = if let Some(e) = &error {
+                        e.clone()
+                    } else if let Some(s) = output.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                        s.to_string()
+                    } else {
+                        serde_json::to_string(&output).unwrap_or_default()
+                    };
+                    tool_results.push(ToolResultRecord {
+                        tool_name: tool_name.clone(),
+                        call_id: Some(cid.clone()),
+                        output: output.clone(),
+                        error: error.clone(),
+                        status: Some(status.clone()),
+                    });
+                    messages.push(Message {
+                        role: "tool".to_string(),
+                        content: serde_json::to_string(&serde_json::json!({
+                            "tool_call_id": cid.clone(),
+                            "tool_name": tool_name.clone(),
+                            "status": status.clone(),
+                            "output": if error.is_some() { serde_json::Value::Null } else { output },
+                            "error": error,
+                            "content": content,
+                        }))
+                        .unwrap_or_default(),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        name: Some(tool_name.clone()),
+                        status: Some(status.clone()),
+                    });
+                    continue;
+                }
+            }
 
             if call.tool_name == "execute" {
                 if let Some(policy) = &self.approval {
@@ -309,20 +492,32 @@ impl SimpleRuntime {
                                             duration_ms: Some(duration_ms),
                                         });
                                     }
+                                    let content = if let Some(s) = out.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                                        s.to_string()
+                                    } else {
+                                        serde_json::to_string(&out).unwrap_or_default()
+                                    };
                                     tool_results.push(ToolResultRecord {
-                                        tool_name: call.tool_name.clone(),
+                                        tool_name: tool_name.clone(),
                                         call_id: Some(call_id.clone()),
                                         output: out.clone(),
                                         error: None,
+                                        status: Some("success".to_string()),
                                     });
                                     messages.push(Message {
                                         role: "tool".to_string(),
                                         content: serde_json::to_string(&serde_json::json!({
-                                            "tool_name": call.tool_name,
-                                            "call_id": call_id,
-                                            "output": out
+                                            "tool_call_id": call_id.clone(),
+                                            "tool_name": tool_name.clone(),
+                                            "status": "success",
+                                            "output": out,
+                                            "content": content,
                                         }))
                                         .unwrap_or_default(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(call_id.clone()),
+                                        name: Some(tool_name.clone()),
+                                        status: Some("success".to_string()),
                                     });
                                 }
                                 Err(e) => {
@@ -340,20 +535,28 @@ impl SimpleRuntime {
                                             duration_ms: Some(duration_ms),
                                         });
                                     }
+                                    let err = e.to_string();
                                     tool_results.push(ToolResultRecord {
-                                        tool_name: call.tool_name.clone(),
+                                        tool_name: tool_name.clone(),
                                         call_id: Some(call_id.clone()),
                                         output: serde_json::Value::Null,
-                                        error: Some(e.to_string()),
+                                        error: Some(err.clone()),
+                                        status: Some("error".to_string()),
                                     });
                                     messages.push(Message {
                                         role: "tool".to_string(),
                                         content: serde_json::to_string(&serde_json::json!({
-                                            "tool_name": call.tool_name,
-                                            "call_id": call_id,
-                                            "error": e.to_string()
+                                            "tool_call_id": call_id.clone(),
+                                            "tool_name": tool_name.clone(),
+                                            "status": "error",
+                                            "error": err.clone(),
+                                            "content": err,
                                         }))
                                         .unwrap_or_default(),
+                                        tool_calls: None,
+                                        tool_call_id: Some(call_id.clone()),
+                                        name: Some(tool_name.clone()),
+                                        status: Some("error".to_string()),
                                     });
                                 }
                             }
@@ -376,19 +579,26 @@ impl SimpleRuntime {
                             }
                             let err = format!("command_not_allowed: {}: {}", code, reason);
                             tool_results.push(ToolResultRecord {
-                                tool_name: call.tool_name.clone(),
+                                tool_name: tool_name.clone(),
                                 call_id: Some(call_id.clone()),
                                 output: serde_json::Value::Null,
                                 error: Some(err.clone()),
+                                status: Some("error".to_string()),
                             });
                             messages.push(Message {
                                 role: "tool".to_string(),
                                 content: serde_json::to_string(&serde_json::json!({
-                                    "tool_name": call.tool_name,
-                                    "call_id": call_id,
-                                    "error": err
+                                    "tool_call_id": call_id.clone(),
+                                    "tool_name": tool_name.clone(),
+                                    "status": "error",
+                                    "error": err.clone(),
+                                    "content": err,
                                 }))
                                 .unwrap_or_default(),
+                                tool_calls: None,
+                                tool_call_id: Some(call_id.clone()),
+                                name: Some(tool_name.clone()),
+                                status: Some("error".to_string()),
                             });
                             continue;
                         }
@@ -409,19 +619,26 @@ impl SimpleRuntime {
                             }
                             let err = format!("command_not_allowed: {}: {}", code, reason);
                             tool_results.push(ToolResultRecord {
-                                tool_name: call.tool_name.clone(),
+                                tool_name: tool_name.clone(),
                                 call_id: Some(call_id.clone()),
                                 output: serde_json::Value::Null,
                                 error: Some(err.clone()),
+                                status: Some("error".to_string()),
                             });
                             messages.push(Message {
                                 role: "tool".to_string(),
                                 content: serde_json::to_string(&serde_json::json!({
-                                    "tool_name": call.tool_name,
-                                    "call_id": call_id,
-                                    "error": err
+                                    "tool_call_id": call_id.clone(),
+                                    "tool_name": tool_name.clone(),
+                                    "status": "error",
+                                    "error": err.clone(),
+                                    "content": err,
                                 }))
                                 .unwrap_or_default(),
+                                tool_calls: None,
+                                tool_call_id: Some(call_id.clone()),
+                                name: Some(tool_name.clone()),
+                                status: Some("error".to_string()),
                             });
                             continue;
                         }
@@ -436,37 +653,57 @@ impl SimpleRuntime {
 
             match result {
                 Ok((out, _delta)) => {
+                    let content = if let Some(s) = out.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                        s.to_string()
+                    } else {
+                        serde_json::to_string(&out).unwrap_or_default()
+                    };
                     tool_results.push(ToolResultRecord {
-                        tool_name: call.tool_name.clone(),
+                        tool_name: tool_name.clone(),
                         call_id: Some(call_id.clone()),
                         output: out.clone(),
                         error: None,
+                        status: Some("success".to_string()),
                     });
                     messages.push(Message {
                         role: "tool".to_string(),
                         content: serde_json::to_string(&serde_json::json!({
-                            "tool_name": call.tool_name,
-                            "call_id": call_id,
-                            "output": out
+                            "tool_call_id": call_id.clone(),
+                            "tool_name": tool_name.clone(),
+                            "status": "success",
+                            "output": out,
+                            "content": content,
                         }))
                         .unwrap_or_default(),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        name: Some(tool_name.clone()),
+                        status: Some("success".to_string()),
                     });
                 }
                 Err(e) => {
+                    let err = e.to_string();
                     tool_results.push(ToolResultRecord {
-                        tool_name: call.tool_name.clone(),
+                        tool_name: tool_name.clone(),
                         call_id: Some(call_id.clone()),
                         output: serde_json::Value::Null,
-                        error: Some(e.to_string()),
+                        error: Some(err.clone()),
+                        status: Some("error".to_string()),
                     });
                     messages.push(Message {
                         role: "tool".to_string(),
                         content: serde_json::to_string(&serde_json::json!({
-                            "tool_name": call.tool_name,
-                            "call_id": call_id,
-                            "error": e.to_string()
+                            "tool_call_id": call_id.clone(),
+                            "tool_name": tool_name.clone(),
+                            "status": "error",
+                            "error": err.clone(),
+                            "content": err,
                         }))
                         .unwrap_or_default(),
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        name: Some(tool_name.clone()),
+                        status: Some("error".to_string()),
                     });
                 }
             }

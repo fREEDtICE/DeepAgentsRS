@@ -7,16 +7,18 @@ use crate::types::Message;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderToolCall {
+    #[serde(alias = "name", alias = "tool")]
     pub tool_name: String,
-    #[serde(default)]
+    #[serde(default, alias = "args", alias = "input")]
     pub arguments: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "id", alias = "tool_call_id", alias = "tool_use_id", alias = "toolUseId")]
     pub call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStep {
+    AssistantMessage { text: String },
     FinalText { text: String },
     ToolCalls { calls: Vec<ProviderToolCall> },
     SkillCall {

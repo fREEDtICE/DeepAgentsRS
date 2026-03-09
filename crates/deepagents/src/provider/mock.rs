@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use crate::provider::protocol::{Provider, ProviderError, ProviderRequest, Provid
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MockStep {
+    AssistantMessage { text: String },
     FinalText { text: String },
     FinalFromLastToolFirstLine { prefix: Option<String> },
     ToolCalls { calls: Vec<ProviderToolCall> },
@@ -32,6 +34,7 @@ pub struct MockScript {
 pub struct MockProvider {
     script: Arc<MockScript>,
     omit_call_ids: bool,
+    next_idx: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
@@ -39,6 +42,7 @@ impl MockProvider {
         Self {
             script: Arc::new(script),
             omit_call_ids: false,
+            next_idx: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -46,6 +50,7 @@ impl MockProvider {
         Self {
             script: Arc::new(script),
             omit_call_ids: true,
+            next_idx: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -58,10 +63,7 @@ impl MockProvider {
 #[async_trait]
 impl Provider for MockProvider {
     async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
-        let idx = req
-            .last_tool_results
-            .len()
-            .min(self.script.steps.len());
+        let idx = self.next_idx.fetch_add(1, Ordering::SeqCst);
         let step = self
             .script
             .steps
@@ -78,6 +80,7 @@ impl Provider for MockProvider {
                     text: String::new(),
                 })
             }
+            MockStep::AssistantMessage { text } => Ok(ProviderStep::AssistantMessage { text }),
             MockStep::FinalText { text } => Ok(ProviderStep::FinalText { text }),
             MockStep::FinalFromLastToolFirstLine { prefix } => {
                 let mut out = prefix.unwrap_or_default();

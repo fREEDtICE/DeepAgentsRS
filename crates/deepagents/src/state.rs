@@ -1,11 +1,22 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentState {
     #[serde(default)]
     pub filesystem: FilesystemState,
+    #[serde(default)]
+    pub extra: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub private: PrivateAgentState,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PrivateAgentState {
+    pub memory_contents: Option<BTreeMap<String, String>>,
+    pub memory_loaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
