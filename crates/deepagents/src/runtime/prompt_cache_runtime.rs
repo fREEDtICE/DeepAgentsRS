@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use tokio::time::{timeout, Duration as TokioDuration};
 
-use crate::provider::{Provider, ProviderRequest, ProviderStep};
+use crate::provider::{
+    Provider, ProviderRequest, ProviderStep, ProviderEvent, VecProviderEventCollector,
+};
 use crate::runtime::cache_store::{CacheStore, MemoryCacheStore};
 use crate::runtime::stable_hash::stable_json_sha256_hex;
 use crate::runtime::{
@@ -163,15 +165,20 @@ pub async fn step_with_prompt_cache(
     provider_timeout_ms: u64,
     state: &mut AgentState,
 ) -> Result<ProviderStep, CachedProviderError> {
+    let (step, _) = step_with_prompt_cache_and_events(provider, req, provider_timeout_ms, state).await?;
+    Ok(step)
+}
+
+pub async fn step_with_prompt_cache_and_events(
+    provider: &Arc<dyn Provider>,
+    req: ProviderRequest,
+    provider_timeout_ms: u64,
+    state: &mut AgentState,
+) -> Result<(ProviderStep, Vec<ProviderEvent>), CachedProviderError> {
     let opts = load_prompt_cache_options(state);
     if !opts.enabled || opts.backend != CacheBackend::Memory {
-        return match timeout(
-            TokioDuration::from_millis(provider_timeout_ms),
-            provider.step(req),
-        )
-        .await
-        {
-            Ok(Ok(s)) => Ok(s),
+        return match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
+            Ok(Ok((s, events))) => Ok((s, events)),
             Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
             Err(_) => Err(CachedProviderError::Timeout),
         };
@@ -223,16 +230,11 @@ pub async fn step_with_prompt_cache(
                     expired: if l2_lookup.expired { Some(true) } else { None },
                 },
             );
-            return Ok(step);
+            return Ok((step, Vec::new()));
         }
 
-        let step = match timeout(
-            TokioDuration::from_millis(provider_timeout_ms),
-            provider.step(req),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
+        let (step, events) = match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
+            Ok(Ok((s, events))) => (s, events),
             Ok(Err(e)) => {
                 push_provider_cache_event(
                     state,
@@ -289,17 +291,29 @@ pub async fn step_with_prompt_cache(
                 expired: if l2_lookup.expired { Some(true) } else { None },
             },
         );
-        return Ok(step);
+        return Ok((step, events));
     }
 
-    match timeout(
-        TokioDuration::from_millis(provider_timeout_ms),
-        provider.step(req),
-    )
-    .await
-    {
-        Ok(Ok(s)) => Ok(s),
+    match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
+        Ok(Ok((s, events))) => Ok((s, events)),
         Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
         Err(_) => Err(CachedProviderError::Timeout),
     }
+}
+
+async fn timeout_with_provider_events(
+    provider: &Arc<dyn Provider>,
+    req: ProviderRequest,
+    provider_timeout_ms: u64,
+) -> Result<Result<(ProviderStep, Vec<ProviderEvent>), anyhow::Error>, tokio::time::error::Elapsed>
+{
+    timeout(
+        TokioDuration::from_millis(provider_timeout_ms),
+        async {
+            let mut collector = VecProviderEventCollector::new();
+            let step = provider.step_with_collector(req, &mut collector).await?;
+            Ok((step, collector.into_events()))
+        },
+    )
+    .await
 }

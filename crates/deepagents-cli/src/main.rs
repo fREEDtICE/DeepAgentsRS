@@ -46,6 +46,14 @@ enum Cmd {
         #[arg(long, default_value = "mock")]
         provider: String,
         #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        #[arg(long)]
         thread_id: Option<String>,
         #[arg(long)]
         mock_script: Option<String>,
@@ -91,6 +99,10 @@ enum Cmd {
         summarization_truncate_keep_last: usize,
         #[arg(long = "interrupt-on")]
         interrupt_on: Vec<String>,
+        #[arg(long)]
+        events_jsonl: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stream_events: bool,
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
@@ -426,6 +438,10 @@ async fn main() -> Result<()> {
         Cmd::Run {
             input,
             provider,
+            model,
+            base_url,
+            api_key,
+            api_key_env,
             thread_id,
             mock_script,
             plugin,
@@ -449,6 +465,8 @@ async fn main() -> Result<()> {
             summarization_max_tool_arg_chars,
             summarization_truncate_keep_last,
             interrupt_on,
+            events_jsonl,
+            stream_events,
             pretty,
         } => {
             let provider_id = provider.clone();
@@ -472,6 +490,31 @@ async fn main() -> Result<()> {
                             script,
                         ),
                     )
+                }
+                "openai-compatible" | "openai_compatible" => {
+                    let model =
+                        model.ok_or_else(|| anyhow!("--model is required for --provider openai-compatible"))?;
+                    let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
+                    if let Some(base_url) = base_url {
+                        config = config.with_base_url(base_url);
+                    }
+                    let api_key = match (api_key, api_key_env) {
+                        (Some(api_key), _) => Some(api_key),
+                        (None, Some(env_name)) => Some(
+                            std::env::var(&env_name)
+                                .map_err(|_| anyhow!("missing env var for --api-key-env: {env_name}"))?,
+                        ),
+                        (None, None) => std::env::var("OPENAI_API_KEY").ok(),
+                    };
+                    if let Some(api_key) = api_key {
+                        config = config.with_api_key(api_key);
+                    }
+                    std::sync::Arc::new(deepagents::provider::LlmProviderAdapter::new(
+                        std::sync::Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
+                            config,
+                            std::sync::Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
+                        )),
+                    ))
                 }
                 other => return Err(anyhow!("unknown --provider: {other}")),
             };
@@ -642,7 +685,8 @@ async fn main() -> Result<()> {
             .with_initial_state(initial_state);
 
             runner.push_user_input(input);
-            let mut out = runner.run().await;
+            let mut event_sink = CliRunEventSink::new(events_jsonl.as_deref(), stream_events)?;
+            let mut out = runner.run_with_events(&mut event_sink).await;
 
             if matches!(mode, ExecutionMode::Interactive) {
                 let mut stderr = std::io::stderr();
@@ -693,7 +737,9 @@ async fn main() -> Result<()> {
                             }
                         }
                     };
-                    out = runner.resume(&interrupt.interrupt_id, decision).await;
+                    out = runner
+                        .resume_with_events(&interrupt.interrupt_id, decision, &mut event_sink)
+                        .await;
                 }
             } else if out.status == deepagents::runtime::RunStatus::Interrupted {
                 if pretty {
@@ -972,6 +1018,37 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     dur.as_millis() as i64
+}
+
+struct CliRunEventSink {
+    file: Option<std::fs::File>,
+    echo_stderr: bool,
+}
+
+impl CliRunEventSink {
+    fn new(path: Option<&str>, echo_stderr: bool) -> Result<Self> {
+        let file = match path {
+            Some(path) => Some(std::fs::File::create(path)?),
+            None => None,
+        };
+        Ok(Self { file, echo_stderr })
+    }
+}
+
+#[async_trait::async_trait]
+impl deepagents::runtime::RunEventSink for CliRunEventSink {
+    async fn emit(&mut self, event: deepagents::runtime::RunEvent) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let line = serde_json::to_string(&event)?;
+        if let Some(file) = &mut self.file {
+            writeln!(file, "{line}")?;
+        }
+        if self.echo_stderr {
+            eprintln!("{line}");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

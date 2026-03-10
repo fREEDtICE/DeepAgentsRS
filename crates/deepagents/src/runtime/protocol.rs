@@ -146,6 +146,14 @@ pub trait Runtime: Send + Sync {
     async fn run(&self, messages: Vec<Message>) -> RunOutput;
 }
 
+#[async_trait]
+pub trait StreamingRuntime: Send + Sync {
+    async fn run_with_events(
+        &mut self,
+        sink: &mut dyn crate::runtime::RunEventSink,
+    ) -> RunOutput;
+}
+
 pub struct ToolCallContext<'a> {
     pub agent: &'a DeepAgent,
     pub tool_call: &'a ProviderToolCall,

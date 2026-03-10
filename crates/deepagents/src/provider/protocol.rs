@@ -64,7 +64,60 @@ pub struct ProviderRequest {
     pub last_tool_results: Vec<crate::runtime::ToolResultRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderEvent {
+    AssistantTextDelta {
+        text: String,
+    },
+    ToolCallArgsDelta {
+        tool_call_id: String,
+        delta: String,
+    },
+    Usage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    },
+}
+
+#[async_trait]
+pub trait ProviderEventCollector: Send {
+    async fn emit(&mut self, event: ProviderEvent) -> anyhow::Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct VecProviderEventCollector {
+    events: Vec<ProviderEvent>,
+}
+
+impl VecProviderEventCollector {
+    pub fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    pub fn into_events(self) -> Vec<ProviderEvent> {
+        self.events
+    }
+}
+
+#[async_trait]
+impl ProviderEventCollector for VecProviderEventCollector {
+    async fn emit(&mut self, event: ProviderEvent) -> anyhow::Result<()> {
+        self.events.push(event);
+        Ok(())
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep>;
+
+    async fn step_with_collector(
+        &self,
+        req: ProviderRequest,
+        _collector: &mut dyn ProviderEventCollector,
+    ) -> anyhow::Result<ProviderStep> {
+        self.step(req).await
+    }
 }

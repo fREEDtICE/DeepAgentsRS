@@ -9,11 +9,15 @@ use crate::approval::{
 use crate::audit::{AuditEvent, AuditSink};
 use crate::provider::{Provider, ProviderRequest, ProviderStep, ProviderToolCall};
 use crate::runtime::attach_provider_cache_events_to_trace;
+use crate::runtime::events::{
+    diff_state_keys, preview_json, preview_text, provider_step_kind, summarize_messages, RunEvent,
+    RunEventSink,
+};
 use crate::runtime::filesystem_runtime_middleware::{
     LargeToolResultOffloadOptions, LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY,
 };
 use crate::runtime::patch_tool_calls::{sanitize_tool_call_id, tool_calls_from_provider_calls};
-use crate::runtime::prompt_cache_runtime::{step_with_prompt_cache, CachedProviderError};
+use crate::runtime::prompt_cache_runtime::{step_with_prompt_cache_and_events, CachedProviderError};
 use crate::runtime::protocol::{
     HandledToolCall, HitlDecision, HitlInterrupt, RunOutput, RunStatus, RuntimeError,
     RuntimeMiddleware, ToolCallContext, ToolCallRecord, ToolResultRecord,
@@ -100,6 +104,7 @@ pub struct ResumableRunner {
     tool_calls: Vec<ToolCallRecord>,
     tool_results: Vec<ToolResultRecord>,
     next_call_id: u64,
+    step_counter: usize,
     pending: Option<PendingInterrupt>,
     task_depth: usize,
 }
@@ -128,6 +133,7 @@ impl ResumableRunner {
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             next_call_id: 1,
+            step_counter: 0,
             pending: None,
             task_depth: 0,
         }
@@ -188,10 +194,219 @@ impl ResumableRunner {
         });
     }
 
-    pub async fn run(&mut self) -> RunOutput {
-        if self.pending.is_some() {
-            return self.pending_output();
+    async fn emit_event(&self, sink: &mut dyn RunEventSink, event: RunEvent) {
+        let _ = sink.emit(event).await;
+    }
+
+    async fn emit_run_finished(
+        &self,
+        sink: &mut dyn RunEventSink,
+        status: RunStatus,
+        reason: &str,
+        final_text: String,
+        step_count: usize,
+    ) {
+        self.emit_event(
+            sink,
+            RunEvent::RunFinished {
+                status,
+                reason: reason.to_string(),
+                final_text,
+                step_count,
+                tool_call_count: self.tool_calls.len(),
+                tool_error_count: self
+                    .tool_results
+                    .iter()
+                    .filter(|r| r.error.is_some() || r.status.as_deref() == Some("error"))
+                    .count(),
+            },
+        )
+        .await;
+    }
+
+    async fn finish_with_output(
+        &self,
+        sink: &mut dyn RunEventSink,
+        out: RunOutput,
+        reason: &str,
+        step_count: usize,
+    ) -> RunOutput {
+        self.emit_run_finished(sink, out.status, reason, out.final_text.clone(), step_count)
+            .await;
+        out
+    }
+
+    async fn emit_state_updated_if_any(
+        &self,
+        step_index: usize,
+        before: &AgentState,
+        sink: &mut dyn RunEventSink,
+    ) {
+        let updated_keys = diff_state_keys(before, &self.state);
+        if !updated_keys.is_empty() {
+            self.emit_event(
+                sink,
+                RunEvent::StateUpdated {
+                    step_index,
+                    updated_keys,
+                },
+            )
+            .await;
         }
+    }
+
+    async fn emit_provider_events(
+        &self,
+        step_index: usize,
+        events: &[crate::provider::ProviderEvent],
+        sink: &mut dyn RunEventSink,
+    ) {
+        for event in events {
+            match event {
+                crate::provider::ProviderEvent::AssistantTextDelta { text } => {
+                    self.emit_event(
+                        sink,
+                        RunEvent::AssistantTextDelta {
+                            step_index,
+                            text: text.clone(),
+                        },
+                    )
+                    .await;
+                }
+                crate::provider::ProviderEvent::ToolCallArgsDelta { tool_call_id, delta } => {
+                    self.emit_event(
+                        sink,
+                        RunEvent::ToolCallArgsDelta {
+                            step_index,
+                            tool_call_id: tool_call_id.clone(),
+                            delta: delta.clone(),
+                        },
+                    )
+                    .await;
+                }
+                crate::provider::ProviderEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                } => {
+                    self.emit_event(
+                        sink,
+                        RunEvent::UsageReported {
+                            step_index,
+                            input_tokens: *input_tokens,
+                            output_tokens: *output_tokens,
+                            total_tokens: *total_tokens,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn push_tool_result_and_message(
+        &mut self,
+        step_index: usize,
+        before_state: &AgentState,
+        tool_name: String,
+        call_id: String,
+        output: serde_json::Value,
+        error: Option<String>,
+        status: String,
+        content: String,
+        content_blocks: Option<Vec<crate::types::ContentBlock>>,
+        sink: &mut dyn RunEventSink,
+        custom_message: Option<serde_json::Value>,
+    ) {
+        self.tool_results.push(ToolResultRecord {
+            tool_name: tool_name.clone(),
+            call_id: Some(call_id.clone()),
+            output: output.clone(),
+            error: error.clone(),
+            status: Some(status.clone()),
+        });
+        self.emit_event(
+            sink,
+            RunEvent::ToolCallFinished {
+                step_index,
+                tool_name: tool_name.clone(),
+                tool_call_id: call_id.clone(),
+                output_preview: preview_json(&output),
+                error: error.clone(),
+                status: Some(status.clone()),
+            },
+        )
+        .await;
+
+        let content_json = custom_message.unwrap_or_else(|| {
+            serde_json::json!({
+                "tool_call_id": call_id.clone(),
+                "tool_name": tool_name.clone(),
+                "status": status.clone(),
+                "output": if error.is_some() { serde_json::Value::Null } else { output },
+                "error": error.clone(),
+                "content": content.clone(),
+            })
+        });
+        self.messages.push(Message {
+            role: "tool".to_string(),
+            content: content_json.to_string(),
+            content_blocks,
+            tool_calls: None,
+            tool_call_id: Some(call_id.clone()),
+            name: Some(tool_name),
+            status: Some(status.clone()),
+        });
+        self.emit_event(
+            sink,
+            RunEvent::ToolMessageAppended {
+                step_index,
+                tool_call_id: call_id,
+                content_preview: preview_text(&content, 240),
+                status: Some(status),
+            },
+        )
+        .await;
+        self.emit_state_updated_if_any(step_index, before_state, sink)
+            .await;
+    }
+
+    pub async fn run(&mut self) -> RunOutput {
+        let mut sink = crate::runtime::NoopRunEventSink;
+        self.run_with_events(&mut sink).await
+    }
+
+    pub async fn run_with_events(&mut self, sink: &mut dyn RunEventSink) -> RunOutput {
+        if self.pending.is_some() {
+            if let Some(interrupt) = self.pending_interrupt().cloned() {
+                self.emit_event(
+                    sink,
+                    RunEvent::Interrupt {
+                        step_index: self.step_counter,
+                        interrupt,
+                    },
+                )
+                .await;
+            }
+            let out = self.pending_output();
+            self.emit_run_finished(
+                sink,
+                out.status,
+                "interrupt_pending",
+                out.final_text.clone(),
+                self.step_counter,
+            )
+            .await;
+            return out;
+        }
+
+        self.emit_event(
+            sink,
+            RunEvent::RunStarted {
+                resumed_from_interrupt: false,
+            },
+        )
+        .await;
 
         if !self.initialized {
             self.messages =
@@ -203,7 +418,7 @@ impl ResumableRunner {
                         Ok(m) => messages = m,
                         Err(e) => {
                             self.messages = Vec::new();
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -224,6 +439,9 @@ impl ResumableRunner {
                                     "reason": "middleware_before_run_error"
                                 })),
                             });
+                            return self
+                                .finish_with_output(sink, out, "middleware_before_run_error", 0)
+                                .await;
                         }
                     }
                 }
@@ -234,6 +452,8 @@ impl ResumableRunner {
         }
 
         for step_idx in 0..self.config.max_steps {
+            let event_step_idx = self.step_counter;
+            self.step_counter = self.step_counter.saturating_add(1);
             let tool_specs = self.agent_tools(&self.state);
             let skill_specs = self
                 .skills
@@ -251,7 +471,7 @@ impl ResumableRunner {
                     {
                         Ok(m) => provider_messages = m,
                         Err(e) => {
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -272,10 +492,30 @@ impl ResumableRunner {
                                     "reason": "middleware_before_provider_step_error"
                                 })),
                             });
+                            return self
+                                .finish_with_output(
+                                    sink,
+                                    out,
+                                    "middleware_before_provider_step_error",
+                                    event_step_idx + 1,
+                                )
+                                .await;
                         }
                     }
                 }
             }
+
+            self.emit_event(
+                sink,
+                RunEvent::ModelRequestBuilt {
+                    step_index: event_step_idx,
+                    tool_names: tool_specs.iter().map(|t| t.name.clone()).collect(),
+                    skills: skill_specs_for_req.iter().map(|s| s.name.clone()).collect(),
+                    message_count: provider_messages.len(),
+                    message_summary: summarize_messages(&provider_messages),
+                },
+            )
+            .await;
 
             let req = ProviderRequest {
                 messages: provider_messages.clone(),
@@ -285,7 +525,7 @@ impl ResumableRunner {
                 last_tool_results: self.tool_results.clone(),
             };
 
-            let mut provider_step = match step_with_prompt_cache(
+            let (mut provider_step, mut provider_events) = match step_with_prompt_cache_and_events(
                 &self.provider,
                 req,
                 self.config.provider_timeout_ms,
@@ -295,7 +535,7 @@ impl ResumableRunner {
             {
                 Ok(s) => s,
                 Err(CachedProviderError::Provider(e)) => {
-                    return finalize_run_output(RunOutput {
+                    let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
                         interrupts: Vec::new(),
                         final_text: String::new(),
@@ -316,9 +556,12 @@ impl ResumableRunner {
                             "reason": "provider_error"
                         })),
                     });
+                    return self
+                        .finish_with_output(sink, out, "provider_error", event_step_idx + 1)
+                        .await;
                 }
                 Err(CachedProviderError::Timeout) => {
-                    return finalize_run_output(RunOutput {
+                    let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
                         interrupts: Vec::new(),
                         final_text: String::new(),
@@ -339,6 +582,9 @@ impl ResumableRunner {
                             "reason": "provider_timeout"
                         })),
                     });
+                    return self
+                        .finish_with_output(sink, out, "provider_timeout", event_step_idx + 1)
+                        .await;
                 }
             };
 
@@ -358,7 +604,7 @@ impl ResumableRunner {
                                 Ok(m) => overflow_messages = m,
                                 Err(e) => {
                                     self.state.extra.remove("_summarization_force");
-                                    return finalize_run_output(RunOutput {
+                                    let out = finalize_run_output(RunOutput {
                                         status: RunStatus::Error,
                                         interrupts: Vec::new(),
                                         final_text: String::new(),
@@ -379,6 +625,14 @@ impl ResumableRunner {
                                             "reason": "middleware_before_provider_step_error"
                                         })),
                                     });
+                                    return self
+                                        .finish_with_output(
+                                            sink,
+                                            out,
+                                            "middleware_before_provider_step_error",
+                                            event_step_idx + 1,
+                                        )
+                                        .await;
                                 }
                             }
                         }
@@ -391,7 +645,7 @@ impl ResumableRunner {
                         state: self.state.clone(),
                         last_tool_results: self.tool_results.clone(),
                     };
-                    provider_step = match step_with_prompt_cache(
+                    (provider_step, provider_events) = match step_with_prompt_cache_and_events(
                         &self.provider,
                         retry_req,
                         self.config.provider_timeout_ms,
@@ -401,7 +655,7 @@ impl ResumableRunner {
                     {
                         Ok(s) => s,
                         Err(CachedProviderError::Provider(e)) => {
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -422,9 +676,12 @@ impl ResumableRunner {
                                     "reason": "provider_error"
                                 })),
                             });
+                            return self
+                                .finish_with_output(sink, out, "provider_error", event_step_idx + 1)
+                                .await;
                         }
                         Err(CachedProviderError::Timeout) => {
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -445,6 +702,14 @@ impl ResumableRunner {
                                     "reason": "provider_timeout"
                                 })),
                             });
+                            return self
+                                .finish_with_output(
+                                    sink,
+                                    out,
+                                    "provider_timeout",
+                                    event_step_idx + 1,
+                                )
+                                .await;
                         }
                     };
                 }
@@ -458,7 +723,7 @@ impl ResumableRunner {
                     {
                         Ok(s) => provider_step = s,
                         Err(e) => {
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -479,14 +744,33 @@ impl ResumableRunner {
                                     "reason": "middleware_patch_provider_step_error"
                                 })),
                             });
+                            return self
+                                .finish_with_output(
+                                    sink,
+                                    out,
+                                    "middleware_patch_provider_step_error",
+                                    event_step_idx + 1,
+                                )
+                                .await;
                         }
                     }
                 }
             }
 
+            self.emit_event(
+                sink,
+                RunEvent::ProviderStepReceived {
+                    step_index: event_step_idx,
+                    step_type: provider_step_kind(&provider_step),
+                },
+            )
+            .await;
+            self.emit_provider_events(event_step_idx, &provider_events, sink)
+                .await;
+
             match provider_step {
                 ProviderStep::AssistantMessage { text } => {
-                    self.messages.push(Message {
+                    let message = Message {
                         role: "assistant".to_string(),
                         content: text,
                         content_blocks: None,
@@ -494,10 +778,37 @@ impl ResumableRunner {
                         tool_call_id: None,
                         name: None,
                         status: None,
-                    });
+                    };
+                    self.messages.push(message.clone());
+                    self.emit_event(
+                        sink,
+                        RunEvent::AssistantMessage {
+                            step_index: event_step_idx,
+                            message,
+                        },
+                    )
+                    .await;
                 }
                 ProviderStep::FinalText { text } => {
-                    return finalize_run_output(RunOutput {
+                    let message = Message {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        content_blocks: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        status: None,
+                    };
+                    self.messages.push(message.clone());
+                    self.emit_event(
+                        sink,
+                        RunEvent::AssistantMessage {
+                            step_index: event_step_idx,
+                            message,
+                        },
+                    )
+                    .await;
+                    let out = finalize_run_output(RunOutput {
                         status: RunStatus::Completed,
                         interrupts: Vec::new(),
                         final_text: text,
@@ -515,9 +826,18 @@ impl ResumableRunner {
                             "reason": "final_text"
                         })),
                     });
+                    self.emit_run_finished(
+                        sink,
+                        out.status,
+                        "final_text",
+                        out.final_text.clone(),
+                        event_step_idx + 1,
+                    )
+                    .await;
+                    return out;
                 }
                 ProviderStep::Error { error } => {
-                    return finalize_run_output(RunOutput {
+                    let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
                         interrupts: Vec::new(),
                         final_text: String::new(),
@@ -538,6 +858,15 @@ impl ResumableRunner {
                             "reason": "provider_step_error"
                         })),
                     });
+                    self.emit_run_finished(
+                        sink,
+                        out.status,
+                        "provider_step_error",
+                        out.final_text.clone(),
+                        event_step_idx + 1,
+                    )
+                    .await;
+                    return out;
                 }
                 ProviderStep::SkillCall {
                     name,
@@ -552,7 +881,7 @@ impl ResumableRunner {
                     let calls = match self.expand_skill(call).await {
                         Ok(c) => c,
                         Err(e) => {
-                            return finalize_run_output(RunOutput {
+                            let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
                                 interrupts: Vec::new(),
                                 final_text: String::new(),
@@ -573,10 +902,22 @@ impl ResumableRunner {
                                     "reason": "skill_error"
                                 })),
                             });
+                            return self
+                                .finish_with_output(sink, out, "skill_error", event_step_idx + 1)
+                                .await;
                         }
                     };
-                    if self.execute_calls(calls).await.is_some() {
-                        return self.pending_output();
+                    if self.execute_calls(event_step_idx, calls, sink).await.is_some() {
+                        let out = self.pending_output();
+                        self.emit_run_finished(
+                            sink,
+                            out.status,
+                            "interrupt",
+                            out.final_text.clone(),
+                            event_step_idx + 1,
+                        )
+                        .await;
+                        return out;
                     }
                 }
                 ProviderStep::ToolCalls { calls } => {
@@ -584,7 +925,7 @@ impl ResumableRunner {
                         calls,
                         &mut self.next_call_id,
                     );
-                    self.messages.push(Message {
+                    let message = Message {
                         role: "assistant".to_string(),
                         content: String::new(),
                         content_blocks: None,
@@ -592,15 +933,33 @@ impl ResumableRunner {
                         tool_call_id: None,
                         name: None,
                         status: None,
-                    });
-                    if self.execute_calls(calls).await.is_some() {
-                        return self.pending_output();
+                    };
+                    self.messages.push(message.clone());
+                    self.emit_event(
+                        sink,
+                        RunEvent::AssistantMessage {
+                            step_index: event_step_idx,
+                            message,
+                        },
+                    )
+                    .await;
+                    if self.execute_calls(event_step_idx, calls, sink).await.is_some() {
+                        let out = self.pending_output();
+                        self.emit_run_finished(
+                            sink,
+                            out.status,
+                            "interrupt",
+                            out.final_text.clone(),
+                            event_step_idx + 1,
+                        )
+                        .await;
+                        return out;
                     }
                 }
             }
         }
 
-        finalize_run_output(RunOutput {
+        let out = finalize_run_output(RunOutput {
             status: RunStatus::Error,
             interrupts: Vec::new(),
             final_text: String::new(),
@@ -616,12 +975,31 @@ impl ResumableRunner {
                 "terminated_at_step": self.config.max_steps,
                 "reason": "max_steps_exceeded"
             })),
-        })
+        });
+        self.emit_run_finished(
+            sink,
+            out.status,
+            "max_steps_exceeded",
+            out.final_text.clone(),
+            self.step_counter,
+        )
+        .await;
+        out
     }
 
     pub async fn resume(&mut self, interrupt_id: &str, decision: HitlDecision) -> RunOutput {
+        let mut sink = crate::runtime::NoopRunEventSink;
+        self.resume_with_events(interrupt_id, decision, &mut sink).await
+    }
+
+    pub async fn resume_with_events(
+        &mut self,
+        interrupt_id: &str,
+        decision: HitlDecision,
+        sink: &mut dyn RunEventSink,
+    ) -> RunOutput {
         let Some(p) = self.pending.clone() else {
-            return finalize_run_output(RunOutput {
+            let out = finalize_run_output(RunOutput {
                 status: RunStatus::Error,
                 interrupts: Vec::new(),
                 final_text: String::new(),
@@ -635,10 +1013,13 @@ impl ResumableRunner {
                 summarization_events: self.state.extra.get("_summarization_events").cloned(),
                 trace: None,
             });
+            return self
+                .finish_with_output(sink, out, "interrupt_not_found", self.step_counter)
+                .await;
         };
 
         if p.interrupt.interrupt_id != interrupt_id {
-            return finalize_run_output(RunOutput {
+            let out = finalize_run_output(RunOutput {
                 status: RunStatus::Error,
                 interrupts: vec![p.interrupt],
                 final_text: String::new(),
@@ -652,20 +1033,25 @@ impl ResumableRunner {
                 summarization_events: self.state.extra.get("_summarization_events").cloned(),
                 trace: None,
             });
+            return self
+                .finish_with_output(sink, out, "interrupt_not_found", self.step_counter)
+                .await;
         }
 
         match decision.clone() {
             HitlDecision::Approve => {
                 self.pending = None;
-                self.execute_pending_call(p.call, None, None).await;
+                self.execute_pending_call(self.step_counter, p.call, None, None, sink)
+                    .await;
             }
             HitlDecision::Reject { reason } => {
                 self.pending = None;
-                self.inject_rejected_tool_message(&p.call, reason);
+                self.inject_rejected_tool_message(self.step_counter, &p.call, reason, sink)
+                    .await;
             }
             HitlDecision::Edit { args } => {
                 if let Err(msg) = validate_edit_args(&p.call.tool_name, &args) {
-                    return finalize_run_output(RunOutput {
+                    let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
                         interrupts: vec![p.interrupt],
                         final_text: String::new(),
@@ -683,22 +1069,40 @@ impl ResumableRunner {
                             .cloned(),
                         trace: None,
                     });
+                    return self
+                        .finish_with_output(sink, out, "invalid_resume", self.step_counter)
+                        .await;
                 }
                 self.pending = None;
                 self.execute_pending_call(
+                    self.step_counter,
                     p.call,
                     Some(args),
                     Some(p.interrupt.proposed_args.clone()),
+                    sink,
                 )
                 .await;
             }
         }
 
-        if self.execute_calls(p.remaining_calls).await.is_some() {
-            return self.pending_output();
+        if self
+            .execute_calls(self.step_counter, p.remaining_calls, sink)
+            .await
+            .is_some()
+        {
+            let out = self.pending_output();
+            self.emit_run_finished(
+                sink,
+                out.status,
+                "interrupt",
+                out.final_text.clone(),
+                self.step_counter,
+            )
+            .await;
+            return out;
         }
 
-        self.run().await
+        self.run_with_events(sink).await
     }
 
     fn pending_output(&self) -> RunOutput {
@@ -895,7 +1299,12 @@ impl ResumableRunner {
         })
     }
 
-    async fn execute_calls(&mut self, calls: Vec<ProviderToolCall>) -> Option<HitlInterrupt> {
+    async fn execute_calls(
+        &mut self,
+        step_index: usize,
+        calls: Vec<ProviderToolCall>,
+        sink: &mut dyn RunEventSink,
+    ) -> Option<HitlInterrupt> {
         let mut queue: std::collections::VecDeque<ProviderToolCall> =
             std::collections::VecDeque::from(calls);
         let write_todos_count = queue
@@ -919,29 +1328,31 @@ impl ResumableRunner {
                     arguments: call.arguments.clone(),
                     call_id: Some(call_id.clone()),
                 });
-                self.tool_results.push(ToolResultRecord {
-                    tool_name: tool_name.clone(),
-                    call_id: Some(call_id.clone()),
-                    output: serde_json::Value::Null,
-                    error: Some(err.clone()),
-                    status: Some("error".to_string()),
-                });
-                self.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: serde_json::to_string(&serde_json::json!({
-                        "tool_call_id": call_id.clone(),
-                        "tool_name": tool_name.clone(),
-                        "status": "error",
-                        "error": err.clone(),
-                        "content": err,
-                    }))
-                    .unwrap_or_default(),
-                    content_blocks: None,
-                    tool_calls: None,
-                    tool_call_id: Some(call_id.clone()),
-                    name: Some(tool_name),
-                    status: Some("error".to_string()),
-                });
+                self.emit_event(
+                    sink,
+                    RunEvent::ToolCallStarted {
+                        step_index,
+                        tool_name: tool_name.clone(),
+                        tool_call_id: call_id.clone(),
+                        arguments_preview: preview_json(&call.arguments),
+                    },
+                )
+                .await;
+                let before_state = self.state.clone();
+                self.push_tool_result_and_message(
+                    step_index,
+                    &before_state,
+                    tool_name,
+                    call_id,
+                    serde_json::Value::Null,
+                    Some(err.clone()),
+                    "error".to_string(),
+                    err,
+                    None,
+                    sink,
+                    None,
+                )
+                .await;
                 continue;
             }
 
@@ -953,29 +1364,31 @@ impl ResumableRunner {
 
             if write_todos_count > 1 && call.tool_name == "write_todos" {
                 let err = "Error: The `write_todos` tool should never be called multiple times in parallel. Please call it only once per model invocation to update the todo list.".to_string();
-                self.tool_results.push(ToolResultRecord {
-                    tool_name: tool_name.clone(),
-                    call_id: Some(call_id.clone()),
-                    output: serde_json::Value::Null,
-                    error: Some(err.clone()),
-                    status: Some("error".to_string()),
-                });
-                self.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: serde_json::to_string(&serde_json::json!({
-                        "tool_call_id": call_id.clone(),
-                        "tool_name": tool_name.clone(),
-                        "status": "error",
-                        "error": err.clone(),
-                        "content": err,
-                    }))
-                    .unwrap_or_default(),
-                    content_blocks: None,
-                    tool_calls: None,
-                    tool_call_id: Some(call_id.clone()),
-                    name: Some(tool_name),
-                    status: Some("error".to_string()),
-                });
+                self.emit_event(
+                    sink,
+                    RunEvent::ToolCallStarted {
+                        step_index,
+                        tool_name: tool_name.clone(),
+                        tool_call_id: call_id.clone(),
+                        arguments_preview: preview_json(&call.arguments),
+                    },
+                )
+                .await;
+                let before_state = self.state.clone();
+                self.push_tool_result_and_message(
+                    step_index,
+                    &before_state,
+                    tool_name,
+                    call_id,
+                    serde_json::Value::Null,
+                    Some(err.clone()),
+                    "error".to_string(),
+                    err,
+                    None,
+                    sink,
+                    None,
+                )
+                .await;
                 continue;
             }
 
@@ -1060,6 +1473,14 @@ impl ResumableRunner {
                                 hints: None,
                             };
                             let remaining_calls = queue.into_iter().collect::<Vec<_>>();
+                            self.emit_event(
+                                sink,
+                                RunEvent::Interrupt {
+                                    step_index,
+                                    interrupt: interrupt.clone(),
+                                },
+                            )
+                            .await;
                             self.pending = Some(PendingInterrupt {
                                 interrupt: interrupt.clone(),
                                 call,
@@ -1081,6 +1502,14 @@ impl ResumableRunner {
                     hints: None,
                 };
                 let remaining_calls = queue.into_iter().collect::<Vec<_>>();
+                self.emit_event(
+                    sink,
+                    RunEvent::Interrupt {
+                        step_index,
+                        interrupt: interrupt.clone(),
+                    },
+                )
+                .await;
                 self.pending = Some(PendingInterrupt {
                     interrupt: interrupt.clone(),
                     call,
@@ -1089,7 +1518,19 @@ impl ResumableRunner {
                 return Some(interrupt);
             }
 
+            self.emit_event(
+                sink,
+                RunEvent::ToolCallStarted {
+                    step_index,
+                    tool_name: tool_name.clone(),
+                    tool_call_id: call_id.clone(),
+                    arguments_preview: preview_json(&call.arguments),
+                },
+            )
+            .await;
+
             if !self.runtime_middlewares.is_empty() {
+                let before_state = self.state.clone();
                 let mut ctx = ToolCallContext {
                     agent: &self.agent,
                     tool_call: &call,
@@ -1136,30 +1577,20 @@ impl ResumableRunner {
                         )
                         .await
                     };
-                    self.tool_results.push(ToolResultRecord {
-                        tool_name: tool_name.clone(),
-                        call_id: Some(cid.clone()),
-                        output: output.clone(),
-                        error: error.clone(),
-                        status: Some(status.clone()),
-                    });
-                    self.messages.push(Message {
-                        role: "tool".to_string(),
-                        content: serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": cid.clone(),
-                            "tool_name": tool_name.clone(),
-                            "status": status.clone(),
-                            "output": if error.is_some() { serde_json::Value::Null } else { output },
-                            "error": error,
-                            "content": content,
-                        }))
-                        .unwrap_or_default(),
-                        content_blocks: None,
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                        name: Some(tool_name.clone()),
-                        status: Some(status.clone()),
-                    });
+                    self.push_tool_result_and_message(
+                        step_index,
+                        &before_state,
+                        tool_name.clone(),
+                        cid,
+                        output,
+                        error,
+                        status,
+                        content,
+                        None,
+                        sink,
+                        None,
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -1180,6 +1611,7 @@ impl ResumableRunner {
                     let decision = policy.decide(&req);
                     match decision {
                         ApprovalDecision::Allow { reason } => {
+                            let before_state = self.state.clone();
                             let started = std::time::Instant::now();
                             let result = self
                                 .agent
@@ -1225,29 +1657,20 @@ impl ResumableRunner {
                                             output,
                                         )
                                         .await;
-                                    self.tool_results.push(ToolResultRecord {
-                                        tool_name: tool_name.clone(),
-                                        call_id: Some(call_id.clone()),
-                                        output: out.clone(),
-                                        error: None,
-                                        status: Some("success".to_string()),
-                                    });
-                                    self.messages.push(Message {
-                                        role: "tool".to_string(),
-                                        content: serde_json::to_string(&serde_json::json!({
-                                            "tool_call_id": call_id.clone(),
-                                            "tool_name": tool_name.clone(),
-                                            "status": "success",
-                                            "output": out,
-                                            "content": content,
-                                        }))
-                                        .unwrap_or_default(),
+                                    self.push_tool_result_and_message(
+                                        step_index,
+                                        &before_state,
+                                        tool_name.clone(),
+                                        call_id.clone(),
+                                        out,
+                                        None,
+                                        "success".to_string(),
+                                        content,
                                         content_blocks,
-                                        tool_calls: None,
-                                        tool_call_id: Some(call_id.clone()),
-                                        name: Some(tool_name.clone()),
-                                        status: Some("success".to_string()),
-                                    });
+                                        sink,
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     if let Some(sink) = &self.audit {
@@ -1266,29 +1689,21 @@ impl ResumableRunner {
                                         });
                                     }
                                     let err = e.to_string();
-                                    self.tool_results.push(ToolResultRecord {
-                                        tool_name: tool_name.clone(),
-                                        call_id: Some(call_id.clone()),
-                                        output: serde_json::Value::Null,
-                                        error: Some(err.clone()),
-                                        status: Some("error".to_string()),
-                                    });
-                                    self.messages.push(Message {
-                                        role: "tool".to_string(),
-                                        content: serde_json::to_string(&serde_json::json!({
-                                            "tool_call_id": call_id.clone(),
-                                            "tool_name": tool_name.clone(),
-                                            "status": "error",
-                                            "error": err.clone(),
-                                            "content": err,
-                                        }))
-                                        .unwrap_or_default(),
-                                        content_blocks: None,
-                                        tool_calls: None,
-                                        tool_call_id: Some(call_id.clone()),
-                                        name: Some(tool_name.clone()),
-                                        status: Some("error".to_string()),
-                                    });
+                                    let before_state = self.state.clone();
+                                    self.push_tool_result_and_message(
+                                        step_index,
+                                        &before_state,
+                                        tool_name.clone(),
+                                        call_id.clone(),
+                                        serde_json::Value::Null,
+                                        Some(err.clone()),
+                                        "error".to_string(),
+                                        err,
+                                        None,
+                                        sink,
+                                        None,
+                                    )
+                                    .await;
                                 }
                             }
                             continue;
@@ -1315,29 +1730,21 @@ impl ResumableRunner {
                                 });
                             }
                             let err = format!("command_not_allowed: {}: {}", code, reason);
-                            self.tool_results.push(ToolResultRecord {
-                                tool_name: tool_name.clone(),
-                                call_id: Some(call_id.clone()),
-                                output: serde_json::Value::Null,
-                                error: Some(err.clone()),
-                                status: Some("error".to_string()),
-                            });
-                            self.messages.push(Message {
-                                role: "tool".to_string(),
-                                content: serde_json::to_string(&serde_json::json!({
-                                    "tool_call_id": call_id.clone(),
-                                    "tool_name": tool_name.clone(),
-                                    "status": "error",
-                                    "error": err.clone(),
-                                    "content": err,
-                                }))
-                                .unwrap_or_default(),
-                                content_blocks: None,
-                                tool_calls: None,
-                                tool_call_id: Some(call_id.clone()),
-                                name: Some(tool_name.clone()),
-                                status: Some("error".to_string()),
-                            });
+                            let before_state = self.state.clone();
+                            self.push_tool_result_and_message(
+                                step_index,
+                                &before_state,
+                                tool_name.clone(),
+                                call_id.clone(),
+                                serde_json::Value::Null,
+                                Some(err.clone()),
+                                "error".to_string(),
+                                err,
+                                None,
+                                sink,
+                                None,
+                            )
+                            .await;
                             continue;
                         }
                         ApprovalDecision::RequireApproval { code, reason } => {
@@ -1370,6 +1777,14 @@ impl ResumableRunner {
                                 hints: None,
                             };
                             let remaining_calls = queue.into_iter().collect::<Vec<_>>();
+                            self.emit_event(
+                                sink,
+                                RunEvent::Interrupt {
+                                    step_index,
+                                    interrupt: interrupt.clone(),
+                                },
+                            )
+                            .await;
                             self.pending = Some(PendingInterrupt {
                                 interrupt: interrupt.clone(),
                                 call,
@@ -1381,6 +1796,7 @@ impl ResumableRunner {
                 }
             }
 
+            let before_state = self.state.clone();
             let result = self
                 .agent
                 .call_tool_stateful(&call.tool_name, call.arguments.clone(), &mut self.state)
@@ -1399,55 +1815,38 @@ impl ResumableRunner {
                         output,
                     )
                     .await;
-                    self.tool_results.push(ToolResultRecord {
-                        tool_name: tool_name.clone(),
-                        call_id: Some(call_id.clone()),
-                        output: out.clone(),
-                        error: None,
-                        status: Some("success".to_string()),
-                    });
-                    self.messages.push(Message {
-                        role: "tool".to_string(),
-                        content: serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": call_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "status": "success",
-                            "output": out,
-                            "content": content,
-                        }))
-                        .unwrap_or_default(),
+                    self.push_tool_result_and_message(
+                        step_index,
+                        &before_state,
+                        tool_name.clone(),
+                        call_id.clone(),
+                        out,
+                        None,
+                        "success".to_string(),
+                        content,
                         content_blocks,
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                        name: Some(tool_name.clone()),
-                        status: Some("success".to_string()),
-                    });
+                        sink,
+                        None,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let err = e.to_string();
-                    self.tool_results.push(ToolResultRecord {
-                        tool_name: tool_name.clone(),
-                        call_id: Some(call_id.clone()),
-                        output: serde_json::Value::Null,
-                        error: Some(err.clone()),
-                        status: Some("error".to_string()),
-                    });
-                    self.messages.push(Message {
-                        role: "tool".to_string(),
-                        content: serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": call_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "status": "error",
-                            "error": err.clone(),
-                            "content": err,
-                        }))
-                        .unwrap_or_default(),
-                        content_blocks: None,
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                        name: Some(tool_name.clone()),
-                        status: Some("error".to_string()),
-                    });
+                    let before_state = self.state.clone();
+                    self.push_tool_result_and_message(
+                        step_index,
+                        &before_state,
+                        tool_name.clone(),
+                        call_id.clone(),
+                        serde_json::Value::Null,
+                        Some(err.clone()),
+                        "error".to_string(),
+                        err,
+                        None,
+                        sink,
+                        None,
+                    )
+                    .await;
                 }
             }
         }
@@ -1456,15 +1855,28 @@ impl ResumableRunner {
 
     async fn execute_pending_call(
         &mut self,
+        step_index: usize,
         call: ProviderToolCall,
         edited_args: Option<serde_json::Value>,
         original_args: Option<serde_json::Value>,
+        sink: &mut dyn RunEventSink,
     ) {
         let call_id = call.call_id.clone().unwrap_or_default();
         let tool_name = call.tool_name.clone();
         let args = edited_args
             .clone()
             .unwrap_or_else(|| call.arguments.clone());
+
+        self.emit_event(
+            sink,
+            RunEvent::ToolCallStarted {
+                step_index,
+                tool_name: tool_name.clone(),
+                tool_call_id: call_id.clone(),
+                arguments_preview: preview_json(&args),
+            },
+        )
+        .await;
 
         if tool_name == "execute" {
             if let Some(policy) = &self.approval {
@@ -1478,9 +1890,9 @@ impl ResumableRunner {
                     root: self.root.clone(),
                     mode: self.mode,
                 };
-                let decision = policy.decide(&req);
-                match decision {
+                match policy.decide(&req) {
                     ApprovalDecision::Allow { reason } => {
+                        let before_state = self.state.clone();
                         let started = std::time::Instant::now();
                         let result = self
                             .agent
@@ -1512,7 +1924,7 @@ impl ResumableRunner {
                                         duration_ms: Some(duration_ms),
                                     });
                                 }
-                                let (out, content) =
+                                let (output, content) =
                                     ResumableRunner::maybe_offload_large_tool_result(
                                         &self.agent,
                                         &mut self.state,
@@ -1526,41 +1938,36 @@ impl ResumableRunner {
                                 } else {
                                     "success"
                                 };
-                                self.tool_results.push(ToolResultRecord {
-                                    tool_name: tool_name.clone(),
-                                    call_id: Some(call_id.clone()),
-                                    output: out.clone(),
-                                    error: None,
-                                    status: Some(status.to_string()),
-                                });
-                                let mut obj = serde_json::json!({
+                                let mut message_json = serde_json::json!({
                                     "tool_call_id": call_id.clone(),
                                     "tool_name": tool_name.clone(),
                                     "status": status,
-                                    "output": out,
-                                    "content": content,
+                                    "output": output.clone(),
+                                    "content": content.clone(),
                                 });
                                 if edited_args.is_some() {
-                                    if let serde_json::Value::Object(map) = &mut obj {
-                                        map.insert(
-                                            "edited".to_string(),
-                                            serde_json::Value::Bool(true),
-                                        );
+                                    if let serde_json::Value::Object(map) = &mut message_json {
+                                        map.insert("edited".to_string(), serde_json::Value::Bool(true));
                                         if let Some(orig) = original_args {
                                             map.insert("original_args".to_string(), orig);
                                         }
                                         map.insert("effective_args".to_string(), args.clone());
                                     }
                                 }
-                                self.messages.push(Message {
-                                    role: "tool".to_string(),
-                                    content: obj.to_string(),
+                                self.push_tool_result_and_message(
+                                    step_index,
+                                    &before_state,
+                                    tool_name.clone(),
+                                    call_id.clone(),
+                                    output,
+                                    None,
+                                    status.to_string(),
+                                    content,
                                     content_blocks,
-                                    tool_calls: None,
-                                    tool_call_id: Some(call_id.clone()),
-                                    name: Some(tool_name.clone()),
-                                    status: Some(status.to_string()),
-                                });
+                                    sink,
+                                    Some(message_json),
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 if let Some(sink) = &self.audit {
@@ -1578,29 +1985,20 @@ impl ResumableRunner {
                                     });
                                 }
                                 let err = e.to_string();
-                                self.tool_results.push(ToolResultRecord {
-                                    tool_name: tool_name.clone(),
-                                    call_id: Some(call_id.clone()),
-                                    output: serde_json::Value::Null,
-                                    error: Some(err.clone()),
-                                    status: Some("error".to_string()),
-                                });
-                                self.messages.push(Message {
-                                    role: "tool".to_string(),
-                                    content: serde_json::to_string(&serde_json::json!({
-                                        "tool_call_id": call_id.clone(),
-                                        "tool_name": tool_name.clone(),
-                                        "status": "error",
-                                        "error": err.clone(),
-                                        "content": err,
-                                    }))
-                                    .unwrap_or_default(),
-                                    content_blocks: None,
-                                    tool_calls: None,
-                                    tool_call_id: Some(call_id.clone()),
-                                    name: Some(tool_name.clone()),
-                                    status: Some("error".to_string()),
-                                });
+                                self.push_tool_result_and_message(
+                                    step_index,
+                                    &before_state,
+                                    tool_name.clone(),
+                                    call_id.clone(),
+                                    serde_json::Value::Null,
+                                    Some(err.clone()),
+                                    "error".to_string(),
+                                    err,
+                                    None,
+                                    sink,
+                                    None,
+                                )
+                                .await;
                             }
                         }
                         return;
@@ -1620,30 +2018,22 @@ impl ResumableRunner {
                                 duration_ms: None,
                             });
                         }
+                        let before_state = self.state.clone();
                         let err = format!("command_not_allowed: {}: {}", code, reason);
-                        self.tool_results.push(ToolResultRecord {
-                            tool_name: tool_name.clone(),
-                            call_id: Some(call_id.clone()),
-                            output: serde_json::Value::Null,
-                            error: Some(err.clone()),
-                            status: Some("error".to_string()),
-                        });
-                        self.messages.push(Message {
-                            role: "tool".to_string(),
-                            content: serde_json::to_string(&serde_json::json!({
-                                "tool_call_id": call_id.clone(),
-                                "tool_name": tool_name.clone(),
-                                "status": "error",
-                                "error": err.clone(),
-                                "content": err,
-                            }))
-                            .unwrap_or_default(),
-                            content_blocks: None,
-                            tool_calls: None,
-                            tool_call_id: Some(call_id.clone()),
-                            name: Some(tool_name.clone()),
-                            status: Some("error".to_string()),
-                        });
+                        self.push_tool_result_and_message(
+                            step_index,
+                            &before_state,
+                            tool_name.clone(),
+                            call_id.clone(),
+                            serde_json::Value::Null,
+                            Some(err.clone()),
+                            "error".to_string(),
+                            err,
+                            None,
+                            sink,
+                            None,
+                        )
+                        .await;
                         return;
                     }
                     ApprovalDecision::RequireApproval { code, reason } => {
@@ -1661,36 +2051,29 @@ impl ResumableRunner {
                                 duration_ms: None,
                             });
                         }
+                        let before_state = self.state.clone();
                         let err = format!("command_not_allowed: {}: {}", code, reason);
-                        self.tool_results.push(ToolResultRecord {
-                            tool_name: tool_name.clone(),
-                            call_id: Some(call_id.clone()),
-                            output: serde_json::Value::Null,
-                            error: Some(err.clone()),
-                            status: Some("error".to_string()),
-                        });
-                        self.messages.push(Message {
-                            role: "tool".to_string(),
-                            content: serde_json::to_string(&serde_json::json!({
-                                "tool_call_id": call_id.clone(),
-                                "tool_name": tool_name.clone(),
-                                "status": "error",
-                                "error": err.clone(),
-                                "content": err,
-                            }))
-                            .unwrap_or_default(),
-                            content_blocks: None,
-                            tool_calls: None,
-                            tool_call_id: Some(call_id.clone()),
-                            name: Some(tool_name.clone()),
-                            status: Some("error".to_string()),
-                        });
+                        self.push_tool_result_and_message(
+                            step_index,
+                            &before_state,
+                            tool_name.clone(),
+                            call_id.clone(),
+                            serde_json::Value::Null,
+                            Some(err.clone()),
+                            "error".to_string(),
+                            err,
+                            None,
+                            sink,
+                            None,
+                        )
+                        .await;
                         return;
                     }
                 }
             }
         }
 
+        let before_state = self.state.clone();
         let result = self
             .agent
             .call_tool_stateful(&tool_name, args.clone(), &mut self.state)
@@ -1702,7 +2085,7 @@ impl ResumableRunner {
                     output,
                     content_blocks,
                 } = out;
-                let (out, content) = ResumableRunner::maybe_offload_large_tool_result(
+                let (output, content) = ResumableRunner::maybe_offload_large_tool_result(
                     &self.agent,
                     &mut self.state,
                     &tool_name,
@@ -1715,22 +2098,15 @@ impl ResumableRunner {
                 } else {
                     "success"
                 };
-                self.tool_results.push(ToolResultRecord {
-                    tool_name: tool_name.clone(),
-                    call_id: Some(call_id.clone()),
-                    output: out.clone(),
-                    error: None,
-                    status: Some(status.to_string()),
-                });
-                let mut obj = serde_json::json!({
+                let mut message_json = serde_json::json!({
                     "tool_call_id": call_id.clone(),
                     "tool_name": tool_name.clone(),
                     "status": status,
-                    "output": out,
-                    "content": content,
+                    "output": output.clone(),
+                    "content": content.clone(),
                 });
                 if edited_args.is_some() {
-                    if let serde_json::Value::Object(map) = &mut obj {
+                    if let serde_json::Value::Object(map) = &mut message_json {
                         map.insert("edited".to_string(), serde_json::Value::Bool(true));
                         if let Some(orig) = original_args {
                             map.insert("original_args".to_string(), orig);
@@ -1738,74 +2114,84 @@ impl ResumableRunner {
                         map.insert("effective_args".to_string(), args);
                     }
                 }
-                self.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: obj.to_string(),
+                self.push_tool_result_and_message(
+                    step_index,
+                    &before_state,
+                    tool_name.clone(),
+                    call_id.clone(),
+                    output,
+                    None,
+                    status.to_string(),
+                    content,
                     content_blocks,
-                    tool_calls: None,
-                    tool_call_id: Some(call_id.clone()),
-                    name: Some(tool_name.clone()),
-                    status: Some(status.to_string()),
-                });
+                    sink,
+                    Some(message_json),
+                )
+                .await;
             }
             Err(e) => {
                 let err = e.to_string();
-                self.tool_results.push(ToolResultRecord {
-                    tool_name: tool_name.clone(),
-                    call_id: Some(call_id.clone()),
-                    output: serde_json::Value::Null,
-                    error: Some(err.clone()),
-                    status: Some("error".to_string()),
-                });
-                self.messages.push(Message {
-                    role: "tool".to_string(),
-                    content: serde_json::to_string(&serde_json::json!({
-                        "tool_call_id": call_id.clone(),
-                        "tool_name": tool_name.clone(),
-                        "status": "error",
-                        "error": err.clone(),
-                        "content": err,
-                    }))
-                    .unwrap_or_default(),
-                    content_blocks: None,
-                    tool_calls: None,
-                    tool_call_id: Some(call_id.clone()),
-                    name: Some(tool_name.clone()),
-                    status: Some("error".to_string()),
-                });
+                self.push_tool_result_and_message(
+                    step_index,
+                    &before_state,
+                    tool_name.clone(),
+                    call_id.clone(),
+                    serde_json::Value::Null,
+                    Some(err.clone()),
+                    "error".to_string(),
+                    err,
+                    None,
+                    sink,
+                    None,
+                )
+                .await;
             }
         }
     }
 
-    fn inject_rejected_tool_message(&mut self, call: &ProviderToolCall, reason: Option<String>) {
+    async fn inject_rejected_tool_message(
+        &mut self,
+        step_index: usize,
+        call: &ProviderToolCall,
+        reason: Option<String>,
+        sink: &mut dyn RunEventSink,
+    ) {
         let call_id = call.call_id.clone().unwrap_or_default();
         let tool_name = call.tool_name.clone();
         let reason2 = reason.unwrap_or_else(|| "rejected".to_string());
         let err = format!("tool_call_rejected: {}", reason2);
-        self.tool_results.push(ToolResultRecord {
-            tool_name: tool_name.clone(),
-            call_id: Some(call_id.clone()),
-            output: serde_json::Value::Null,
-            error: Some(err.clone()),
-            status: Some("rejected".to_string()),
-        });
-        self.messages.push(Message {
-            role: "tool".to_string(),
-            content: serde_json::to_string(&serde_json::json!({
-                "tool_call_id": call_id.clone(),
-                "tool_name": tool_name.clone(),
-                "status": "rejected",
-                "output": serde_json::Value::Null,
-                "error": err.clone(),
-                "content": err,
-            }))
-            .unwrap_or_default(),
-            content_blocks: None,
-            tool_calls: None,
-            tool_call_id: Some(call_id.clone()),
-            name: Some(tool_name),
-            status: Some("rejected".to_string()),
-        });
+        let before_state = self.state.clone();
+        self.emit_event(
+            sink,
+            RunEvent::ToolCallStarted {
+                step_index,
+                tool_name: tool_name.clone(),
+                tool_call_id: call_id.clone(),
+                arguments_preview: preview_json(&call.arguments),
+            },
+        )
+        .await;
+        self.push_tool_result_and_message(
+            step_index,
+            &before_state,
+            tool_name,
+            call_id,
+            serde_json::Value::Null,
+            Some(err.clone()),
+            "rejected".to_string(),
+            err,
+            None,
+            sink,
+            None,
+        )
+        .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runtime::StreamingRuntime for ResumableRunner {
+    async fn run_with_events(&mut self, sink: &mut dyn crate::runtime::RunEventSink) -> RunOutput {
+        ResumableRunner::run_with_events(self, sink).await
     }
 }
 
