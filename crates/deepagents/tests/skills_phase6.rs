@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use deepagents::approval::ExecutionMode;
 use deepagents::provider::protocol::{Provider, ProviderRequest, ProviderStep};
 use deepagents::provider::ProviderToolCall;
-use deepagents::runtime::{Runtime, RuntimeConfig};
-use deepagents::runtime::skills_middleware::SkillsMiddleware;
-use deepagents::skills::loader::{load_skills, SkillsLoadOptions};
 use deepagents::runtime::simple::SimpleRuntime;
+use deepagents::runtime::skills_middleware::SkillsMiddleware;
+use deepagents::runtime::{Runtime, RuntimeConfig};
+use deepagents::skills::loader::{load_skills, SkillsLoadOptions};
 use deepagents::types::Message;
 
 fn write_skill(dir: &std::path::Path, name: &str, desc: &str, tools_json: Option<&str>) {
@@ -28,9 +28,16 @@ fn load_skills_last_one_wins() {
     let b = temp.path().join("B");
     write_skill(&a, "web-research", "A impl", None);
     write_skill(&b, "web-research", "B impl", None);
-    let sources = vec![a.to_string_lossy().to_string(), b.to_string_lossy().to_string()];
+    let sources = vec![
+        a.to_string_lossy().to_string(),
+        b.to_string_lossy().to_string(),
+    ];
     let loaded = load_skills(&sources, SkillsLoadOptions::default()).unwrap();
-    let skill = loaded.metadata.iter().find(|s| s.name == "web-research").unwrap();
+    let skill = loaded
+        .metadata
+        .iter()
+        .find(|s| s.name == "web-research")
+        .unwrap();
     assert_eq!(skill.description, "B impl");
     assert_eq!(loaded.metadata.len(), 1);
 }
@@ -69,7 +76,11 @@ async fn skills_tool_executes_steps() {
         }]
     }"#;
     write_skill(&src, "read-readme", "Read README", Some(tools_json));
-    std::fs::write(temp.path().join("README.md"), "Project: DeepAgents\nhello\n").unwrap();
+    std::fs::write(
+        temp.path().join("README.md"),
+        "Project: DeepAgents\nhello\n",
+    )
+    .unwrap();
 
     let sources = vec![src.to_string_lossy().to_string()];
     let options = SkillsLoadOptions::default();
@@ -116,6 +127,7 @@ async fn skills_tool_executes_steps() {
         .run(vec![Message {
             role: "user".to_string(),
             content: "read".to_string(),
+            content_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -124,7 +136,11 @@ async fn skills_tool_executes_steps() {
         .await;
     assert!(out.error.is_none());
     let result = out.tool_results.first().unwrap();
-    let content = result.output.get("content").and_then(|v| v.as_str()).unwrap();
+    let content = result
+        .output
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap();
     assert!(content.contains("Project: DeepAgents"));
 }
 
@@ -142,7 +158,11 @@ async fn skills_tools_are_injected_into_tool_specs() {
         }]
     }"#;
     write_skill(&src, "echo-skill", "Echo", Some(tools_json));
-    std::fs::write(temp.path().join("README.md"), "Project: DeepAgents\nhello\n").unwrap();
+    std::fs::write(
+        temp.path().join("README.md"),
+        "Project: DeepAgents\nhello\n",
+    )
+    .unwrap();
 
     let sources = vec![src.to_string_lossy().to_string()];
     let options = SkillsLoadOptions::default();
@@ -177,6 +197,7 @@ async fn skills_tools_are_injected_into_tool_specs() {
         .run(vec![Message {
             role: "user".to_string(),
             content: "ping".to_string(),
+            content_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -186,7 +207,10 @@ async fn skills_tools_are_injected_into_tool_specs() {
 
     let req = captured.lock().unwrap().clone().unwrap();
     assert!(req.tool_specs.iter().any(|t| t.name == "echo-skill"));
-    assert!(req.messages.iter().any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1")));
+    assert!(req
+        .messages
+        .iter()
+        .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1")));
 }
 
 struct CaptureProvider {
@@ -197,6 +221,8 @@ struct CaptureProvider {
 impl Provider for CaptureProvider {
     async fn step(&self, req: ProviderRequest) -> Result<ProviderStep, anyhow::Error> {
         *self.captured.lock().unwrap() = Some(req);
-        Ok(ProviderStep::FinalText { text: "ok".to_string() })
+        Ok(ProviderStep::FinalText {
+            text: "ok".to_string(),
+        })
     }
 }

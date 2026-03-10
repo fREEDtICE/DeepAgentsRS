@@ -213,16 +213,25 @@ impl CompiledSubAgent for ExtraStateSubAgent {
     }
 
     async fn run(&self, mut req: SubAgentRunRequest) -> anyhow::Result<SubAgentRunOutput> {
-        req.state.extra.insert("allowed_key".to_string(), serde_json::json!({"x": 1}));
-        req.state.extra.insert("todos".to_string(), serde_json::json!([1, 2, 3]));
-        req.state.extra.insert("memory_contents".to_string(), serde_json::json!("MEM"));
+        req.state
+            .extra
+            .insert("allowed_key".to_string(), serde_json::json!({"x": 1}));
+        req.state
+            .extra
+            .insert("todos".to_string(), serde_json::json!([1, 2, 3]));
+        req.state
+            .extra
+            .insert("memory_contents".to_string(), serde_json::json!("MEM"));
         req.state
             .extra
             .insert("skills_metadata".to_string(), serde_json::json!({"k":"v"}));
+        req.state.extra.insert(
+            "structured_response".to_string(),
+            serde_json::json!({"ok": true}),
+        );
         req.state
             .extra
-            .insert("structured_response".to_string(), serde_json::json!({"ok": true}));
-        req.state.extra.insert("messages".to_string(), serde_json::json!(["bad"]));
+            .insert("messages".to_string(), serde_json::json!(["bad"]));
         Ok(SubAgentRunOutput {
             final_text: "OK".to_string(),
             state: req.state,
@@ -275,7 +284,11 @@ enum RuntimeMockOutputMode {
     LastToolError,
 }
 
-fn runtime_mock_subagent(subagent_type: &str, description: &str, script: MockScript) -> RuntimeMockSubAgent {
+fn runtime_mock_subagent(
+    subagent_type: &str,
+    description: &str,
+    script: MockScript,
+) -> RuntimeMockSubAgent {
     RuntimeMockSubAgent {
         subagent_type: subagent_type.to_string(),
         description: description.to_string(),
@@ -284,7 +297,11 @@ fn runtime_mock_subagent(subagent_type: &str, description: &str, script: MockScr
     }
 }
 
-fn runtime_last_tool_error_subagent(subagent_type: &str, description: &str, script: MockScript) -> RuntimeMockSubAgent {
+fn runtime_last_tool_error_subagent(
+    subagent_type: &str,
+    description: &str,
+    script: MockScript,
+) -> RuntimeMockSubAgent {
     RuntimeMockSubAgent {
         subagent_type: subagent_type.to_string(),
         description: description.to_string(),

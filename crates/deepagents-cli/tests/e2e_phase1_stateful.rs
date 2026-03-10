@@ -41,7 +41,11 @@ fn phase1_state_write_edit_delete_and_observability() {
         &[],
     );
     assert!(st.success());
-    let path = v.get("output").and_then(|o| o.get("path")).and_then(|p| p.as_str()).unwrap();
+    let path = v
+        .get("output")
+        .and_then(|o| o.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap();
     let rec = v
         .get("state")
         .and_then(|s| s.get("filesystem"))
@@ -50,7 +54,10 @@ fn phase1_state_write_edit_delete_and_observability() {
         .unwrap();
     assert_eq!(
         rec.get("content").unwrap().as_array().unwrap(),
-        &vec![serde_json::Value::String("hello".into()), serde_json::Value::String("world".into())]
+        &vec![
+            serde_json::Value::String("hello".into()),
+            serde_json::Value::String("world".into())
+        ]
     );
 
     let (st, v) = run_tool_stateful(
@@ -73,7 +80,10 @@ fn phase1_state_write_edit_delete_and_observability() {
         .unwrap();
     assert_eq!(
         rec.get("content").unwrap().as_array().unwrap(),
-        &vec![serde_json::Value::String("hello".into()), serde_json::Value::String("rust".into())]
+        &vec![
+            serde_json::Value::String("hello".into()),
+            serde_json::Value::String("rust".into())
+        ]
     );
 
     let (st, v) = run_tool_stateful(
@@ -111,7 +121,11 @@ fn phase1_schema_validation_missing_wrong_unknown_fields() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("missing field"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("missing field"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -122,7 +136,11 @@ fn phase1_schema_validation_missing_wrong_unknown_fields() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("invalid type"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("invalid type"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -133,7 +151,11 @@ fn phase1_schema_validation_missing_wrong_unknown_fields() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("unknown field"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("unknown field"));
 }
 
 #[test]
@@ -152,11 +174,21 @@ fn phase1_defaults_and_grep_modes() {
         root.to_string_lossy().as_ref(),
         &state_file_s,
         "read_file",
-        &format!(r#"{{"file_path":"{}"}}"#, root.join("README.md").to_string_lossy()),
+        &format!(
+            r#"{{"file_path":"{}"}}"#,
+            root.join("README.md").to_string_lossy()
+        ),
         &[],
     );
     assert!(st.success());
-    assert!(v.get("output").unwrap().get("content").unwrap().as_str().unwrap().contains("1→needle"));
+    assert!(v
+        .get("output")
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("1→needle"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -172,18 +204,29 @@ fn phase1_defaults_and_grep_modes() {
     assert!(st.success());
     let content = v.get("output").unwrap().as_array().unwrap();
     assert!(content.len() >= 2);
-    assert!(content.iter().all(|m| m.get("line").unwrap().as_u64().unwrap() >= 1));
+    assert!(content
+        .iter()
+        .all(|m| m.get("line").unwrap().as_u64().unwrap() >= 1));
 
     let (st, v) = run_tool_stateful(
         bin,
         root.to_string_lossy().as_ref(),
         &state_file_s,
         "grep",
-        &format!(r#"{{"pattern":"needle","path":"{}","glob":"**/*.*"}}"#, root.to_string_lossy()),
+        &format!(
+            r#"{{"pattern":"needle","path":"{}","glob":"**/*.*"}}"#,
+            root.to_string_lossy()
+        ),
         &[],
     );
     assert!(st.success());
-    assert!(v.get("output").unwrap().as_array().unwrap().iter().all(|p| p.as_str().is_some()));
+    assert!(v
+        .get("output")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p.as_str().is_some()));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -198,7 +241,9 @@ fn phase1_defaults_and_grep_modes() {
     );
     assert!(st.success());
     let counts = v.get("output").unwrap().as_array().unwrap();
-    assert!(counts.iter().all(|e| e.is_array() && e.as_array().unwrap().len() == 2));
+    assert!(counts
+        .iter()
+        .all(|e| e.is_array() && e.as_array().unwrap().len() == 2));
 }
 
 #[test]
@@ -220,7 +265,10 @@ fn phase1_glob_paths_reusable_for_read() {
         &[],
     );
     assert!(st.success());
-    let p = v.get("output").unwrap().as_array().unwrap()[0].as_str().unwrap().to_string();
+    let p = v.get("output").unwrap().as_array().unwrap()[0]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -231,7 +279,14 @@ fn phase1_glob_paths_reusable_for_read() {
         &[],
     );
     assert!(st.success());
-    assert!(v.get("output").unwrap().get("content").unwrap().as_str().unwrap().contains("1→hello"));
+    assert!(v
+        .get("output")
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("1→hello"));
 }
 
 #[test]
@@ -247,12 +302,27 @@ fn phase1_truncation_and_pagination_for_read_file() {
         root.to_string_lossy().as_ref(),
         &state_file_s,
         "read_file",
-        &format!(r#"{{"file_path":"{}","limit":2,"offset":0}}"#, root.join("large.txt").to_string_lossy()),
+        &format!(
+            r#"{{"file_path":"{}","limit":2,"offset":0}}"#,
+            root.join("large.txt").to_string_lossy()
+        ),
         &[],
     );
     assert!(st.success());
-    assert!(v.get("output").unwrap().get("truncated").unwrap().as_bool().unwrap());
-    let next = v.get("output").unwrap().get("next_offset").unwrap().as_u64().unwrap();
+    assert!(v
+        .get("output")
+        .unwrap()
+        .get("truncated")
+        .unwrap()
+        .as_bool()
+        .unwrap());
+    let next = v
+        .get("output")
+        .unwrap()
+        .get("next_offset")
+        .unwrap()
+        .as_u64()
+        .unwrap();
     assert_eq!(next, 2);
 
     let (st, v) = run_tool_stateful(
@@ -268,7 +338,13 @@ fn phase1_truncation_and_pagination_for_read_file() {
         &[],
     );
     assert!(st.success());
-    let s = v.get("output").unwrap().get("content").unwrap().as_str().unwrap();
+    let s = v
+        .get("output")
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(s.contains("3→c"));
 }
 
@@ -294,7 +370,11 @@ fn phase1_security_outside_root_and_symlink_escape() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("permission_denied"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("permission_denied"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -305,7 +385,11 @@ fn phase1_security_outside_root_and_symlink_escape() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("permission_denied"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("permission_denied"));
 }
 
 #[test]
@@ -323,22 +407,36 @@ fn phase1_error_codes_and_execute_contracts() {
         root.to_string_lossy().as_ref(),
         &state_file_s,
         "read_file",
-        &format!(r#"{{"file_path":"{}","limit":1}}"#, root.join("nope.txt").to_string_lossy()),
+        &format!(
+            r#"{{"file_path":"{}","limit":1}}"#,
+            root.join("nope.txt").to_string_lossy()
+        ),
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("file_not_found"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("file_not_found"));
 
     let (st, v) = run_tool_stateful(
         bin,
         root.to_string_lossy().as_ref(),
         &state_file_s,
         "read_file",
-        &format!(r#"{{"file_path":"{}","limit":1}}"#, root.join("d").to_string_lossy()),
+        &format!(
+            r#"{{"file_path":"{}","limit":1}}"#,
+            root.join("d").to_string_lossy()
+        ),
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("is_directory"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("is_directory"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -353,7 +451,10 @@ fn phase1_error_codes_and_execute_contracts() {
     );
     assert!(st.success());
     assert_eq!(
-        v.get("output").unwrap().get("error").and_then(|e| e.as_str()),
+        v.get("output")
+            .unwrap()
+            .get("error")
+            .and_then(|e| e.as_str()),
         Some("parent_not_found")
     );
 
@@ -369,7 +470,13 @@ fn phase1_error_codes_and_execute_contracts() {
         &[],
     );
     assert!(st.success());
-    assert_eq!(v.get("output").unwrap().get("error").and_then(|e| e.as_str()), Some("no_match"));
+    assert_eq!(
+        v.get("output")
+            .unwrap()
+            .get("error")
+            .and_then(|e| e.as_str()),
+        Some("no_match")
+    );
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -380,7 +487,11 @@ fn phase1_error_codes_and_execute_contracts() {
         &["sleep"],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("timeout"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("timeout"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -391,7 +502,11 @@ fn phase1_error_codes_and_execute_contracts() {
         &["echo"],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("command_not_allowed"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("command_not_allowed"));
 
     let (st, v) = run_tool_stateful(
         bin,
@@ -402,6 +517,11 @@ fn phase1_error_codes_and_execute_contracts() {
         &["yes", "head"],
     );
     assert!(st.success());
-    let tr = v.get("output").unwrap().get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
+    let tr = v
+        .get("output")
+        .unwrap()
+        .get("truncated")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
     assert!(tr);
 }

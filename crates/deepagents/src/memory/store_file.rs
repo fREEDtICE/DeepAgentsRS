@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 
 use crate::memory::protocol::{
-    MemoryEntry, MemoryError, MemoryErrorCode, MemoryEvictionPolicy, MemoryEvictionReport, MemoryPolicy, MemoryQuery, MemoryStore,
+    MemoryEntry, MemoryError, MemoryErrorCode, MemoryEvictionPolicy, MemoryEvictionReport,
+    MemoryPolicy, MemoryQuery, MemoryStore,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -75,7 +76,10 @@ impl FileMemoryStore {
         let md = render_agents_md_v1(&entries);
         write_atomic(&self.agents_md_path, md.as_bytes())
             .await
-            .map_err(|e| MemoryError::new(MemoryErrorCode::IoError, "failed to write AGENTS.md").with_source(e))?;
+            .map_err(|e| {
+                MemoryError::new(MemoryErrorCode::IoError, "failed to write AGENTS.md")
+                    .with_source(e)
+            })?;
         Ok(())
     }
 
@@ -88,8 +92,11 @@ impl FileMemoryStore {
         let (policy, entries) = match read_file_bytes(&self.path).await {
             Ok(Some(bytes)) => {
                 let f: MemoryFileV1 = serde_json::from_slice(&bytes).map_err(|e| {
-                    MemoryError::new(MemoryErrorCode::Corrupt, "failed to parse memory store file")
-                        .with_source(anyhow::Error::new(e))
+                    MemoryError::new(
+                        MemoryErrorCode::Corrupt,
+                        "failed to parse memory store file",
+                    )
+                    .with_source(anyhow::Error::new(e))
                 })?;
                 if f.version != 1 {
                     return Err(MemoryError::new(
@@ -100,7 +107,13 @@ impl FileMemoryStore {
                 (f.policy, f.entries)
             }
             Ok(None) => (self.default_policy.clone(), Vec::new()),
-            Err(e) => return Err(MemoryError::new(MemoryErrorCode::IoError, "failed to read memory store file").with_source(e)),
+            Err(e) => {
+                return Err(MemoryError::new(
+                    MemoryErrorCode::IoError,
+                    "failed to read memory store file",
+                )
+                .with_source(e))
+            }
         };
 
         let mut guard = self.state.lock().unwrap();
@@ -131,7 +144,9 @@ impl FileMemoryStore {
     }
 
     fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
-        DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&Utc))
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
     }
 
     fn matches_query(e: &MemoryEntry, q: &MemoryQuery) -> bool {
@@ -171,9 +186,10 @@ impl MemoryStore for FileMemoryStore {
         };
 
         if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| MemoryError::new(MemoryErrorCode::IoError, "failed to create store dir").with_source(anyhow::Error::new(e)))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                MemoryError::new(MemoryErrorCode::IoError, "failed to create store dir")
+                    .with_source(anyhow::Error::new(e))
+            })?;
         }
 
         let f = MemoryFileV1 {
@@ -181,11 +197,13 @@ impl MemoryStore for FileMemoryStore {
             policy,
             entries,
         };
-        let bytes = serde_json::to_vec_pretty(&f)
-            .map_err(|e| MemoryError::new(MemoryErrorCode::Corrupt, "failed to serialize store file").with_source(anyhow::Error::new(e)))?;
-        write_atomic(&self.path, &bytes)
-            .await
-            .map_err(|e| MemoryError::new(MemoryErrorCode::IoError, "failed to write store file").with_source(e))?;
+        let bytes = serde_json::to_vec_pretty(&f).map_err(|e| {
+            MemoryError::new(MemoryErrorCode::Corrupt, "failed to serialize store file")
+                .with_source(anyhow::Error::new(e))
+        })?;
+        write_atomic(&self.path, &bytes).await.map_err(|e| {
+            MemoryError::new(MemoryErrorCode::IoError, "failed to write store file").with_source(e)
+        })?;
         Ok(())
     }
 
@@ -293,7 +311,9 @@ impl MemoryStore for FileMemoryStore {
                     .entries
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, e)| Self::parse_ts(&e.last_accessed_at).unwrap_or_else(Utc::now))
+                    .min_by_key(|(_, e)| {
+                        Self::parse_ts(&e.last_accessed_at).unwrap_or_else(Utc::now)
+                    })
                     .map(|(i, _)| i)
                     .unwrap_or(0),
                 MemoryEvictionPolicy::Ttl { ttl_secs } => {

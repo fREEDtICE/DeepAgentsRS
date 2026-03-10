@@ -103,7 +103,13 @@ fn phase4_sa02_isolation_child_messages_only_description() {
     );
     assert!(st.success());
     let payload: serde_json::Value = serde_json::from_str(&tool_result_content(&v, 0)).unwrap();
-    assert_eq!(payload.get("messages_len").and_then(|n| n.as_u64()).unwrap(), 1);
+    assert_eq!(
+        payload
+            .get("messages_len")
+            .and_then(|n| n.as_u64())
+            .unwrap(),
+        1
+    );
     assert_eq!(
         payload
             .get("first_message")
@@ -112,13 +118,10 @@ fn phase4_sa02_isolation_child_messages_only_description() {
             .unwrap(),
         "check isolation"
     );
-    assert_eq!(
-        payload
-            .get("saw_secret_in_messages")
-            .and_then(|b| b.as_bool())
-            .unwrap(),
-        false
-    );
+    assert!(!payload
+        .get("saw_secret_in_messages")
+        .and_then(|b| b.as_bool())
+        .unwrap());
 }
 
 #[test]
@@ -184,7 +187,10 @@ fn phase4_sa04_only_final_message_is_returned() {
         "input",
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "final");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "final"
+    );
 }
 
 #[test]
@@ -273,10 +279,19 @@ fn phase4_sa07_child_tool_side_effects_happen_without_polluting_parent_trace() {
         "input",
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "DONE");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "DONE"
+    );
     assert!(root.join("child.txt").exists());
     assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap().len(), 1);
-    assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap()[0].get("tool_name").and_then(|s| s.as_str()).unwrap(), "task");
+    assert_eq!(
+        v.get("tool_calls").unwrap().as_array().unwrap()[0]
+            .get("tool_name")
+            .and_then(|s| s.as_str())
+            .unwrap(),
+        "task"
+    );
 }
 
 #[test]
@@ -362,6 +377,9 @@ fn phase4_security_execute_policy_is_enforced_in_subagent() {
     assert!(st.success());
     let text = v.get("final_text").and_then(|s| s.as_str()).unwrap();
     assert!(text.contains("command_not_allowed"));
-    assert!(text.contains("approval_required") || text.contains("not_in_allow_list") || text.contains("dangerous_pattern"));
+    assert!(
+        text.contains("approval_required")
+            || text.contains("not_in_allow_list")
+            || text.contains("dangerous_pattern")
+    );
 }
-

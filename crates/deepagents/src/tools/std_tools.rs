@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine;
 use serde::Deserialize;
 
 use crate::backends::SandboxBackend;
 use crate::tools::protocol::{Tool, ToolResult};
+use crate::types::ContentBlock;
 
 pub fn default_tools(backend: Arc<dyn SandboxBackend>) -> Vec<Arc<dyn Tool>> {
     vec![
@@ -59,6 +62,7 @@ impl Tool for LsTool {
         let infos = self.backend.ls_info(&input.path).await?;
         Ok(ToolResult {
             output: serde_json::to_value(infos)?,
+            content_blocks: None,
         })
     }
 }
@@ -75,13 +79,43 @@ struct ReadFileInput {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct ReadFileOutput {
-    content: String,
-    truncated: bool,
-    next_offset: Option<usize>,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ReadFileOutput {
+    Text {
+        content: String,
+        truncated: bool,
+        next_offset: Option<usize>,
+    },
+    Image {
+        file_path: String,
+        mime_type: String,
+        size_bytes: u64,
+        content: String,
+    },
+}
+
+const READ_FILE_DEFAULT_LIMIT: usize = 100;
+const READ_FILE_DEFAULT_MAX_BYTES: usize = 4_000_000;
+
+fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -96,8 +130,50 @@ impl Tool for ReadFileTool {
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
         let input: ReadFileInput = serde_json::from_value(input)?;
+        let mode = input
+            .mode
+            .as_deref()
+            .unwrap_or("auto")
+            .trim()
+            .to_ascii_lowercase();
+        let image_mime = image_mime_for_path(&input.file_path);
+        let use_image = match mode.as_str() {
+            "auto" => image_mime.is_some(),
+            "text" => false,
+            "image" => true,
+            _ => {
+                return Err(anyhow::anyhow!("invalid_request: unknown mode"));
+            }
+        };
+
+        if use_image {
+            let mime = image_mime
+                .ok_or_else(|| anyhow::anyhow!("invalid_request: unsupported_image_type"))?;
+            let max_bytes = input.max_bytes.unwrap_or(READ_FILE_DEFAULT_MAX_BYTES);
+            if max_bytes == 0 {
+                return Err(anyhow::anyhow!("invalid_request: max_bytes must be > 0"));
+            }
+            let bytes = self.backend.read_bytes(&input.file_path, max_bytes).await?;
+            let size_bytes = bytes.len() as u64;
+            let base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let output = ReadFileOutput::Image {
+                file_path: input.file_path,
+                mime_type: mime.to_string(),
+                size_bytes,
+                content: "(image returned as content block)".to_string(),
+            };
+            return Ok(ToolResult {
+                output: serde_json::to_value(output)?,
+                content_blocks: Some(vec![ContentBlock {
+                    block_type: "image_base64".to_string(),
+                    mime_type: Some(mime.to_string()),
+                    base64: Some(base64),
+                }]),
+            });
+        }
+
         let offset = input.offset.unwrap_or(0);
-        let limit = input.limit.unwrap_or(100).max(1);
+        let limit = input.limit.unwrap_or(READ_FILE_DEFAULT_LIMIT).max(1);
         let out = self
             .backend
             .read(&input.file_path, offset, limit + 1)
@@ -113,11 +189,12 @@ impl Tool for ReadFileTool {
         }
         let next_offset = truncated.then_some(offset + limit);
         Ok(ToolResult {
-            output: serde_json::to_value(ReadFileOutput {
+            output: serde_json::to_value(ReadFileOutput::Text {
                 content,
                 truncated,
                 next_offset,
             })?,
+            content_blocks: None,
         })
     }
 }
@@ -145,9 +222,13 @@ impl Tool for WriteFileTool {
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
         let input: WriteFileInput = serde_json::from_value(input)?;
-        let res = self.backend.write_file(&input.file_path, &input.content).await?;
+        let res = self
+            .backend
+            .write_file(&input.file_path, &input.content)
+            .await?;
         Ok(ToolResult {
             output: serde_json::to_value(res)?,
+            content_blocks: None,
         })
     }
 }
@@ -177,6 +258,7 @@ impl Tool for DeleteFileTool {
         let res = self.backend.delete_file(&input.file_path).await?;
         Ok(ToolResult {
             output: serde_json::to_value(res)?,
+            content_blocks: None,
         })
     }
 }
@@ -211,6 +293,7 @@ impl Tool for EditFileTool {
             .await?;
         Ok(ToolResult {
             output: serde_json::to_value(res)?,
+            content_blocks: None,
         })
     }
 }
@@ -240,6 +323,7 @@ impl Tool for GlobTool {
         let res = self.backend.glob(&input.pattern).await?;
         Ok(ToolResult {
             output: serde_json::to_value(res)?,
+            content_blocks: None,
         })
     }
 }
@@ -284,15 +368,13 @@ impl Tool for GrepTool {
         let input: GrepInput = serde_json::from_value(input)?;
         let matches = self
             .backend
-            .grep(
-                &input.pattern,
-                input.path.as_deref(),
-                input.glob.as_deref(),
-            )
+            .grep(&input.pattern, input.path.as_deref(), input.glob.as_deref())
             .await?;
 
         let head = input.head_limit.unwrap_or(100);
-        let mode = input.output_mode.unwrap_or(GrepOutputMode::FilesWithMatches);
+        let mode = input
+            .output_mode
+            .unwrap_or(GrepOutputMode::FilesWithMatches);
         let output = match mode {
             GrepOutputMode::FilesWithMatches => {
                 let mut files = BTreeSet::new();
@@ -322,7 +404,10 @@ impl Tool for GrepTool {
             }
         };
 
-        Ok(ToolResult { output })
+        Ok(ToolResult {
+            output,
+            content_blocks: None,
+        })
     }
 }
 
@@ -353,6 +438,7 @@ impl Tool for ExecuteTool {
         let res = self.backend.execute(&input.command, input.timeout).await?;
         Ok(ToolResult {
             output: serde_json::to_value(res)?,
+            content_blocks: None,
         })
     }
 }

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 chrono.workspace = true
 globset.workspace = true
 regex.workspace = true
@@ -17,6 +18,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

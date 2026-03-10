@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::backends::{LocalSandbox, SandboxBackend};
+use crate::middleware::filesystem::FilesystemMiddleware;
 use crate::middleware::protocol::{MiddlewareContext, ToolExecution};
 use crate::middleware::Middleware;
-use crate::middleware::filesystem::FilesystemMiddleware;
 use crate::state::AgentState;
-use crate::tools::{default_tools, Tool};
+use crate::tools::{default_tools, Tool, ToolResult};
 use crate::types::{AgentRequest, AgentResponse};
 
 #[derive(Clone)]
@@ -28,7 +28,10 @@ impl DeepAgent {
         }
     }
 
-    pub fn with_backend_and_tools(backend: Arc<dyn SandboxBackend>, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn with_backend_and_tools(
+        backend: Arc<dyn SandboxBackend>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
         let tools = tools.into_iter().map(|t| (t.name(), t)).collect();
         let middlewares: Vec<Arc<dyn Middleware>> = vec![Arc::new(FilesystemMiddleware::new())];
         Self {
@@ -38,13 +41,21 @@ impl DeepAgent {
         }
     }
 
+    pub fn backend(&self) -> Arc<dyn SandboxBackend> {
+        self.backend.clone()
+    }
+
     pub async fn run(&self, _req: AgentRequest) -> anyhow::Result<AgentResponse> {
         Ok(AgentResponse {
             output_text: String::new(),
         })
     }
 
-    pub async fn call_tool(&self, name: &str, input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let tool = self
             .tools
             .get(name)
@@ -57,7 +68,7 @@ impl DeepAgent {
         name: &str,
         input: serde_json::Value,
         state: &mut AgentState,
-    ) -> anyhow::Result<(serde_json::Value, Option<crate::state::FilesystemDelta>)> {
+    ) -> anyhow::Result<(ToolResult, Option<crate::state::FilesystemDelta>)> {
         let tool = self
             .tools
             .get(name)
@@ -74,13 +85,17 @@ impl DeepAgent {
         }
 
         let result = tool.call(input).await;
-        let mut exec = match result {
-            Ok(res) => ToolExecution {
-                tool_name: name.to_string(),
-                input: exec.input,
-                output: Some(res.output),
-                error: None,
-            },
+        let mut tool_result: Option<ToolResult> = None;
+        let exec = match result {
+            Ok(res) => {
+                tool_result = Some(res.clone());
+                ToolExecution {
+                    tool_name: name.to_string(),
+                    input: exec.input,
+                    output: Some(res.output),
+                    error: None,
+                }
+            }
             Err(e) => ToolExecution {
                 tool_name: name.to_string(),
                 input: exec.input,
@@ -104,7 +119,13 @@ impl DeepAgent {
 
         match exec.error {
             Some(err) => Err(anyhow::anyhow!(err)),
-            None => Ok((exec.output.take().unwrap_or(serde_json::Value::Null), filesystem_delta)),
+            None => Ok((
+                tool_result.unwrap_or(ToolResult {
+                    output: serde_json::Value::Null,
+                    content_blocks: None,
+                }),
+                filesystem_delta,
+            )),
         }
     }
 }

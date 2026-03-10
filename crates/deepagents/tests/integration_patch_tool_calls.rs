@@ -6,14 +6,15 @@ use deepagents::provider::ProviderToolCall;
 use deepagents::runtime::patch_tool_calls::patch_dangling_tool_calls;
 use deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware;
 use deepagents::runtime::simple::SimpleRuntime;
-use deepagents::runtime::RuntimeConfig;
 use deepagents::runtime::Runtime;
+use deepagents::runtime::RuntimeConfig;
 use deepagents::types::{Message, ToolCall};
 
 fn msg(role: &str, content: &str) -> Message {
     Message {
         role: role.to_string(),
         content: content.to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -25,6 +26,7 @@ fn assistant_with_tool_calls(calls: Vec<ToolCall>) -> Message {
     Message {
         role: "assistant".to_string(),
         content: String::new(),
+        content_blocks: None,
         tool_calls: Some(calls),
         tool_call_id: None,
         name: None,
@@ -36,6 +38,7 @@ fn tool_msg(call_id: &str, name: &str, status: &str, content: &str) -> Message {
     Message {
         role: "tool".to_string(),
         content: content.to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),
         name: Some(name.to_string()),
@@ -165,12 +168,14 @@ async fn normalize_accepts_string_json_arguments_for_tool_calls() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> = Arc::new(MockProvider::from_script(script));
+    let provider: Arc<dyn deepagents::provider::Provider> =
+        Arc::new(MockProvider::from_script(script));
 
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
 
-    let patch_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(PatchToolCallsMiddleware::new());
+    let patch_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+        Arc::new(PatchToolCallsMiddleware::new());
     let runtime = SimpleRuntime::new(
         agent,
         provider,

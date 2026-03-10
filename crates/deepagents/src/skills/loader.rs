@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::skills::{
-    LoadedSkills, SkillMetadata, SkillOverrideRecord, SkillSourceDiagnostics, SkillToolSpec, SkillsDiagnostics,
-};
 use crate::skills::validator::{load_skill_dir, SkillPackage, SkillValidationOptions};
+use crate::skills::{
+    LoadedSkills, SkillMetadata, SkillOverrideRecord, SkillSourceDiagnostics, SkillToolSpec,
+    SkillsDiagnostics,
+};
 
 #[derive(Debug, Clone)]
 pub struct SkillsLoadOptions {
@@ -54,7 +55,13 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
             if !path.is_dir() {
                 continue;
             }
-            match load_skill_dir(&path, &source_name, SkillValidationOptions { strict: options.strict }) {
+            match load_skill_dir(
+                &path,
+                &source_name,
+                SkillValidationOptions {
+                    strict: options.strict,
+                },
+            ) {
                 Ok(pkg) => {
                     if let Some(prev) = skill_map.get(&pkg.metadata.name) {
                         diagnostics.overrides.push(SkillOverrideRecord {
@@ -71,7 +78,9 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
                         return Err(anyhow::anyhow!("{}: {}", path.display(), e));
                     }
                     source_diag.skipped += 1;
-                    source_diag.errors.push(format!("{}: {}", path.display(), e));
+                    source_diag
+                        .errors
+                        .push(format!("{}: {}", path.display(), e));
                 }
             }
         }
@@ -84,7 +93,10 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
         metadata.push(pkg.metadata.clone());
         for tool in pkg.tools {
             if is_core_tool(&tool.name) {
-                return Err(anyhow::anyhow!("skill tool conflicts with core tool: {}", tool.name));
+                return Err(anyhow::anyhow!(
+                    "skill tool conflicts with core tool: {}",
+                    tool.name
+                ));
             }
             if let Some(prev) = tool_map.get(&tool.name) {
                 diagnostics.overrides.push(SkillOverrideRecord {
@@ -115,8 +127,7 @@ fn source_name(path: &Path) -> String {
 fn is_core_tool(name: &str) -> bool {
     matches!(
         name,
-        "ls"
-            | "read_file"
+        "ls" | "read_file"
             | "write_file"
             | "edit_file"
             | "delete_file"

@@ -1,12 +1,12 @@
 ---
 title: DeepAgents（Python 版）代码调研与 Rust 迁移方案
-source_repo_root: /Users/bytedance/Documents/Dev/deepagents-rs/deepagents/
+source_repo_root: ../../deepagents/
 generated_at: 2026-03-05
 ---
 
 ## 0. 范围与目标
 
-本调研以 `/Users/bytedance/Documents/Dev/deepagents-rs/deepagents/` 为唯一事实来源，目标是：
+本调研以 `../../deepagents/` 为唯一事实来源，目标是：
 
 - 还原 deepagents（Python）端到端运行链路与关键语义边界（agent loop / middleware / backend / state）。
 - 提炼出 Rust 版本需要对齐的“可观察行为”（tool schema、state key、隔离策略、落盘路径、错误语义等）。

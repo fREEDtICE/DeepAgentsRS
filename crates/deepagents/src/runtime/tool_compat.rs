@@ -17,7 +17,10 @@ fn stringify_error(v: &serde_json::Value) -> String {
     }
 }
 
-fn extract_string<'a>(map: &'a serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<&'a str> {
+fn extract_string<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
     for k in keys {
         if let Some(s) = map.get(*k).and_then(|v| v.as_str()) {
             return Some(s);
@@ -30,7 +33,9 @@ pub fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len());
     for mut msg in messages {
         if msg.role == "assistant" && msg.tool_calls.is_none() {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&msg.content)
+            {
                 if let Some(tc_val) = map.get("tool_calls") {
                     if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()) {
                         msg.content = map
@@ -45,10 +50,19 @@ pub fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
         }
 
         if msg.role == "tool" && msg.tool_call_id.is_none() {
-            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+            if let Ok(serde_json::Value::Object(map)) =
+                serde_json::from_str::<serde_json::Value>(&msg.content)
+            {
                 if let Some(id) = extract_string(
                     &map,
-                    &["tool_call_id", "tool_use_id", "toolUseId", "call_id", "id", "tool_callid"],
+                    &[
+                        "tool_call_id",
+                        "tool_use_id",
+                        "toolUseId",
+                        "call_id",
+                        "id",
+                        "tool_callid",
+                    ],
                 ) {
                     msg.tool_call_id = Some(id.to_string());
                 }
@@ -93,7 +107,10 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
                     .clone()
                     .or_else(|| extract_string(&map, &["tool_name", "name"]).map(|s| s.to_string()))
                     .unwrap_or_else(|| "unknown".to_string());
-                let output = map.get("output").cloned().unwrap_or(serde_json::Value::Null);
+                let output = map
+                    .get("output")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let error = map
                     .get("error")
                     .filter(|e| !e.is_null())
@@ -109,7 +126,13 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
                     .status
                     .clone()
                     .or_else(|| extract_string(&map, &["status"]).map(|s| s.to_string()))
-                    .or_else(|| if error.is_some() { Some("error".to_string()) } else { Some("success".to_string()) });
+                    .or_else(|| {
+                        if error.is_some() {
+                            Some("error".to_string())
+                        } else {
+                            Some("success".to_string())
+                        }
+                    });
                 (tool_name, output, error, status)
             }
             _ => {
@@ -137,15 +160,26 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
 
 pub enum NormalizedToolCall {
     Valid(ProviderToolCall),
-    Invalid { call: ProviderToolCall, error: String },
+    Invalid {
+        call: ProviderToolCall,
+        error: String,
+    },
 }
 
-pub fn normalize_tool_call_for_execution(mut call: ProviderToolCall, next_call_id: &mut u64) -> NormalizedToolCall {
+pub fn normalize_tool_call_for_execution(
+    mut call: ProviderToolCall,
+    next_call_id: &mut u64,
+) -> NormalizedToolCall {
     if call.tool_name.trim().is_empty() {
         call.tool_name = "unknown".to_string();
     }
 
-    let need_id = call.call_id.as_deref().map(str::trim).unwrap_or("").is_empty();
+    let need_id = call
+        .call_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
     if need_id {
         let id = format!("call-{}", *next_call_id);
         *next_call_id += 1;

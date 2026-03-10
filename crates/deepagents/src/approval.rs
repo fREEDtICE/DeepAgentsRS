@@ -158,18 +158,7 @@ fn contains_control_chars(s: &str) -> bool {
 
 fn contains_dangerous_patterns(s: &str) -> bool {
     let needles = [
-        "$(",
-        "`",
-        "${",
-        "$'",
-        "<<<",
-        ">>",
-        "<<",
-        ">>",
-        ">",
-        "<",
-        "<(",
-        ">(",
+        "$(", "`", "${", "$'", "<<<", ">>", "<<", ">>", ">", "<", "<(", ">(",
     ];
     if needles.iter().any(|n| s.contains(n)) {
         return true;
@@ -257,7 +246,10 @@ fn first_program_token(segment: &str) -> Option<String> {
         }
         break;
     }
-    tokens.first().map(|s| s.to_string()).filter(|s| !s.is_empty())
+    tokens
+        .first()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn is_env_assignment_token(t: &str) -> bool {
@@ -299,4 +291,3 @@ fn shell_like_split(s: &str) -> Vec<String> {
     }
     out
 }
-

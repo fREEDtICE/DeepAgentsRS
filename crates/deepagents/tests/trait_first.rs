@@ -22,11 +22,31 @@ impl FilesystemBackend for MockBackend {
         }])
     }
 
-    async fn read(&self, _file_path: &str, _offset: usize, _limit: usize) -> Result<String, BackendError> {
+    async fn read(
+        &self,
+        _file_path: &str,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<String, BackendError> {
         Ok("     1→hello\n".to_string())
     }
 
-    async fn write_file(&self, file_path: &str, _content: &str) -> Result<WriteResult, BackendError> {
+    async fn read_bytes(
+        &self,
+        _file_path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        if max_bytes == 0 {
+            return Err(BackendError::Other("too_large".to_string()));
+        }
+        Ok(vec![0u8; 1])
+    }
+
+    async fn write_file(
+        &self,
+        file_path: &str,
+        _content: &str,
+    ) -> Result<WriteResult, BackendError> {
         Ok(WriteResult {
             error: None,
             path: Some(file_path.to_string()),
@@ -66,7 +86,11 @@ impl FilesystemBackend for MockBackend {
 
 #[async_trait]
 impl SandboxBackend for MockBackend {
-    async fn execute(&self, _command: &str, _timeout_secs: Option<u64>) -> Result<ExecResult, BackendError> {
+    async fn execute(
+        &self,
+        _command: &str,
+        _timeout_secs: Option<u64>,
+    ) -> Result<ExecResult, BackendError> {
         Ok(ExecResult {
             exit_code: 0,
             output: "ok".to_string(),
@@ -92,5 +116,10 @@ async fn agent_can_use_third_party_backend_via_traits() {
 
     let arr = out.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert!(arr[0].get("path").unwrap().as_str().unwrap().ends_with("/a.txt"));
+    assert!(arr[0]
+        .get("path")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .ends_with("/a.txt"));
 }

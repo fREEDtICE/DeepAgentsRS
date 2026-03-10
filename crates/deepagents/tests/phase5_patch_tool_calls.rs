@@ -1,12 +1,16 @@
 use deepagents::provider::ProviderToolCall;
 use deepagents::runtime::patch_tool_calls::{patch_dangling_tool_calls, sanitize_tool_call_id};
-use deepagents::runtime::tool_compat::{normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages, NormalizedToolCall};
+use deepagents::runtime::tool_compat::{
+    normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages,
+    NormalizedToolCall,
+};
 use deepagents::types::{Message, ToolCall};
 
 fn assistant_with_tool_calls(calls: Vec<ToolCall>) -> Message {
     Message {
         role: "assistant".to_string(),
         content: String::new(),
+        content_blocks: None,
         tool_calls: Some(calls),
         tool_call_id: None,
         name: None,
@@ -18,6 +22,7 @@ fn tool_msg(call_id: &str, name: &str, status: &str, content: &str) -> Message {
     Message {
         role: "tool".to_string(),
         content: content.to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),
         name: Some(name.to_string()),
@@ -76,7 +81,10 @@ fn pt03_history_consistent_is_not_modified() {
         name: "write_file".to_string(),
         arguments: serde_json::json!({}),
     }];
-    let messages = vec![assistant_with_tool_calls(calls), tool_msg("x", "write_file", "success", "ok")];
+    let messages = vec![
+        assistant_with_tool_calls(calls),
+        tool_msg("x", "write_file", "success", "ok"),
+    ];
     let patched = patch_dangling_tool_calls(messages.clone());
     assert_eq!(patched.len(), messages.len());
     assert_eq!(patched[0].tool_calls.as_ref().unwrap().len(), 1);
@@ -102,6 +110,7 @@ fn pt04_only_truly_dangling_tool_calls_are_patched() {
         Message {
             role: "user".to_string(),
             content: "later".to_string(),
+            content_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -141,6 +150,7 @@ fn normalize_messages_extracts_assistant_tool_calls_from_json_content() {
     let msg = Message {
         role: "assistant".to_string(),
         content,
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -157,6 +167,7 @@ fn normalize_messages_extracts_tool_call_id_from_tool_json_content() {
     let msg = Message {
         role: "tool".to_string(),
         content: r#"{"tool_call_id":"x","content":"ok"}"#.to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -210,6 +221,7 @@ fn tool_results_from_messages_parses_runtime_tool_json_shape() {
             "content": "hello"
         })
         .to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: Some("x".to_string()),
         name: Some("read_file".to_string()),
@@ -220,7 +232,14 @@ fn tool_results_from_messages_parses_runtime_tool_json_shape() {
     assert_eq!(out[0].call_id.as_deref().unwrap(), "x");
     assert_eq!(out[0].tool_name, "read_file");
     assert_eq!(out[0].status.as_deref().unwrap(), "success");
-    assert_eq!(out[0].output.get("content").and_then(|v| v.as_str()).unwrap(), "hello");
+    assert_eq!(
+        out[0]
+            .output
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "hello"
+    );
 }
 
 #[test]

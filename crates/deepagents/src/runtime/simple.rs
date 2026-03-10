@@ -2,17 +2,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::time::{timeout, Duration};
 
-use crate::approval::{redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ExecutionMode};
+use crate::approval::{
+    redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ExecutionMode,
+};
 use crate::audit::{AuditEvent, AuditSink};
 use crate::provider::{Provider, ProviderRequest, ProviderStep, ProviderToolCall};
-use crate::runtime::protocol::{
-    HandledToolCall, RunOutput, Runtime, RuntimeConfig, RuntimeError, RuntimeMiddleware, ToolCallContext, ToolCallRecord,
-    ToolResultRecord, ToolSpec,
+use crate::runtime::attach_provider_cache_events_to_trace;
+use crate::runtime::filesystem_runtime_middleware::{
+    LargeToolResultOffloadOptions, LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY,
 };
-use crate::runtime::patch_tool_calls::tool_calls_from_provider_calls;
-use crate::runtime::tool_compat::{normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages, NormalizedToolCall};
+use crate::runtime::patch_tool_calls::{sanitize_tool_call_id, tool_calls_from_provider_calls};
+use crate::runtime::prompt_cache_runtime::{step_with_prompt_cache, CachedProviderError};
+use crate::runtime::protocol::{
+    HandledToolCall, RunOutput, RunStatus, Runtime, RuntimeConfig, RuntimeError, RuntimeMiddleware,
+    ToolCallContext, ToolCallRecord, ToolResultRecord, ToolSpec,
+};
+use crate::runtime::tool_compat::{
+    normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages,
+    NormalizedToolCall,
+};
 use crate::skills::{SkillCall, SkillPlugin};
 use crate::state::AgentState;
 use crate::types::Message;
@@ -23,6 +32,39 @@ fn mode_str(mode: ExecutionMode) -> String {
         ExecutionMode::NonInteractive => "non_interactive".to_string(),
         ExecutionMode::Interactive => "interactive".to_string(),
     }
+}
+
+fn load_large_tool_result_offload_options(
+    state: &AgentState,
+) -> Option<LargeToolResultOffloadOptions> {
+    let v = state.extra.get(LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY)?;
+    serde_json::from_value(v.clone()).ok()
+}
+
+fn preview_head_tail_lines(text: &str, max_lines: usize) -> (String, String) {
+    let max_lines = max_lines.max(1);
+    let mut head: Vec<&str> = Vec::new();
+    let mut tail: std::collections::VecDeque<&str> =
+        std::collections::VecDeque::with_capacity(max_lines);
+    for line in text.lines() {
+        if head.len() < max_lines {
+            head.push(line);
+        }
+        if tail.len() == max_lines {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    (
+        head.join("\n"),
+        tail.into_iter().collect::<Vec<_>>().join("\n"),
+    )
+}
+
+fn finalize_run_output(mut out: RunOutput) -> RunOutput {
+    out.trace = attach_provider_cache_events_to_trace(out.trace, &mut out.state);
+    out.summarization_events = out.state.extra.get("_summarization_events").cloned();
+    out
 }
 
 pub struct SimpleRuntime {
@@ -76,7 +118,10 @@ impl SimpleRuntime {
         }
     }
 
-    pub fn with_runtime_middlewares(mut self, middlewares: Vec<Arc<dyn RuntimeMiddleware>>) -> Self {
+    pub fn with_runtime_middlewares(
+        mut self,
+        middlewares: Vec<Arc<dyn RuntimeMiddleware>>,
+    ) -> Self {
         self.runtime_middlewares = middlewares;
         self
     }
@@ -106,7 +151,9 @@ impl Runtime for SimpleRuntime {
                 match mw.before_run(messages, &mut state).await {
                     Ok(m) => messages = m,
                     Err(e) => {
-                        return RunOutput {
+                        return finalize_run_output(RunOutput {
+                            status: RunStatus::Error,
+                            interrupts: Vec::new(),
                             final_text: String::new(),
                             tool_calls,
                             tool_results,
@@ -116,8 +163,10 @@ impl Runtime for SimpleRuntime {
                                 message: e.to_string(),
                             }),
                             summarization_events: state.extra.get("_summarization_events").cloned(),
-                            trace: Some(serde_json::json!({ "terminated_at_step": 0, "reason": "middleware_before_run_error" })),
-                        };
+                            trace: Some(
+                                serde_json::json!({ "terminated_at_step": 0, "reason": "middleware_before_run_error" }),
+                            ),
+                        });
                     }
                 }
             }
@@ -140,7 +189,9 @@ impl Runtime for SimpleRuntime {
                     match mw.before_provider_step(provider_messages, &mut state).await {
                         Ok(m) => provider_messages = m,
                         Err(e) => {
-                            return RunOutput {
+                            return finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
@@ -149,9 +200,14 @@ impl Runtime for SimpleRuntime {
                                     code: "middleware_error".to_string(),
                                     message: e.to_string(),
                                 }),
-                                summarization_events: state.extra.get("_summarization_events").cloned(),
-                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" })),
-                            };
+                                summarization_events: state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(
+                                    serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" }),
+                                ),
+                            });
                         }
                     }
                 }
@@ -165,15 +221,19 @@ impl Runtime for SimpleRuntime {
                 last_tool_results: tool_results.clone(),
             };
 
-            let mut provider_step = match timeout(
-                Duration::from_millis(self.config.provider_timeout_ms),
-                self.provider.step(req),
+            let mut provider_step = match step_with_prompt_cache(
+                &self.provider,
+                req,
+                self.config.provider_timeout_ms,
+                &mut state,
             )
             .await
             {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    return RunOutput {
+                Ok(s) => s,
+                Err(CachedProviderError::Provider(e)) => {
+                    return finalize_run_output(RunOutput {
+                        status: RunStatus::Error,
+                        interrupts: Vec::new(),
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
@@ -183,11 +243,15 @@ impl Runtime for SimpleRuntime {
                             message: e.to_string(),
                         }),
                         summarization_events: state.extra.get("_summarization_events").cloned(),
-                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" })),
-                    };
+                        trace: Some(
+                            serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" }),
+                        ),
+                    });
                 }
-                Err(_) => {
-                    return RunOutput {
+                Err(CachedProviderError::Timeout) => {
+                    return finalize_run_output(RunOutput {
+                        status: RunStatus::Error,
+                        interrupts: Vec::new(),
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
@@ -197,23 +261,28 @@ impl Runtime for SimpleRuntime {
                             message: "provider timed out".to_string(),
                         }),
                         summarization_events: state.extra.get("_summarization_events").cloned(),
-                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" })),
-                    };
+                        trace: Some(
+                            serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" }),
+                        ),
+                    });
                 }
             };
 
             if let ProviderStep::Error { error } = &provider_step {
                 if error.code == "context_overflow" {
-                    state
-                        .extra
-                        .insert("_summarization_force".to_string(), serde_json::Value::Bool(true));
+                    state.extra.insert(
+                        "_summarization_force".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
                     let mut overflow_messages = messages.clone();
                     if !self.runtime_middlewares.is_empty() {
                         for mw in &self.runtime_middlewares {
                             match mw.before_provider_step(overflow_messages, &mut state).await {
                                 Ok(m) => overflow_messages = m,
                                 Err(e) => {
-                                    return RunOutput {
+                                    return finalize_run_output(RunOutput {
+                                        status: RunStatus::Error,
+                                        interrupts: Vec::new(),
                                         final_text: String::new(),
                                         tool_calls,
                                         tool_results,
@@ -222,9 +291,14 @@ impl Runtime for SimpleRuntime {
                                             code: "middleware_error".to_string(),
                                             message: e.to_string(),
                                         }),
-                                        summarization_events: state.extra.get("_summarization_events").cloned(),
-                                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" })),
-                                    };
+                                        summarization_events: state
+                                            .extra
+                                            .get("_summarization_events")
+                                            .cloned(),
+                                        trace: Some(
+                                            serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" }),
+                                        ),
+                                    });
                                 }
                             }
                         }
@@ -237,15 +311,19 @@ impl Runtime for SimpleRuntime {
                         state: state.clone(),
                         last_tool_results: tool_results.clone(),
                     };
-                    provider_step = match timeout(
-                        Duration::from_millis(self.config.provider_timeout_ms),
-                        self.provider.step(retry_req),
+                    provider_step = match step_with_prompt_cache(
+                        &self.provider,
+                        retry_req,
+                        self.config.provider_timeout_ms,
+                        &mut state,
                     )
                     .await
                     {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            return RunOutput {
+                        Ok(s) => s,
+                        Err(CachedProviderError::Provider(e)) => {
+                            return finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
@@ -254,12 +332,19 @@ impl Runtime for SimpleRuntime {
                                     code: "provider_error".to_string(),
                                     message: e.to_string(),
                                 }),
-                                summarization_events: state.extra.get("_summarization_events").cloned(),
-                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" })),
-                            };
+                                summarization_events: state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(
+                                    serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" }),
+                                ),
+                            });
                         }
-                        Err(_) => {
-                            return RunOutput {
+                        Err(CachedProviderError::Timeout) => {
+                            return finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
@@ -268,9 +353,14 @@ impl Runtime for SimpleRuntime {
                                     code: "provider_timeout".to_string(),
                                     message: "provider timed out".to_string(),
                                 }),
-                                summarization_events: state.extra.get("_summarization_events").cloned(),
-                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" })),
-                            };
+                                summarization_events: state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(
+                                    serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" }),
+                                ),
+                            });
                         }
                     };
                 }
@@ -278,10 +368,15 @@ impl Runtime for SimpleRuntime {
 
             if !self.runtime_middlewares.is_empty() {
                 for mw in &self.runtime_middlewares {
-                    match mw.patch_provider_step(provider_step, &mut next_call_id).await {
+                    match mw
+                        .patch_provider_step(provider_step, &mut next_call_id)
+                        .await
+                    {
                         Ok(s) => provider_step = s,
                         Err(e) => {
-                            return RunOutput {
+                            return finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
@@ -290,9 +385,14 @@ impl Runtime for SimpleRuntime {
                                     code: "middleware_error".to_string(),
                                     message: e.to_string(),
                                 }),
-                                summarization_events: state.extra.get("_summarization_events").cloned(),
-                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_patch_provider_step_error" })),
-                            };
+                                summarization_events: state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(
+                                    serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_patch_provider_step_error" }),
+                                ),
+                            });
                         }
                     }
                 }
@@ -303,6 +403,7 @@ impl Runtime for SimpleRuntime {
                     messages.push(Message {
                         role: "assistant".to_string(),
                         content: text,
+                        content_blocks: None,
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
@@ -310,18 +411,24 @@ impl Runtime for SimpleRuntime {
                     });
                 }
                 ProviderStep::FinalText { text } => {
-                    return RunOutput {
+                    return finalize_run_output(RunOutput {
+                        status: RunStatus::Completed,
+                        interrupts: Vec::new(),
                         final_text: text,
                         tool_calls,
                         tool_results,
                         state: state.clone(),
                         error: None,
                         summarization_events: state.extra.get("_summarization_events").cloned(),
-                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "final_text" })),
-                    };
+                        trace: Some(
+                            serde_json::json!({ "terminated_at_step": step_idx, "reason": "final_text" }),
+                        ),
+                    });
                 }
                 ProviderStep::Error { error } => {
-                    return RunOutput {
+                    return finalize_run_output(RunOutput {
+                        status: RunStatus::Error,
+                        interrupts: Vec::new(),
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
@@ -331,15 +438,27 @@ impl Runtime for SimpleRuntime {
                             message: error.message,
                         }),
                         summarization_events: state.extra.get("_summarization_events").cloned(),
-                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_step_error" })),
-                    };
+                        trace: Some(
+                            serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_step_error" }),
+                        ),
+                    });
                 }
-                ProviderStep::SkillCall { name, input, call_id } => {
-                    let call = SkillCall { name, input, call_id };
+                ProviderStep::SkillCall {
+                    name,
+                    input,
+                    call_id,
+                } => {
+                    let call = SkillCall {
+                        name,
+                        input,
+                        call_id,
+                    };
                     let calls = match self.expand_skill(call).await {
                         Ok(c) => c,
                         Err(e) => {
-                            return RunOutput {
+                            return finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
@@ -348,9 +467,14 @@ impl Runtime for SimpleRuntime {
                                     code: e.code,
                                     message: e.message,
                                 }),
-                                summarization_events: state.extra.get("_summarization_events").cloned(),
-                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "skill_error" })),
-                            };
+                                summarization_events: state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(
+                                    serde_json::json!({ "terminated_at_step": step_idx, "reason": "skill_error" }),
+                                ),
+                            });
                         }
                     };
                     self.execute_calls(
@@ -367,6 +491,7 @@ impl Runtime for SimpleRuntime {
                     messages.push(Message {
                         role: "assistant".to_string(),
                         content: String::new(),
+                        content_blocks: None,
                         tool_calls: Some(tool_calls_from_provider_calls(&calls)),
                         tool_call_id: None,
                         name: None,
@@ -385,7 +510,9 @@ impl Runtime for SimpleRuntime {
             }
         }
 
-        RunOutput {
+        finalize_run_output(RunOutput {
+            status: RunStatus::Error,
+            interrupts: Vec::new(),
             final_text: String::new(),
             tool_calls,
             tool_results,
@@ -395,8 +522,10 @@ impl Runtime for SimpleRuntime {
                 message: "runtime exceeded max_steps".to_string(),
             }),
             summarization_events: state.extra.get("_summarization_events").cloned(),
-            trace: Some(serde_json::json!({ "terminated_at_step": self.config.max_steps, "reason": "max_steps_exceeded" })),
-        }
+            trace: Some(
+                serde_json::json!({ "terminated_at_step": self.config.max_steps, "reason": "max_steps_exceeded" }),
+            ),
+        })
     }
 }
 
@@ -405,15 +534,27 @@ impl SimpleRuntime {
         let mut out = Vec::new();
         for (name, desc) in [
             ("ls", "Lists files and directories in a given path."),
-            ("read_file", "Reads a file from the local filesystem and returns output."),
+            (
+                "read_file",
+                "Reads a file from the local filesystem and returns output.",
+            ),
             ("write_file", "Writes a new file to the filesystem."),
-            ("edit_file", "Edits an existing file by replacing a literal string."),
+            (
+                "edit_file",
+                "Edits an existing file by replacing a literal string.",
+            ),
             ("delete_file", "Deletes a file from the filesystem."),
             ("glob", "Glob match file paths."),
             ("grep", "Search for a literal text pattern across files."),
-            ("execute", "Executes a shell command in an isolated sandbox environment."),
+            (
+                "execute",
+                "Executes a shell command in an isolated sandbox environment.",
+            ),
             ("task", "Launch a sub-agent and assign a task to it."),
-            ("compact_conversation", "Compacts conversation history by summarizing older messages."),
+            (
+                "compact_conversation",
+                "Compacts conversation history by summarizing older messages.",
+            ),
         ] {
             out.push(ToolSpec {
                 name: name.to_string(),
@@ -421,7 +562,9 @@ impl SimpleRuntime {
             });
         }
         if let Some(v) = state.extra.get("skills_tools") {
-            if let Ok(skills) = serde_json::from_value::<Vec<crate::skills::SkillToolSpec>>(v.clone()) {
+            if let Ok(skills) =
+                serde_json::from_value::<Vec<crate::skills::SkillToolSpec>>(v.clone())
+            {
                 for s in skills {
                     out.push(ToolSpec {
                         name: s.name,
@@ -433,7 +576,126 @@ impl SimpleRuntime {
         out
     }
 
-    async fn expand_skill(&self, call: SkillCall) -> Result<Vec<ProviderToolCall>, crate::skills::SkillError> {
+    async fn maybe_offload_large_tool_result(
+        &self,
+        state: &mut AgentState,
+        tool_name: &str,
+        call_id: &str,
+        output: serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        let content = if let Some(s) = output
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            s.to_string()
+        } else {
+            serde_json::to_string(&output).unwrap_or_default()
+        };
+
+        let Some(opts) = load_large_tool_result_offload_options(state) else {
+            return (output, content);
+        };
+        if !opts.enabled {
+            return (output, content);
+        }
+        if opts.excluded_tools.iter().any(|t| t == tool_name) {
+            return (output, content);
+        }
+
+        let full_text = if let Some(s) = output.get("content").and_then(|v| v.as_str()) {
+            s.to_string()
+        } else {
+            serde_json::to_string(&output).unwrap_or_default()
+        };
+        let total_chars = full_text.chars().count();
+        if total_chars < opts.threshold_chars {
+            return (output, content);
+        }
+
+        let id = sanitize_tool_call_id(call_id);
+        let prefix = opts.prefix.trim_end_matches('/');
+        let path = format!("{prefix}/{id}");
+
+        let backend = self.agent.backend();
+        if backend.create_dir_all(prefix).await.is_err() {
+            return (output, content);
+        }
+        let write_ok = match backend.write_file(&path, &full_text).await {
+            Ok(wr) => wr.error.as_deref().is_none() || wr.error.as_deref() == Some("file_exists"),
+            Err(_) => false,
+        };
+        if !write_ok {
+            return (output, content);
+        }
+
+        let (head, tail) = preview_head_tail_lines(&full_text, opts.preview_max_lines);
+        let content2 = format!(
+            "TOOL_OUTPUT_OFFLOADED: Full output written to {}. Use read_file with offset/limit to paginate.\n<preview_head>\n{}\n</preview_head>\n<preview_tail>\n{}\n</preview_tail>",
+            path, head, tail
+        );
+
+        let output2 = match output {
+            serde_json::Value::Object(mut obj) => {
+                obj.insert("offloaded".to_string(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "offload_path".to_string(),
+                    serde_json::Value::String(path.clone()),
+                );
+                obj.insert(
+                    "offload_total_chars".to_string(),
+                    serde_json::Value::Number(total_chars.into()),
+                );
+                obj.insert(
+                    "offload_head".to_string(),
+                    serde_json::Value::String(head.clone()),
+                );
+                obj.insert(
+                    "offload_tail".to_string(),
+                    serde_json::Value::String(tail.clone()),
+                );
+                obj.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(format!("(offloaded to {}; use read_file)", path)),
+                );
+                serde_json::Value::Object(obj)
+            }
+            other => serde_json::json!({
+                "offloaded": true,
+                "offload_path": path,
+                "offload_total_chars": total_chars,
+                "offload_head": head,
+                "offload_tail": tail,
+                "output_type": match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                },
+                "content": format!("(offloaded; use read_file)"),
+            }),
+        };
+
+        state.extra.insert(
+            "_large_tool_result_offload_event".to_string(),
+            serde_json::json!({
+                "tool_name": tool_name,
+                "call_id": call_id,
+                "path": output2.get("offload_path").cloned().unwrap_or(serde_json::Value::Null),
+                "total_chars": total_chars,
+            }),
+        );
+
+        (output2, content2)
+    }
+
+    async fn expand_skill(
+        &self,
+        call: SkillCall,
+    ) -> Result<Vec<ProviderToolCall>, crate::skills::SkillError> {
         for p in &self.skills {
             let names: Vec<String> = p.list_skills().into_iter().map(|s| s.name).collect();
             if names.iter().any(|n| n == &call.name) {
@@ -455,6 +717,10 @@ impl SimpleRuntime {
         tool_results: &mut Vec<ToolResultRecord>,
         next_call_id: &mut u64,
     ) {
+        let write_todos_count = calls
+            .iter()
+            .filter(|c| c.tool_name == "write_todos")
+            .count();
         for call in calls {
             let normalized = normalize_tool_call_for_execution(call, next_call_id);
             let (call, error) = match normalized {
@@ -488,6 +754,7 @@ impl SimpleRuntime {
                         "content": err,
                     }))
                     .unwrap_or_default(),
+                    content_blocks: None,
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
                     name: Some(tool_name),
@@ -501,6 +768,34 @@ impl SimpleRuntime {
                 arguments: call.arguments.clone(),
                 call_id: Some(call_id.clone()),
             });
+
+            if write_todos_count > 1 && call.tool_name == "write_todos" {
+                let err = "Error: The `write_todos` tool should never be called multiple times in parallel. Please call it only once per model invocation to update the todo list.".to_string();
+                tool_results.push(ToolResultRecord {
+                    tool_name: tool_name.clone(),
+                    call_id: Some(call_id.clone()),
+                    output: serde_json::Value::Null,
+                    error: Some(err.clone()),
+                    status: Some("error".to_string()),
+                });
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: serde_json::to_string(&serde_json::json!({
+                        "tool_call_id": call_id.clone(),
+                        "tool_name": tool_name.clone(),
+                        "status": "error",
+                        "error": err.clone(),
+                        "content": err,
+                    }))
+                    .unwrap_or_default(),
+                    content_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                    name: Some(tool_name),
+                    status: Some("error".to_string()),
+                });
+                continue;
+            }
 
             if !self.runtime_middlewares.is_empty() {
                 let mut ctx = ToolCallContext {
@@ -537,12 +832,11 @@ impl SimpleRuntime {
                     let status = if error.is_some() { "error" } else { "success" }.to_string();
                     let tool_name = tool_name.clone();
                     let cid = call_id.clone();
-                    let content = if let Some(e) = &error {
-                        e.clone()
-                    } else if let Some(s) = output.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-                        s.to_string()
+                    let (output, content) = if let Some(e) = &error {
+                        (output, e.clone())
                     } else {
-                        serde_json::to_string(&output).unwrap_or_default()
+                        self.maybe_offload_large_tool_result(state, &tool_name, &cid, output)
+                            .await
                     };
                     tool_results.push(ToolResultRecord {
                         tool_name: tool_name.clone(),
@@ -562,6 +856,7 @@ impl SimpleRuntime {
                             "content": content,
                         }))
                         .unwrap_or_default(),
+                    content_blocks: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
                         name: Some(tool_name.clone()),
@@ -596,6 +891,16 @@ impl SimpleRuntime {
                             let duration_ms = started.elapsed().as_millis() as u64;
                             match result {
                                 Ok((out, _delta)) => {
+                                    let crate::tools::ToolResult {
+                                        output,
+                                        content_blocks,
+                                    } = out;
+                                    let exit_code = output
+                                        .get("exit_code")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32);
+                                    let truncated =
+                                        output.get("truncated").and_then(|v| v.as_bool());
                                     if let Some(sink) = &self.audit {
                                         let _ = sink.record(AuditEvent {
                                             timestamp_ms: Utc::now().timestamp_millis(),
@@ -605,20 +910,20 @@ impl SimpleRuntime {
                                             decision: "allow".to_string(),
                                             decision_code: "allow".to_string(),
                                             decision_reason: reason,
-                                            exit_code: out.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32),
-                                            truncated: out.get("truncated").and_then(|v| v.as_bool()),
+                                            exit_code,
+                                            truncated,
                                             duration_ms: Some(duration_ms),
                                         });
                                     }
-                                    let content = if let Some(s) = out.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-                                        s.to_string()
-                                    } else {
-                                        serde_json::to_string(&out).unwrap_or_default()
-                                    };
+                                    let (out_value, content) = self
+                                        .maybe_offload_large_tool_result(
+                                            state, &tool_name, &call_id, output,
+                                        )
+                                        .await;
                                     tool_results.push(ToolResultRecord {
                                         tool_name: tool_name.clone(),
                                         call_id: Some(call_id.clone()),
-                                        output: out.clone(),
+                                        output: out_value.clone(),
                                         error: None,
                                         status: Some("success".to_string()),
                                     });
@@ -628,10 +933,11 @@ impl SimpleRuntime {
                                             "tool_call_id": call_id.clone(),
                                             "tool_name": tool_name.clone(),
                                             "status": "success",
-                                            "output": out,
+                                            "output": out_value,
                                             "content": content,
                                         }))
                                         .unwrap_or_default(),
+                                        content_blocks,
                                         tool_calls: None,
                                         tool_call_id: Some(call_id.clone()),
                                         name: Some(tool_name.clone()),
@@ -647,7 +953,8 @@ impl SimpleRuntime {
                                             command_redacted: redact_command(&cmd),
                                             decision: "allow".to_string(),
                                             decision_code: "allow".to_string(),
-                                            decision_reason: "allowed but execution failed".to_string(),
+                                            decision_reason: "allowed but execution failed"
+                                                .to_string(),
                                             exit_code: None,
                                             truncated: None,
                                             duration_ms: Some(duration_ms),
@@ -671,6 +978,7 @@ impl SimpleRuntime {
                                             "content": err,
                                         }))
                                         .unwrap_or_default(),
+                                        content_blocks: None,
                                         tool_calls: None,
                                         tool_call_id: Some(call_id.clone()),
                                         name: Some(tool_name.clone()),
@@ -713,6 +1021,7 @@ impl SimpleRuntime {
                                     "content": err,
                                 }))
                                 .unwrap_or_default(),
+                                content_blocks: None,
                                 tool_calls: None,
                                 tool_call_id: Some(call_id.clone()),
                                 name: Some(tool_name.clone()),
@@ -735,7 +1044,12 @@ impl SimpleRuntime {
                                     duration_ms: None,
                                 });
                             }
-                            let err = format!("command_not_allowed: {}: {}", code, reason);
+                            let err = format!(
+                                "command_not_allowed: {}: {} (interactive approval required; not supported in {})",
+                                code,
+                                reason,
+                                mode_str(self.mode)
+                            );
                             tool_results.push(ToolResultRecord {
                                 tool_name: tool_name.clone(),
                                 call_id: Some(call_id.clone()),
@@ -753,6 +1067,7 @@ impl SimpleRuntime {
                                     "content": err,
                                 }))
                                 .unwrap_or_default(),
+                                content_blocks: None,
                                 tool_calls: None,
                                 tool_call_id: Some(call_id.clone()),
                                 name: Some(tool_name.clone()),
@@ -771,15 +1086,17 @@ impl SimpleRuntime {
 
             match result {
                 Ok((out, _delta)) => {
-                    let content = if let Some(s) = out.get("content").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
-                        s.to_string()
-                    } else {
-                        serde_json::to_string(&out).unwrap_or_default()
-                    };
+                    let crate::tools::ToolResult {
+                        output,
+                        content_blocks,
+                    } = out;
+                    let (out_value, content) = self
+                        .maybe_offload_large_tool_result(state, &tool_name, &call_id, output)
+                        .await;
                     tool_results.push(ToolResultRecord {
                         tool_name: tool_name.clone(),
                         call_id: Some(call_id.clone()),
-                        output: out.clone(),
+                        output: out_value.clone(),
                         error: None,
                         status: Some("success".to_string()),
                     });
@@ -789,10 +1106,11 @@ impl SimpleRuntime {
                             "tool_call_id": call_id.clone(),
                             "tool_name": tool_name.clone(),
                             "status": "success",
-                            "output": out,
+                            "output": out_value,
                             "content": content,
                         }))
                         .unwrap_or_default(),
+                        content_blocks,
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
                         name: Some(tool_name.clone()),
@@ -818,6 +1136,7 @@ impl SimpleRuntime {
                             "content": err,
                         }))
                         .unwrap_or_default(),
+                        content_blocks: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
                         name: Some(tool_name.clone()),

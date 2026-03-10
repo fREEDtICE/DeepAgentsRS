@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::runtime::{HandledToolCall, RuntimeMiddleware, ToolCallContext};
-use crate::subagents::protocol::{filter_state_for_child, merge_child_state, SubAgentRunRequest, TaskInput};
+use crate::subagents::protocol::{
+    filter_state_for_child, merge_child_state, SubAgentRunRequest, TaskInput,
+};
 use crate::subagents::SubAgentRegistry;
 use crate::types::Message;
 
@@ -35,7 +37,10 @@ impl SubAgentMiddleware {
 
 #[async_trait]
 impl RuntimeMiddleware for SubAgentMiddleware {
-    async fn handle_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> anyhow::Result<Option<HandledToolCall>> {
+    async fn handle_tool_call(
+        &self,
+        ctx: &mut ToolCallContext<'_>,
+    ) -> anyhow::Result<Option<HandledToolCall>> {
         if ctx.tool_call.tool_name != "task" {
             return Ok(None);
         }
@@ -94,6 +99,7 @@ impl RuntimeMiddleware for SubAgentMiddleware {
         let child_messages = vec![Message {
             role: "user".to_string(),
             content: input.description.clone(),
+            content_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

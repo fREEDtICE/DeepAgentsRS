@@ -9,7 +9,10 @@ async fn local_backend_read_write_edit() {
     let backend = LocalSandbox::new(&root).unwrap();
 
     let file_path = root.join("a.txt").to_string_lossy().to_string();
-    let wr = backend.write_file(&file_path, "hello\nworld\n").await.unwrap();
+    let wr = backend
+        .write_file(&file_path, "hello\nworld\n")
+        .await
+        .unwrap();
     assert!(wr.error.is_none());
 
     let content = backend.read(&file_path, 0, 100).await.unwrap();
@@ -46,7 +49,11 @@ async fn local_backend_glob_and_grep() {
     assert_eq!(files.len(), 1);
 
     let matches = backend
-        .grep("todo:", Some(root.to_string_lossy().as_ref()), Some("**/*.txt"))
+        .grep(
+            "todo:",
+            Some(root.to_string_lossy().as_ref()),
+            Some("**/*.txt"),
+        )
         .await
         .unwrap();
     assert_eq!(matches.len(), 1);

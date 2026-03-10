@@ -17,9 +17,25 @@ pub trait Backend: Send + Sync {
 #[async_trait]
 pub trait FilesystemBackend: Backend {
     async fn ls_info(&self, path: &str) -> Result<Vec<crate::types::FileInfo>, BackendError>;
-    async fn read(&self, file_path: &str, offset: usize, limit: usize) -> Result<String, BackendError>;
-    async fn write_file(&self, file_path: &str, content: &str) -> Result<crate::types::WriteResult, BackendError>;
-    async fn delete_file(&self, _file_path: &str) -> Result<crate::types::DeleteResult, BackendError> {
+    async fn create_dir_all(&self, _dir_path: &str) -> Result<(), BackendError> {
+        Err(BackendError::Other("not_supported".to_string()))
+    }
+    async fn read(
+        &self,
+        file_path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, BackendError>;
+    async fn read_bytes(&self, file_path: &str, max_bytes: usize) -> Result<Vec<u8>, BackendError>;
+    async fn write_file(
+        &self,
+        file_path: &str,
+        content: &str,
+    ) -> Result<crate::types::WriteResult, BackendError>;
+    async fn delete_file(
+        &self,
+        _file_path: &str,
+    ) -> Result<crate::types::DeleteResult, BackendError> {
         Ok(crate::types::DeleteResult {
             error: Some("not_supported".to_string()),
             path: None,
@@ -42,5 +58,9 @@ pub trait FilesystemBackend: Backend {
 
 #[async_trait]
 pub trait SandboxBackend: FilesystemBackend {
-    async fn execute(&self, command: &str, timeout_secs: Option<u64>) -> Result<crate::types::ExecResult, BackendError>;
+    async fn execute(
+        &self,
+        command: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<crate::types::ExecResult, BackendError>;
 }

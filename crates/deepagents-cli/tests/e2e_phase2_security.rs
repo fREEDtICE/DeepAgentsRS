@@ -74,11 +74,18 @@ fn phase2_non_interactive_deny_by_default() {
         &[],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("command_not_allowed"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("command_not_allowed"));
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].get("decision").and_then(|v| v.as_str()), Some("require_approval"));
+    assert_eq!(
+        lines[0].get("decision").and_then(|v| v.as_str()),
+        Some("require_approval")
+    );
     assert_eq!(
         lines[0].get("decision_code").and_then(|v| v.as_str()),
         Some("approval_required")
@@ -103,13 +110,28 @@ fn phase2_allow_list_allows_and_audits() {
         &["echo"],
     );
     assert!(st.success());
-    assert_eq!(v.get("output").unwrap().get("exit_code").and_then(|v| v.as_i64()), Some(0));
+    assert_eq!(
+        v.get("output")
+            .unwrap()
+            .get("exit_code")
+            .and_then(|v| v.as_i64()),
+        Some(0)
+    );
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].get("decision").and_then(|v| v.as_str()), Some("allow"));
-    assert_eq!(lines[0].get("decision_code").and_then(|v| v.as_str()), Some("allow"));
-    assert!(lines[0].get("duration_ms").and_then(|v| v.as_u64()).is_some());
+    assert_eq!(
+        lines[0].get("decision").and_then(|v| v.as_str()),
+        Some("allow")
+    );
+    assert_eq!(
+        lines[0].get("decision_code").and_then(|v| v.as_str()),
+        Some("allow")
+    );
+    assert!(lines[0]
+        .get("duration_ms")
+        .and_then(|v| v.as_u64())
+        .is_some());
 }
 
 #[test]
@@ -130,12 +152,22 @@ fn phase2_dangerous_pattern_denied_even_if_allowed() {
         &["echo"],
     );
     assert!(!st.success());
-    assert!(v.get("error").and_then(|e| e.as_str()).unwrap().contains("dangerous_pattern"));
+    assert!(v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("dangerous_pattern"));
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].get("decision").and_then(|v| v.as_str()), Some("deny"));
-    assert_eq!(lines[0].get("decision_code").and_then(|v| v.as_str()), Some("dangerous_pattern"));
+    assert_eq!(
+        lines[0].get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+    assert_eq!(
+        lines[0].get("decision_code").and_then(|v| v.as_str()),
+        Some("dangerous_pattern")
+    );
 }
 
 #[test]
@@ -194,13 +226,18 @@ fn phase2_run_path_does_not_bypass_policy_allow() {
     assert_eq!(v.get("final_text").and_then(|s| s.as_str()), Some("ok"));
     assert_eq!(
         v.get("tool_results").unwrap().as_array().unwrap()[0]
-            .get("output").and_then(|o| o.get("exit_code")).and_then(|v| v.as_i64()),
+            .get("output")
+            .and_then(|o| o.get("exit_code"))
+            .and_then(|v| v.as_i64()),
         Some(0)
     );
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].get("decision").and_then(|v| v.as_str()), Some("allow"));
+    assert_eq!(
+        lines[0].get("decision").and_then(|v| v.as_str()),
+        Some("allow")
+    );
 }
 
 #[test]
@@ -230,12 +267,26 @@ fn phase2_run_path_does_not_bypass_policy_deny() {
         &[],
         "do it",
     );
-    assert!(st.success());
-    let err = v.get("tool_results").unwrap().as_array().unwrap()[0]
-        .get("error").and_then(|e| e.as_str()).unwrap();
-    assert!(err.contains("approval_required"));
+    assert!(!st.success());
+    assert_eq!(st.code(), Some(2));
+    assert_eq!(
+        v.get("status").and_then(|s| s.as_str()),
+        Some("interrupted")
+    );
+    let interrupt = v
+        .get("interrupts")
+        .and_then(|v| v.as_array())
+        .and_then(|v| v.get(0))
+        .unwrap();
+    assert_eq!(
+        interrupt.get("tool_name").and_then(|v| v.as_str()),
+        Some("execute")
+    );
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].get("decision").and_then(|v| v.as_str()), Some("require_approval"));
+    assert_eq!(
+        lines[0].get("decision").and_then(|v| v.as_str()),
+        Some("require_approval")
+    );
 }

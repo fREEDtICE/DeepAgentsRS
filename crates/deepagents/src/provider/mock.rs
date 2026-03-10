@@ -1,18 +1,28 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::protocol::{Provider, ProviderError, ProviderRequest, ProviderStep, ProviderToolCall};
+use crate::provider::protocol::{
+    Provider, ProviderError, ProviderRequest, ProviderStep, ProviderToolCall,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MockStep {
-    AssistantMessage { text: String },
-    FinalText { text: String },
-    FinalFromLastToolFirstLine { prefix: Option<String> },
-    ToolCalls { calls: Vec<ProviderToolCall> },
+    AssistantMessage {
+        text: String,
+    },
+    FinalText {
+        text: String,
+    },
+    FinalFromLastToolFirstLine {
+        prefix: Option<String>,
+    },
+    ToolCalls {
+        calls: Vec<ProviderToolCall>,
+    },
     SkillCall {
         name: String,
         #[serde(default)]
@@ -20,8 +30,13 @@ pub enum MockStep {
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
-    Error { code: String, message: String },
-    DelayMs { ms: u64 },
+    Error {
+        code: String,
+        message: String,
+    },
+    DelayMs {
+        ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -99,7 +114,15 @@ impl Provider for MockProvider {
                 }
                 Ok(ProviderStep::ToolCalls { calls })
             }
-            MockStep::SkillCall { name, input, call_id } => Ok(ProviderStep::SkillCall { name, input, call_id }),
+            MockStep::SkillCall {
+                name,
+                input,
+                call_id,
+            } => Ok(ProviderStep::SkillCall {
+                name,
+                input,
+                call_id,
+            }),
             MockStep::Error { code, message } => Ok(ProviderStep::Error {
                 error: ProviderError { code, message },
             }),

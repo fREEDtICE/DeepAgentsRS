@@ -6,8 +6,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use deepagents::approval::{redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode};
+use deepagents::approval::{
+    redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, DefaultApprovalPolicy,
+    ExecutionMode,
+};
 use deepagents::audit::{AuditEvent, AuditSink};
+use deepagents::provider::mock::{MockProvider, MockScript};
 use deepagents::state::AgentState;
 use deepagents::{create_deep_agent_with_backend, create_local_sandbox_backend, DeepAgent};
 use serde::{Deserialize, Serialize};
@@ -26,9 +30,7 @@ pub struct AppState {
     next_id: Arc<AtomicU64>,
 }
 
-#[derive(Clone)]
 struct Session {
-    session_id: String,
     root: String,
     agent: DeepAgent,
     state: AgentState,
@@ -36,6 +38,7 @@ struct Session {
     mode: ExecutionMode,
     approval: Arc<dyn ApprovalPolicy>,
     audit: Option<Arc<dyn AuditSink>>,
+    runner: Option<deepagents::runtime::ResumableRunner>,
     closed: bool,
 }
 
@@ -61,6 +64,35 @@ struct CallToolRequest {
     session_id: String,
     tool_name: String,
     input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRequest {
+    #[serde(default)]
+    protocol_version: Option<String>,
+    session_id: String,
+    provider: String,
+    mock_script: Value,
+    input: String,
+    #[serde(default)]
+    max_steps: Option<usize>,
+    #[serde(default)]
+    provider_timeout_ms: Option<u64>,
+    #[serde(default)]
+    memory_disable: Option<bool>,
+    #[serde(default)]
+    summarization_disable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeRequest {
+    #[serde(default)]
+    protocol_version: Option<String>,
+    session_id: String,
+    interrupt_id: String,
+    decision: deepagents::runtime::HitlDecision,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +141,8 @@ pub fn router() -> Router {
         .route("/initialize", post(initialize))
         .route("/new_session", post(new_session))
         .route("/call_tool", post(call_tool))
+        .route("/run", post(run_session))
+        .route("/resume", post(resume_session))
         .route("/session_state/:session_id", get(get_session_state))
         .route("/end_session", post(end_session))
         .with_state(state)
@@ -133,12 +167,17 @@ async fn new_session(
         if v != PROTOCOL_VERSION {
             return (
                 StatusCode::BAD_REQUEST,
-                resp_err("invalid_request", "unsupported protocol_version", Some(json!({ "got": v }))),
+                resp_err(
+                    "invalid_request",
+                    "unsupported protocol_version",
+                    Some(json!({ "got": v })),
+                ),
             );
         }
     }
 
-    let mode = parse_execution_mode(req.execution_mode.as_deref()).unwrap_or(ExecutionMode::NonInteractive);
+    let mode = parse_execution_mode(req.execution_mode.as_deref())
+        .unwrap_or(ExecutionMode::NonInteractive);
     let allow_list = req.shell_allow_list.unwrap_or_default();
 
     let backend_shell_allow = match mode {
@@ -157,7 +196,11 @@ async fn new_session(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                resp_err("invalid_request", "invalid root", Some(json!({ "error": e.to_string() }))),
+                resp_err(
+                    "invalid_request",
+                    "invalid root",
+                    Some(json!({ "error": e.to_string() })),
+                ),
             )
         }
     };
@@ -173,7 +216,6 @@ async fn new_session(
     let session_id = format!("s-{}-{}", now_ms(), n);
 
     let session = Session {
-        session_id: session_id.clone(),
         root: req.root,
         agent,
         state: AgentState::default(),
@@ -181,13 +223,14 @@ async fn new_session(
         mode,
         approval,
         audit,
+        runner: None,
         closed: false,
     };
 
-    st.sessions
-        .write()
-        .await
-        .insert(session_id.clone(), Arc::new(tokio::sync::Mutex::new(session)));
+    st.sessions.write().await.insert(
+        session_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(session)),
+    );
 
     (StatusCode::OK, resp_ok(json!({ "session_id": session_id })))
 }
@@ -200,7 +243,11 @@ async fn call_tool(
         if v != PROTOCOL_VERSION {
             return (
                 StatusCode::BAD_REQUEST,
-                resp_err("invalid_request", "unsupported protocol_version", Some(json!({ "got": v }))),
+                resp_err(
+                    "invalid_request",
+                    "unsupported protocol_version",
+                    Some(json!({ "got": v })),
+                ),
             );
         }
     }
@@ -209,7 +256,11 @@ async fn call_tool(
     let Some(s) = sessions.get(&req.session_id).cloned() else {
         return (
             StatusCode::NOT_FOUND,
-            resp_err("session_not_found", "session not found", Some(json!({ "session_id": req.session_id }))),
+            resp_err(
+                "session_not_found",
+                "session not found",
+                Some(json!({ "session_id": req.session_id })),
+            ),
         );
     };
     drop(sessions);
@@ -218,14 +269,22 @@ async fn call_tool(
     if session.closed {
         return (
             StatusCode::GONE,
-            resp_err("already_closed", "session already closed", Some(json!({ "session_id": req.session_id }))),
+            resp_err(
+                "already_closed",
+                "session already closed",
+                Some(json!({ "session_id": req.session_id })),
+            ),
         );
     }
 
     session.state_version = session.state_version.saturating_add(1);
 
     if req.tool_name == "execute" {
-        let cmd = req.input.get("command").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let cmd = req
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let Some(cmd) = cmd.as_deref() {
             let decision = session.approval.decide(&ApprovalRequest {
                 command: cmd.to_string(),
@@ -249,13 +308,25 @@ async fn call_tool(
                     );
                 }
                 ApprovalDecision::RequireApproval { code, reason } => {
-                    record_audit(&session, cmd, "require_approval", &code, &reason, None, None, None);
+                    record_audit(
+                        &session,
+                        cmd,
+                        "require_approval",
+                        &code,
+                        &reason,
+                        None,
+                        None,
+                        None,
+                    );
+                    let msg = format!(
+                        "{reason} (interactive approval required; not supported by deepagents-acp yet)"
+                    );
                     if matches!(session.mode, ExecutionMode::NonInteractive) {
                         return (
                             StatusCode::OK,
                             resp_ok(tool_result_error(
                                 &code,
-                                &reason,
+                                &msg,
                                 session.state_version,
                                 Some(&session.state),
                                 None,
@@ -266,7 +337,7 @@ async fn call_tool(
                         StatusCode::OK,
                         resp_ok(tool_result_error(
                             &code,
-                            &reason,
+                            &msg,
                             session.state_version,
                             Some(&session.state),
                             None,
@@ -281,7 +352,9 @@ async fn call_tool(
     let agent = session.agent.clone();
     let tool_name = req.tool_name.clone();
     let input = req.input.clone();
-    let result = agent.call_tool_stateful(&tool_name, input, &mut session.state).await;
+    let result = agent
+        .call_tool_stateful(&tool_name, input, &mut session.state)
+        .await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
@@ -298,15 +371,19 @@ async fn call_tool(
                     "allow",
                     "allow",
                     "allowed",
-                    out.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32),
-                    out.get("truncated").and_then(|v| v.as_bool()),
+                    out.output
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32),
+                    out.output.get("truncated").and_then(|v| v.as_bool()),
                     Some(duration_ms),
                 );
             }
             (
                 StatusCode::OK,
                 resp_ok(json!({
-                    "output": out,
+                    "output": out.output,
+                    "content_blocks": out.content_blocks,
                     "error": Value::Null,
                     "state": session.state,
                     "delta": delta,
@@ -322,7 +399,16 @@ async fn call_tool(
                     .get("command")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                record_audit(&session, cmd, "allow", "allow", "allowed but failed", None, None, Some(duration_ms));
+                record_audit(
+                    &session,
+                    cmd,
+                    "allow",
+                    "allow",
+                    "allowed but failed",
+                    None,
+                    None,
+                    Some(duration_ms),
+                );
             }
             (
                 StatusCode::OK,
@@ -338,6 +424,279 @@ async fn call_tool(
     }
 }
 
+async fn run_session(
+    State(st): State<AppState>,
+    Json(req): Json<RunRequest>,
+) -> (StatusCode, Json<Value>) {
+    if let Some(v) = req.protocol_version.as_deref() {
+        if v != PROTOCOL_VERSION {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(
+                    "invalid_request",
+                    "unsupported protocol_version",
+                    Some(json!({ "got": v })),
+                ),
+            );
+        }
+    }
+
+    let sessions = st.sessions.read().await;
+    let Some(s) = sessions.get(&req.session_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            resp_err(
+                "session_not_found",
+                "session not found",
+                Some(json!({ "session_id": req.session_id })),
+            ),
+        );
+    };
+    drop(sessions);
+
+    let mut session = s.lock().await;
+    if session.closed {
+        return (
+            StatusCode::GONE,
+            resp_err(
+                "already_closed",
+                "session already closed",
+                Some(json!({ "session_id": req.session_id })),
+            ),
+        );
+    }
+
+    if session.runner.is_none() {
+        let script: MockScript = match serde_json::from_value(req.mock_script.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "invalid mock_script",
+                        Some(json!({ "error": e.to_string() })),
+                    ),
+                )
+            }
+        };
+        let provider: Arc<dyn deepagents::provider::Provider> = match req.provider.as_str() {
+            "mock" => Arc::new(MockProvider::from_script(script)),
+            "mock2" => Arc::new(MockProvider::from_script_without_call_ids(script)),
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "unknown provider",
+                        Some(json!({ "provider": other })),
+                    ),
+                )
+            }
+        };
+
+        let subagent_registry = match deepagents::subagents::builtins::default_registry() {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    resp_err(
+                        "internal_error",
+                        "failed to initialize subagent registry",
+                        Some(json!({ "error": e.to_string() })),
+                    ),
+                )
+            }
+        };
+
+        let subagent_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
+            deepagents::subagents::SubAgentMiddleware::new(subagent_registry),
+        );
+        let patch_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+            Arc::new(deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware::new());
+
+        let mut asm = deepagents::runtime::RuntimeMiddlewareAssembler::new();
+        asm.push(
+            deepagents::runtime::RuntimeMiddlewareSlot::TodoList,
+            "todolist",
+            Arc::new(deepagents::runtime::TodoListMiddleware::new()),
+        );
+
+        if !req.memory_disable.unwrap_or(false) {
+            let sources = vec![".deepagents/AGENTS.md".to_string(), "AGENTS.md".to_string()];
+            let options = deepagents::runtime::MemoryLoadOptions::default();
+            let memory_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
+                deepagents::runtime::MemoryMiddleware::new(session.root.clone(), sources, options),
+            );
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::Memory,
+                "memory",
+                memory_mw,
+            );
+        }
+
+        asm.push(
+            deepagents::runtime::RuntimeMiddlewareSlot::FilesystemRuntime,
+            "filesystem_runtime",
+            Arc::new(deepagents::runtime::FilesystemRuntimeMiddleware::new(
+                deepagents::runtime::FilesystemRuntimeOptions::default(),
+            )),
+        );
+        asm.push(
+            deepagents::runtime::RuntimeMiddlewareSlot::Subagents,
+            "subagents",
+            subagent_mw,
+        );
+
+        if !req.summarization_disable.unwrap_or(false) {
+            let options = deepagents::runtime::SummarizationOptions {
+                policy: deepagents::runtime::SummarizationPolicyKind::Budget,
+                ..Default::default()
+            };
+            let summarization_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
+                deepagents::runtime::SummarizationMiddleware::new(session.root.clone(), options),
+            );
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::Summarization,
+                "summarization",
+                summarization_mw,
+            );
+        }
+
+        asm.push(
+            deepagents::runtime::RuntimeMiddlewareSlot::PromptCaching,
+            "prompt_caching",
+            Arc::new(deepagents::runtime::PromptCachingMiddleware::disabled()),
+        );
+        asm.push(
+            deepagents::runtime::RuntimeMiddlewareSlot::PatchToolCalls,
+            "patch_tool_calls",
+            patch_mw,
+        );
+
+        let runtime_middlewares = match asm.build() {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    resp_err(
+                        "internal_error",
+                        "failed to assemble runtime_middlewares",
+                        Some(json!({ "error": e.to_string() })),
+                    ),
+                )
+            }
+        };
+
+        let mut interrupt_on = std::collections::BTreeMap::new();
+        for k in ["write_file", "edit_file", "delete_file", "execute"] {
+            interrupt_on.insert(k.to_string(), true);
+        }
+
+        let runner = deepagents::runtime::ResumableRunner::new(
+            session.agent.clone(),
+            provider,
+            vec![],
+            deepagents::runtime::ResumableRunnerOptions {
+                config: deepagents::runtime::RuntimeConfig {
+                    max_steps: req.max_steps.unwrap_or(8),
+                    provider_timeout_ms: req.provider_timeout_ms.unwrap_or(1000),
+                },
+                approval: Some(session.approval.clone()),
+                audit: session.audit.clone(),
+                root: session.root.clone(),
+                mode: session.mode,
+                interrupt_on,
+            },
+        )
+        .with_runtime_middlewares(runtime_middlewares)
+        .with_initial_state(session.state.clone());
+
+        session.runner = Some(runner);
+    }
+
+    session.state_version = session.state_version.saturating_add(1);
+    let runner = session.runner.as_mut().unwrap();
+    if runner.pending_interrupt().is_none() {
+        runner.push_user_input(req.input);
+    }
+    let out = runner.run().await;
+    session.state = out.state.clone();
+    (
+        StatusCode::OK,
+        resp_ok(json!({ "output": out, "state_version": session.state_version })),
+    )
+}
+
+async fn resume_session(
+    State(st): State<AppState>,
+    Json(req): Json<ResumeRequest>,
+) -> (StatusCode, Json<Value>) {
+    if let Some(v) = req.protocol_version.as_deref() {
+        if v != PROTOCOL_VERSION {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(
+                    "invalid_request",
+                    "unsupported protocol_version",
+                    Some(json!({ "got": v })),
+                ),
+            );
+        }
+    }
+
+    let sessions = st.sessions.read().await;
+    let Some(s) = sessions.get(&req.session_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            resp_err(
+                "session_not_found",
+                "session not found",
+                Some(json!({ "session_id": req.session_id })),
+            ),
+        );
+    };
+    drop(sessions);
+
+    let mut session = s.lock().await;
+    if session.closed {
+        return (
+            StatusCode::GONE,
+            resp_err(
+                "already_closed",
+                "session already closed",
+                Some(json!({ "session_id": req.session_id })),
+            ),
+        );
+    }
+
+    session.state_version = session.state_version.saturating_add(1);
+
+    let out = match session.runner.as_mut() {
+        Some(runner) => runner.resume(&req.interrupt_id, req.decision).await,
+        None => deepagents::runtime::RunOutput {
+            status: deepagents::runtime::RunStatus::Error,
+            interrupts: Vec::new(),
+            final_text: String::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            state: session.state.clone(),
+            error: Some(deepagents::runtime::RuntimeError {
+                code: "interrupt_not_found".to_string(),
+                message: "runner not initialized".to_string(),
+            }),
+            summarization_events: None,
+            trace: None,
+        },
+    };
+
+    session.state = out.state.clone();
+    (
+        StatusCode::OK,
+        resp_ok(json!({ "output": out, "state_version": session.state_version })),
+    )
+}
+
 async fn get_session_state(
     State(st): State<AppState>,
     Path(session_id): Path<String>,
@@ -346,7 +705,11 @@ async fn get_session_state(
     let Some(s) = sessions.get(&session_id).cloned() else {
         return (
             StatusCode::NOT_FOUND,
-            resp_err("session_not_found", "session not found", Some(json!({ "session_id": session_id }))),
+            resp_err(
+                "session_not_found",
+                "session not found",
+                Some(json!({ "session_id": session_id })),
+            ),
         );
     };
     drop(sessions);
@@ -355,14 +718,23 @@ async fn get_session_state(
     if session.closed {
         return (
             StatusCode::GONE,
-            resp_err("already_closed", "session already closed", Some(json!({ "session_id": session_id }))),
+            resp_err(
+                "already_closed",
+                "session already closed",
+                Some(json!({ "session_id": session_id })),
+            ),
         );
     }
+    let pending_interrupt = session
+        .runner
+        .as_ref()
+        .and_then(|r| r.pending_interrupt().cloned());
     (
         StatusCode::OK,
         resp_ok(json!({
             "state": session.state,
-            "state_version": session.state_version
+            "state_version": session.state_version,
+            "pending_interrupt": pending_interrupt
         })),
     )
 }
@@ -375,7 +747,11 @@ async fn end_session(
         if v != PROTOCOL_VERSION {
             return (
                 StatusCode::BAD_REQUEST,
-                resp_err("invalid_request", "unsupported protocol_version", Some(json!({ "got": v }))),
+                resp_err(
+                    "invalid_request",
+                    "unsupported protocol_version",
+                    Some(json!({ "got": v })),
+                ),
             );
         }
     }
@@ -384,7 +760,11 @@ async fn end_session(
     let Some(s) = sessions.get(&req.session_id).cloned() else {
         return (
             StatusCode::NOT_FOUND,
-            resp_err("session_not_found", "session not found", Some(json!({ "session_id": req.session_id }))),
+            resp_err(
+                "session_not_found",
+                "session not found",
+                Some(json!({ "session_id": req.session_id })),
+            ),
         );
     };
     drop(sessions);
@@ -392,7 +772,10 @@ async fn end_session(
     let mut session = s.lock().await;
     let already_closed = session.closed;
     session.closed = true;
-    (StatusCode::OK, resp_ok(json!({ "already_closed": already_closed })))
+    (
+        StatusCode::OK,
+        resp_ok(json!({ "already_closed": already_closed })),
+    )
 }
 
 fn tool_result_error(

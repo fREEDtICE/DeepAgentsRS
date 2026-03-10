@@ -68,6 +68,7 @@ pub trait SubAgentRegistry: Send + Sync {
 
 pub fn filter_state_for_child(parent: &AgentState) -> AgentState {
     let mut child = parent.clone();
+    child.todos.clear();
     for k in EXCLUDED_STATE_KEYS {
         child.extra.remove(k);
     }

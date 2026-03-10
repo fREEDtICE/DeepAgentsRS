@@ -61,7 +61,10 @@ fn phase1_5_minimal_loop_read_file() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "first: Project: DeepAgents");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "first: Project: DeepAgents"
+    );
     assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap().len(), 1);
     assert_eq!(v.get("tool_results").unwrap().as_array().unwrap().len(), 1);
     assert!(v.get("error").unwrap().is_null());
@@ -97,8 +100,17 @@ fn phase1_5_provider_replacement_mock2() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "Project: DeepAgents");
-    assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap()[0].get("call_id").and_then(|c| c.as_str()).unwrap(), "call-1");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "Project: DeepAgents"
+    );
+    assert_eq!(
+        v.get("tool_calls").unwrap().as_array().unwrap()[0]
+            .get("call_id")
+            .and_then(|c| c.as_str())
+            .unwrap(),
+        "call-1"
+    );
 }
 
 #[test]
@@ -131,9 +143,14 @@ fn phase1_5_tool_call_parsing_rejects_non_object_arguments() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "done");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "done"
+    );
     let err = v.get("tool_results").unwrap().as_array().unwrap()[0]
-        .get("error").and_then(|e| e.as_str()).unwrap();
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap();
     assert!(err.contains("invalid_tool_call"));
 }
 
@@ -165,7 +182,11 @@ fn phase1_5_provider_timeout_is_classified() {
     );
     assert!(!st.success());
     assert_eq!(
-        v.get("error").unwrap().get("code").and_then(|c| c.as_str()).unwrap(),
+        v.get("error")
+            .unwrap()
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap(),
         "provider_timeout"
     );
 }
@@ -201,7 +222,9 @@ fn phase1_5_tool_error_is_recorded_and_run_can_still_finalize() {
     assert!(st.success());
     assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "ok");
     let err = v.get("tool_results").unwrap().as_array().unwrap()[0]
-        .get("error").and_then(|e| e.as_str()).unwrap();
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap();
     assert!(err.contains("file_not_found"));
 }
 
@@ -247,7 +270,10 @@ fn phase1_5_declarative_skill_plugin_can_trigger_tool() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "Project: DeepAgents");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "Project: DeepAgents"
+    );
 }
 
 #[test]
@@ -290,15 +316,16 @@ fn phase1_5_multi_round_tool_calls() {
     assert!(st.success());
     assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap().len(), 2);
     assert_eq!(v.get("tool_results").unwrap().as_array().unwrap().len(), 2);
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "line: line201");
-    assert!(
-        v.get("tool_results").unwrap().as_array().unwrap()[0]
-            .get("output")
-            .and_then(|o| o.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap()
-            .contains("Project: DeepAgents")
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "line: line201"
     );
+    assert!(v.get("tool_results").unwrap().as_array().unwrap()[0]
+        .get("output")
+        .and_then(|o| o.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap()
+        .contains("Project: DeepAgents"));
 }
 
 #[test]
@@ -327,11 +354,18 @@ fn phase1_5_no_tool_direct_answer() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "hello");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "hello"
+    );
     assert_eq!(v.get("tool_calls").unwrap().as_array().unwrap().len(), 0);
     assert_eq!(v.get("tool_results").unwrap().as_array().unwrap().len(), 0);
     assert_eq!(
-        v.get("trace").unwrap().get("reason").and_then(|r| r.as_str()).unwrap(),
+        v.get("trace")
+            .unwrap()
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap(),
         "final_text"
     );
 }
@@ -406,10 +440,21 @@ fn phase1_5_schema_validation_missing_and_wrong_types_are_recorded() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "done");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "done"
+    );
     let r = v.get("tool_results").unwrap().as_array().unwrap();
-    assert!(r[0].get("error").and_then(|e| e.as_str()).unwrap().contains("missing field"));
-    assert!(r[1].get("error").and_then(|e| e.as_str()).unwrap().contains("invalid type"));
+    assert!(r[0]
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("missing field"));
+    assert!(r[1]
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("invalid type"));
 }
 
 #[test]
@@ -450,8 +495,16 @@ fn phase1_5_path_escape_and_symlink_escape_are_denied() {
     );
     assert!(st.success());
     let r = v.get("tool_results").unwrap().as_array().unwrap();
-    assert!(r[0].get("error").and_then(|e| e.as_str()).unwrap().contains("permission_denied"));
-    assert!(r[1].get("error").and_then(|e| e.as_str()).unwrap().contains("permission_denied"));
+    assert!(r[0]
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("permission_denied"));
+    assert!(r[1]
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap()
+        .contains("permission_denied"));
     assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "ok");
 }
 
@@ -561,11 +614,19 @@ fn phase1_5_max_steps_exceeded_is_classified() {
     );
     assert!(!st.success());
     assert_eq!(
-        v.get("error").unwrap().get("code").and_then(|c| c.as_str()).unwrap(),
+        v.get("error")
+            .unwrap()
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap(),
         "max_steps_exceeded"
     );
     assert_eq!(
-        v.get("trace").unwrap().get("reason").and_then(|r| r.as_str()).unwrap(),
+        v.get("trace")
+            .unwrap()
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap(),
         "max_steps_exceeded"
     );
 }
@@ -597,11 +658,19 @@ fn phase1_5_skill_not_found_is_classified() {
     );
     assert!(!st.success());
     assert_eq!(
-        v.get("error").unwrap().get("code").and_then(|c| c.as_str()).unwrap(),
+        v.get("error")
+            .unwrap()
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap(),
         "skill_not_found"
     );
     assert_eq!(
-        v.get("trace").unwrap().get("reason").and_then(|r| r.as_str()).unwrap(),
+        v.get("trace")
+            .unwrap()
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap(),
         "skill_error"
     );
 }
@@ -650,7 +719,10 @@ fn phase1_5_declarative_skill_merge_args_overrides_base() {
         None,
     );
     assert!(st.success());
-    assert_eq!(v.get("final_text").and_then(|s| s.as_str()).unwrap(), "needle");
+    assert_eq!(
+        v.get("final_text").and_then(|s| s.as_str()).unwrap(),
+        "needle"
+    );
 }
 
 #[test]

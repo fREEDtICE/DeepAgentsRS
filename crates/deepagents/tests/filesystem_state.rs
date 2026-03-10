@@ -1,4 +1,6 @@
-use deepagents::state::{DefaultFilesystemReducer, FileDelta, FileRecord, FilesystemDelta, FilesystemState, StateReducer};
+use deepagents::state::{
+    DefaultFilesystemReducer, FileDelta, FileRecord, FilesystemDelta, FilesystemState, StateReducer,
+};
 
 #[test]
 fn reducer_upsert_overwrites() {
@@ -30,7 +32,10 @@ fn reducer_upsert_overwrites() {
     );
 
     DefaultFilesystemReducer.reduce(&mut state, delta);
-    assert_eq!(state.files.get("/a").unwrap().content, vec!["new".to_string()]);
+    assert_eq!(
+        state.files.get("/a").unwrap().content,
+        vec!["new".to_string()]
+    );
 }
 
 #[test]

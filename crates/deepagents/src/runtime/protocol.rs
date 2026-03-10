@@ -41,8 +41,76 @@ pub struct RuntimeError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    Completed,
+    Interrupted,
+    Error,
+}
+
+impl Default for RunStatus {
+    fn default() -> Self {
+        Self::Completed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitlPolicy {
+    pub allow_approve: bool,
+    pub allow_reject: bool,
+    pub allow_edit: bool,
+}
+
+impl Default for HitlPolicy {
+    fn default() -> Self {
+        Self {
+            allow_approve: true,
+            allow_reject: true,
+            allow_edit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitlHints {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub danger_level: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitlInterrupt {
+    pub interrupt_id: String,
+    pub tool_name: String,
+    pub tool_call_id: String,
+    pub proposed_args: serde_json::Value,
+    #[serde(default)]
+    pub policy: HitlPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<HitlHints>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum HitlDecision {
+    Approve,
+    Reject {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Edit {
+        args: serde_json::Value,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutput {
+    #[serde(default)]
+    pub status: RunStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interrupts: Vec<HitlInterrupt>,
     pub final_text: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCallRecord>,
@@ -99,11 +167,19 @@ pub struct HandledToolCall {
 
 #[async_trait]
 pub trait RuntimeMiddleware: Send + Sync {
-    async fn before_run(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
+    async fn before_run(
+        &self,
+        messages: Vec<Message>,
+        _state: &mut AgentState,
+    ) -> anyhow::Result<Vec<Message>> {
         Ok(messages)
     }
 
-    async fn before_provider_step(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
+    async fn before_provider_step(
+        &self,
+        messages: Vec<Message>,
+        _state: &mut AgentState,
+    ) -> anyhow::Result<Vec<Message>> {
         Ok(messages)
     }
 
@@ -115,7 +191,10 @@ pub trait RuntimeMiddleware: Send + Sync {
         Ok(step)
     }
 
-    async fn handle_tool_call(&self, _ctx: &mut ToolCallContext<'_>) -> anyhow::Result<Option<HandledToolCall>> {
+    async fn handle_tool_call(
+        &self,
+        _ctx: &mut ToolCallContext<'_>,
+    ) -> anyhow::Result<Option<HandledToolCall>> {
         Ok(None)
     }
 }

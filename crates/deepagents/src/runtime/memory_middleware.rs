@@ -57,7 +57,11 @@ impl MemoryMiddleware {
 
 #[async_trait::async_trait]
 impl RuntimeMiddleware for MemoryMiddleware {
-    async fn before_run(&self, mut messages: Vec<Message>, state: &mut AgentState) -> Result<Vec<Message>> {
+    async fn before_run(
+        &self,
+        mut messages: Vec<Message>,
+        state: &mut AgentState,
+    ) -> Result<Vec<Message>> {
         if state.private.memory_loaded || state.private.memory_contents.is_some() {
             return Ok(messages);
         }
@@ -65,10 +69,13 @@ impl RuntimeMiddleware for MemoryMiddleware {
         let (contents, diagnostics) = load_sources(&self.root, &self.sources, &self.options)?;
         state.private.memory_loaded = true;
         state.private.memory_contents = Some(contents.clone());
-        state
-            .extra
-            .insert("memory_diagnostics".to_string(), serde_json::to_value(&diagnostics)?);
-        *self.state.write().unwrap() = LoadedMemory { diagnostics: diagnostics.clone() };
+        state.extra.insert(
+            "memory_diagnostics".to_string(),
+            serde_json::to_value(&diagnostics)?,
+        );
+        *self.state.write().unwrap() = LoadedMemory {
+            diagnostics: diagnostics.clone(),
+        };
 
         if !has_injection_marker(&messages) {
             let block = build_memory_block(&contents, &self.sources, &diagnostics);
@@ -77,6 +84,7 @@ impl RuntimeMiddleware for MemoryMiddleware {
                 Message {
                     role: "system".to_string(),
                     content: block,
+                    content_blocks: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -96,7 +104,11 @@ fn has_injection_marker(messages: &[Message]) -> bool {
         .any(|m| m.content.contains("DEEPAGENTS_MEMORY_INJECTED_V1"))
 }
 
-fn build_memory_block(contents: &BTreeMap<String, String>, sources: &[String], diagnostics: &MemoryDiagnostics) -> String {
+fn build_memory_block(
+    contents: &BTreeMap<String, String>,
+    sources: &[String],
+    diagnostics: &MemoryDiagnostics,
+) -> String {
     if let Some(c) = contents.get("__combined__") {
         let mut buf = String::new();
         buf.push_str("DEEPAGENTS_MEMORY_INJECTED_V1\n");
@@ -105,7 +117,9 @@ fn build_memory_block(contents: &BTreeMap<String, String>, sources: &[String], d
         buf.push_str("\n</agent_memory>\n\n");
         buf.push_str("<memory_guidelines>\n");
         buf.push_str("The above <agent_memory> was loaded from files in your filesystem.\n");
-        buf.push_str("Never store API keys, access tokens, passwords, or any other credentials in memory.\n");
+        buf.push_str(
+            "Never store API keys, access tokens, passwords, or any other credentials in memory.\n",
+        );
         buf.push_str("If the user asks you to remember something persistent (preferences, role, workflows), update memory immediately using file tools.\n");
         buf.push_str("If the information is transient or sensitive, do not write it to memory.\n");
         buf.push_str("</memory_guidelines>\n\n");
@@ -137,7 +151,9 @@ fn build_memory_block(contents: &BTreeMap<String, String>, sources: &[String], d
     buf.push_str("\n</agent_memory>\n\n");
     buf.push_str("<memory_guidelines>\n");
     buf.push_str("The above <agent_memory> was loaded from files in your filesystem.\n");
-    buf.push_str("Never store API keys, access tokens, passwords, or any other credentials in memory.\n");
+    buf.push_str(
+        "Never store API keys, access tokens, passwords, or any other credentials in memory.\n",
+    );
     buf.push_str("If the user asks you to remember something persistent (preferences, role, workflows), update memory immediately using file tools.\n");
     buf.push_str("If the information is transient or sensitive, do not write it to memory.\n");
     buf.push_str("</memory_guidelines>\n\n");
@@ -203,14 +219,28 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     let head = max_chars / 2;
     let tail = max_chars - head;
     let head_str: String = s.chars().take(head).collect();
-    let tail_str: String = s.chars().rev().take(tail).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail_str: String = s
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head_str}\n\n...(memory truncated)...\n\n{tail_str}")
 }
 
-fn load_one_source(root: &Path, source: &str, options: &MemoryLoadOptions) -> Result<Option<String>> {
+fn load_one_source(
+    root: &Path,
+    source: &str,
+    options: &MemoryLoadOptions,
+) -> Result<Option<String>> {
     let p = resolve_source_path(root, source, options)?;
     if p.file_name().and_then(|n| n.to_str()) != Some("AGENTS.md") {
-        anyhow::bail!("invalid_request: memory source must be AGENTS.md: {}", source);
+        anyhow::bail!(
+            "invalid_request: memory source must be AGENTS.md: {}",
+            source
+        );
     }
     let meta = match std::fs::symlink_metadata(&p) {
         Ok(m) => m,
@@ -232,16 +262,15 @@ fn load_one_source(root: &Path, source: &str, options: &MemoryLoadOptions) -> Re
 }
 
 fn resolve_source_path(root: &Path, source: &str, options: &MemoryLoadOptions) -> Result<PathBuf> {
-    let root_canon = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let root_raw = root.to_path_buf();
 
     if source.starts_with("~/") || source.starts_with("~\\") {
         if !options.allow_host_paths {
             anyhow::bail!("permission_denied: host paths disabled: {}", source);
         }
-        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("memory_io_error: HOME not set"))?;
+        let home =
+            std::env::var("HOME").map_err(|_| anyhow::anyhow!("memory_io_error: HOME not set"))?;
         let rest = &source[2..];
         return Ok(PathBuf::from(home).join(rest));
     }
@@ -252,7 +281,10 @@ fn resolve_source_path(root: &Path, source: &str, options: &MemoryLoadOptions) -
             return Ok(p);
         }
         let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if p_canon.starts_with(&root_canon) || p.starts_with(&root_raw) || p.starts_with(&root_canon) {
+        if p_canon.starts_with(&root_canon)
+            || p.starts_with(&root_raw)
+            || p.starts_with(&root_canon)
+        {
             return Ok(p_canon);
         }
         anyhow::bail!("permission_denied: outside root: {}", source);

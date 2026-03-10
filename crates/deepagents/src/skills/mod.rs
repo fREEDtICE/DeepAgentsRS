@@ -1,7 +1,7 @@
 pub mod declarative;
 pub mod loader;
-pub mod validator;
 pub mod protocol;
+pub mod validator;
 
 use std::collections::BTreeMap;
 

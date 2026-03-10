@@ -74,7 +74,11 @@ async fn file_memory_store_put_get_query_and_evict() {
 async fn memory_middleware_injects_once_and_keeps_memory_private() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join(".deepagents")).unwrap();
-    std::fs::write(temp.path().join(".deepagents").join("AGENTS.md"), "# Memory\nHello\n").unwrap();
+    std::fs::write(
+        temp.path().join(".deepagents").join("AGENTS.md"),
+        "# Memory\nHello\n",
+    )
+    .unwrap();
 
     let options = MemoryLoadOptions {
         allow_host_paths: false,
@@ -91,6 +95,7 @@ async fn memory_middleware_injects_once_and_keeps_memory_private() {
     let messages = vec![Message {
         role: "user".to_string(),
         content: "hi".to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -98,7 +103,9 @@ async fn memory_middleware_injects_once_and_keeps_memory_private() {
     }];
 
     let out1 = mw.before_run(messages.clone(), &mut state).await.unwrap();
-    assert!(out1.iter().any(|m| m.role == "system" && m.content.contains("DEEPAGENTS_MEMORY_INJECTED_V1")));
+    assert!(out1
+        .iter()
+        .any(|m| m.role == "system" && m.content.contains("DEEPAGENTS_MEMORY_INJECTED_V1")));
     assert!(state.private.memory_contents.is_some());
     assert!(state.extra.contains_key("memory_diagnostics"));
 

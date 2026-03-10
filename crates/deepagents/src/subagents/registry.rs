@@ -19,7 +19,10 @@ impl InMemorySubAgentRegistry {
 impl SubAgentRegistry for InMemorySubAgentRegistry {
     fn register(&self, agent: Arc<dyn CompiledSubAgent>) -> anyhow::Result<()> {
         let key = agent.subagent_type().to_string();
-        let mut map = self.agents.write().map_err(|_| anyhow::anyhow!("registry_locked"))?;
+        let mut map = self
+            .agents
+            .write()
+            .map_err(|_| anyhow::anyhow!("registry_locked"))?;
         if map.contains_key(&key) {
             return Err(anyhow::anyhow!("subagent_already_registered: {}", key));
         }

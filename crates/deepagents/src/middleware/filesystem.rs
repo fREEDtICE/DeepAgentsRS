@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use crate::backends::SandboxBackend;
 use crate::middleware::protocol::MiddlewareContext;
 use crate::middleware::Middleware;
-use crate::state::{DefaultFilesystemReducer, FileDelta, FileRecord, FilesystemDelta, StateReducer};
+use crate::state::{
+    DefaultFilesystemReducer, FileDelta, FileRecord, FilesystemDelta, StateReducer,
+};
 
 #[derive(Clone)]
 pub struct FilesystemMiddleware {
@@ -56,10 +58,7 @@ impl Middleware for FilesystemMiddleware {
 
         match tool_name {
             "write_file" | "edit_file" => {
-                let ok = output
-                    .get("error")
-                    .map(|e| e.is_null())
-                    .unwrap_or(true);
+                let ok = output.get("error").map(|e| e.is_null()).unwrap_or(true);
                 if !ok {
                     return Ok(());
                 }
@@ -67,12 +66,19 @@ impl Middleware for FilesystemMiddleware {
                     .get("path")
                     .and_then(|p| p.as_str())
                     .map(|s| s.to_string())
-                    .or_else(|| ctx.tool.input.get("file_path").and_then(|p| p.as_str()).map(|s| s.to_string()));
+                    .or_else(|| {
+                        ctx.tool
+                            .input
+                            .get("file_path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string())
+                    });
                 let Some(path) = path else {
                     return Ok(());
                 };
 
-                let (content, truncated) = read_file_lines(ctx.backend, &path, self.max_lines).await?;
+                let (content, truncated) =
+                    read_file_lines(ctx.backend, &path, self.max_lines).await?;
                 let now = now_iso8601();
                 let record = FileRecord {
                     content,
@@ -90,10 +96,7 @@ impl Middleware for FilesystemMiddleware {
                 );
             }
             "delete_file" => {
-                let ok = output
-                    .get("error")
-                    .map(|e| e.is_null())
-                    .unwrap_or(true);
+                let ok = output.get("error").map(|e| e.is_null()).unwrap_or(true);
                 if !ok {
                     return Ok(());
                 }
@@ -101,7 +104,13 @@ impl Middleware for FilesystemMiddleware {
                     .get("path")
                     .and_then(|p| p.as_str())
                     .map(|s| s.to_string())
-                    .or_else(|| ctx.tool.input.get("file_path").and_then(|p| p.as_str()).map(|s| s.to_string()));
+                    .or_else(|| {
+                        ctx.tool
+                            .input
+                            .get("file_path")
+                            .and_then(|p| p.as_str())
+                            .map(|s| s.to_string())
+                    });
                 let Some(path) = path else {
                     return Ok(());
                 };
@@ -124,7 +133,8 @@ impl Middleware for FilesystemMiddleware {
         }
 
         if !delta.files.is_empty() {
-            self.reducer.reduce(&mut ctx.state.filesystem, delta.clone());
+            self.reducer
+                .reduce(&mut ctx.state.filesystem, delta.clone());
             ctx.filesystem_delta = Some(delta);
         }
         Ok(())

@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct AgentState {
     #[serde(default)]
     pub filesystem: FilesystemState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<TodoItem>,
     #[serde(default)]
     pub extra: BTreeMap<String, Value>,
     #[serde(skip)]
@@ -51,6 +53,16 @@ pub struct FileDelta {
     pub upsert: Option<FileRecord>,
     #[serde(default)]
     pub delete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+    #[serde(rename = "activeForm", skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
 }
 
 pub trait StateReducer<S, D>: Send + Sync {

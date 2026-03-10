@@ -29,4 +29,3 @@ impl AuditSink for NoopAuditSink {
         Ok(())
     }
 }
-

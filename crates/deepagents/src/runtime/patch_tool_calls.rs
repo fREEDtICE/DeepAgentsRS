@@ -73,6 +73,7 @@ pub fn patch_dangling_tool_calls(messages: Vec<Message>) -> Vec<Message> {
             out.push(Message {
                 role: "tool".to_string(),
                 content,
+                content_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some(tc.id),
                 name: Some(tc.name),
@@ -102,12 +103,10 @@ pub fn normalize_provider_tool_calls(
             serde_json::Value::Null => {
                 call.arguments = serde_json::json!({});
             }
-            serde_json::Value::String(s) => {
-                match serde_json::from_str::<serde_json::Value>(s) {
-                    Ok(v) if v.is_object() => call.arguments = v,
-                    _ => {}
-                }
-            }
+            serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) if v.is_object() => call.arguments = v,
+                _ => {}
+            },
             _ => {}
         }
         out.push(call);
@@ -131,7 +130,20 @@ impl Default for PatchToolCallsMiddleware {
 
 #[async_trait::async_trait]
 impl RuntimeMiddleware for PatchToolCallsMiddleware {
-    async fn before_run(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
+    async fn before_run(
+        &self,
+        messages: Vec<Message>,
+        _state: &mut AgentState,
+    ) -> anyhow::Result<Vec<Message>> {
+        let messages = normalize_messages(messages);
+        Ok(patch_dangling_tool_calls(messages))
+    }
+
+    async fn before_provider_step(
+        &self,
+        messages: Vec<Message>,
+        _state: &mut AgentState,
+    ) -> anyhow::Result<Vec<Message>> {
         let messages = normalize_messages(messages);
         Ok(patch_dangling_tool_calls(messages))
     }

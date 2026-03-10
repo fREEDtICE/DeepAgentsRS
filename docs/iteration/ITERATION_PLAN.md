@@ -260,20 +260,101 @@
 
 - 关键路径回归：带工具调用的对话不会被裁剪到不可恢复
 
+## Phase 8.5：默认中间件顺序对齐（Python → Rust）
+
+### 目标
+
+- 对齐 Python `create_deep_agent()` 的主 agent 默认中间件顺序
+- 明确“运行时层 vs 工具层”的分层边界与职责
+
+### 范围
+
+- CLI/ACP 默认装配路径的中间件顺序调整
+- 新增（或 stub/noop）`TodoListMiddleware` 与 `PromptCachingMiddleware`
+- 明确 `FilesystemMiddleware`（工具层）与 `FilesystemRuntimeMiddleware`（运行时层）边界
+- `HITL` 保持策略与交互分离（未实现交互时需显式提示）
+
+### 对齐顺序（主 agent）
+
+- Python 参考顺序：`TodoList` →（可选）`Memory` →（可选）`Skills` → `Filesystem` → `Subagents` → `Summarization` → `AnthropicPromptCaching` → `PatchToolCalls` →（可选）用户 middleware →（可选）`HITL`
+- Rust 目标顺序：`TodoList` →（可选）`Memory` →（可选）`Skills` → `Filesystem` → `Subagents` → `Summarization` → `PromptCaching` → `PatchToolCalls` →（可选）用户 middleware →（可选）`HITL`
+
+### 交付物
+
+- CLI/ACP 默认装配顺序调整并文档化
+- `TodoListMiddleware` 与 `PromptCachingMiddleware` 的 Rust 版本（可 noop）
+- `FilesystemRuntimeMiddleware` 最小实现（支持“超大工具输出落盘引用”的占位接口）
+- TECH_DESIGN 与迭代计划同步更新
+
+### 验收
+
+- CLI `run` 默认顺序与 Python 对齐（主 agent）
+- `TodoListMiddleware`/`PromptCachingMiddleware` 无副作用且工具名可见
+- `FilesystemRuntimeMiddleware` 具备占位 offload 接口（可返回未启用状态）
+- `HITL` 未实现交互时有明确“不支持交互审批”提示
+
+### 未解决问题清单（截至 Phase 8.5）
+
+下列问题不在 Phase 8.5 的“默认顺序对齐 + 分层边界收敛”范围内，仍需纳入后续阶段（优先级建议从上到下）：
+
+1. HITL 交互闭环未实现：会话级 interrupt/resume（CLI/ACP 都需支持），而非仅返回“需要审批”的错误（方案与迭代拆分见 [HITL_INTERRUPT_RESUME_PLAN.md](HITL_INTERRUPT_RESUME_PLAN.md)）。
+2. 工具输出形态差异：同一仓库内既存在“结构化 JSON output + 展示用 content”双轨（DeepAgentsRS），也存在“底层 String 锁死 + 多种回灌编码”（ZeroClaw），Python 侧则以可展示 content 为主但类型更动态；需要冻结 canonical ToolResultEnvelope，并在 runtime/renderer/provider 边界内收敛，降低模型端解释成本（见 [TOOL_OUTPUT_NORMALIZATION_PLAN.md](TOOL_OUTPUT_NORMALIZATION_PLAN.md)）。
+3. 多模态 read_file：Python 支持图片等多模态返回，Rust 目前仅文本/JSON 包裹（方案见 [MULTIMODAL_READ_FILE_PLAN.md](MULTIMODAL_READ_FILE_PLAN.md)）。
+4. 路径模型未冻结：是否对齐 Python“虚拟路径 + CompositeBackend 路由”仍未决策，影响历史落盘路径与跨后端语义。
+5. Provider 生态缺失：除 mock/mock2 外缺少真实 provider 接入与 tool-calling 对齐验证。
+
 ## Phase 9：统一对齐与发布准备
 
 ### 目标
 
-- 梳理兼容矩阵、文档、示例与 CI，形成可持续迭代基线
+- 将 Phase 8.5 的“未解决问题清单”收敛为可执行的迭代门禁（有依赖顺序、有验收测试、有可观察输出），避免长期停留在文案层
+- 让 Rust 版具备一个可对齐验证的“真实 provider 路径”，从而解锁 PromptCaching、HITL 与工具渲染等跨层能力的真实集成验证
+- 梳理兼容矩阵、文档、示例与 CI，形成可持续迭代基线（对齐以可观察行为为准）
 
 ### 范围
 
-- 兼容矩阵维护、CI、示例工程、版本号与变更日志策略
-- Trait 稳定性策略：为公共 trait 增加版本化说明与破坏性变更准则
+- 迭代门禁（建议拆成 I1-I7，按依赖顺序推进）
+  - I1：冻结路径模型（虚拟路径/路由/安全口径）
+  - I2：工具结果渲染一致性（模型可见文本形态收敛）
+  - I3：Large tool result offload（`/large_tool_results/...` 引用模板与恢复语义）
+  - I4：HITL 协议与交互闭环（pause/approve/resume，覆盖 CLI 与 ACP）
+  - I5：TodoList 完整能力（todo state/reducer + `write_todos` 工具 + subagent 合并语义）
+  - I6：真实 Provider 接入与对齐验证（含 tool-calling、call_id、错误分类、PromptCaching 实装路径）
+  - I7：多模态 read_file（图片/多模态块返回与渲染策略）
+- 工程化与发布准备
+  - 兼容矩阵维护、示例工程、版本号与变更日志策略
+  - Trait 稳定性策略：为公共 trait 增加版本化说明与破坏性变更准则
+  - CI 门禁：把“默认路径对齐”的关键链路纳入黑盒 E2E（CLI/ACP 各一条）
+
+### 交付物
+
+- I1（路径模型冻结）
+  - 决策文档：是否采用“虚拟路径（`/` 开头）+ validate_path + CompositeBackend 路由”，并明确与当前 LocalSandbox root 边界的关系与迁移口径
+  - 可被测试的路径规范：路径归一化、跨平台分隔符、`..`/symlink 逃逸、以及虚拟根下的可路由前缀
+- I2（工具结果渲染一致性）
+  - 定义稳定的“模型可见 tool 文本模板”：统一 `tool` role message 的 `content` 形态（至少保证同一工具的关键字段不因 caller/transport 不同而变化）
+  - provider/tool renderer 的职责边界：哪些字段用于模型、哪些字段用于机器消费（RunOutput 结构化字段）
+- I3（Large tool result offload）
+  - 实现“检测→落盘→替换为引用模板”的最小闭环，并保证 PatchToolCalls/Summarization 组合下的幂等与可恢复
+  - 明确引用模板（固定字段、头尾预览策略、可选 checksum/size 元信息）
+- I4（HITL）
+  - 定义 interrupt/resume 的会话级协议（错误码/状态字段/恢复输入），并提供 CLI 与 ACP 各自最小可用入口
+  - 非交互模式与交互模式的行为边界（何时失败、何时暂停、如何提示）
+- I5（TodoList）
+  - 定义 TodoState（state keys、reducer 合并规则、与 SubAgent 的隔离/合并口径）
+  - 提供 `write_todos` 工具协议与最小实现（保证默认路径不泄漏敏感信息）
+- I6（真实 Provider + PromptCaching）
+  - 接入至少一个真实 provider，并做 tool-calling 形态与 call_id 规则的对齐验证（覆盖 streaming/timeout/retry 的最小集合）
+  - PromptCaching 从 stub/noop 升级为可插桩实现（哪怕先只记录 cache key/命中统计，也要锁定 key 策略与可观察输出）
+- I7（多模态 read_file）
+  - 扩展工具协议支持图片等多模态块（Rust 与 Python 的差异需在渲染层明确：模型可见/机器可见字段）
+  - 与 offload/渲染一致性联动：图片大于阈值时的引用策略与展示模板
 
 ### 验收
 
 - CI 稳定、示例可跑、文档可按阶段复现
+- 每个 I* 都有独立的“黑盒可复现用例”（优先落到 `docs/e2e/` + 对应 crates 的 e2e test），并且能在本地 `cargo test --workspace` 覆盖
+- 关键链路回归（至少覆盖一次组合）：tool 调用→（可能 offload）→ summarization→ patch tool calls→ 下一轮 provider 调用，且行为可解释、可恢复
 
 ## Parity Matrix（py → rust 对齐矩阵，建议持续维护）
 
@@ -288,9 +369,15 @@
 | CLI（交互/TUI） | `deepagents_cli/*` | 非交互优先，TUI 后置 | 已实现：`tool` + `run`（非交互），TUI 仍后置 | E2E_PHASE0/1/1_5/2 |
 | ACP server | `libs/acp/*` | Rust ACP 最小子集 | 已实现：HTTP+JSON v1（session + call_tool + state_version） | E2E_PHASE3_ACP |
 | Subagents | `middleware/subagents.py` | task 工具 + registry + 路由 | 已实现：RuntimeMiddleware 拦截 `task` + 深度限制 + state 过滤/合并 | E2E_PHASE4_SUBAGENTS |
-| Patch tool calls | `middleware/patch_tool_calls.py` | 运行前修补 dangling tool_calls | 未实现（需显式纳入 Phase 5 契约与回归） | E2E_PHASE5_PATCH_TOOL_CALLS |
+| Patch tool calls | `middleware/patch_tool_calls.py` | 运行前修补 dangling tool_calls | 已实现：PatchToolCallsMiddleware（dangling tool result 补齐 + provider tool-call 规范化） | E2E_PHASE5_PATCH_TOOL_CALLS |
 | Skills | `middleware/skills.py` | WASM/声明式/脚本插件 | 已实现：声明式技能（manifest→tool_calls）；WASM/脚本未实现 | E2E_PHASE1_5 |
-| Memory | `middleware/memory.py` | store trait + 最小实现 | 未实现（需要明确私有 state 与失败语义对齐） | Phase 7 |
-| Summarization | `middleware/summarization.py` | `_summarization_event` + 历史落盘 + args 裁剪 | 未实现（仅计划；需按 RESEARCH 锚点收敛语义） | Phase 8 |
+| Memory | `middleware/memory.py` | store trait + 最小实现 | 已实现：MemoryMiddleware（私有 memory_contents + 注入 block + diagnostics） | Phase 7 |
+| Summarization | `middleware/summarization.py` | `_summarization_event` + 历史落盘 + args 裁剪 | 已实现：SummarizationMiddleware（budget/turns 策略 + tool args 裁剪 + 事件写入 state.extra） | Phase 8 |
+| TodoList（write_todos） | `graph.py:create_deep_agent` | todo state/reducer + `write_todos` 工具 | 未实现（Phase 8.5 仅 stub/noop 对齐顺序） | 后续阶段（建议 Phase 9/10） |
+| PromptCaching | `graph.py:create_deep_agent` | provider 缓存插桩与 key 策略 | 未实现（Phase 8.5 仅 stub/noop 对齐顺序） | 后续阶段（依赖真实 provider） |
 | Large tool result offload | `middleware/filesystem.py` | `/large_tool_results/...` 引用模板 | 未实现（需纳入 Filesystem/Runner 契约） | 后续阶段 |
+| HITL（interrupt/resume） | CLI + middleware | 暂停→询问→恢复的交互闭环 | 未实现（目前仅“需要审批但不支持交互”的提示） | 后续阶段 |
+| 工具结果渲染一致性 | Tools + provider | 统一工具输出形态（字符串/结构化） | 未实现（目前差异显著） | 后续阶段 |
+| 多模态 read_file | `middleware/filesystem.py` | 图片/多模态块返回 | 未实现 | 后续阶段 |
+| 真实 Provider 接入 | LangChain providers | 至少一个真实 provider + tool-calling 对齐 | 未实现（仅 mock/mock2） | 后续阶段 |
 | 路径模型与路由 | `CompositeBackend` | 虚拟路径 + 路由 | 未决策/未实现（需冻结决策以支撑 offload/历史落盘） | 后续阶段 |

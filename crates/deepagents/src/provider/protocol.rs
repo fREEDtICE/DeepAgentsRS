@@ -11,16 +11,28 @@ pub struct ProviderToolCall {
     pub tool_name: String,
     #[serde(default, alias = "args", alias = "input")]
     pub arguments: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "id", alias = "tool_call_id", alias = "tool_use_id", alias = "toolUseId")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "id",
+        alias = "tool_call_id",
+        alias = "tool_use_id",
+        alias = "toolUseId"
+    )]
     pub call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderStep {
-    AssistantMessage { text: String },
-    FinalText { text: String },
-    ToolCalls { calls: Vec<ProviderToolCall> },
+    AssistantMessage {
+        text: String,
+    },
+    FinalText {
+        text: String,
+    },
+    ToolCalls {
+        calls: Vec<ProviderToolCall>,
+    },
     SkillCall {
         name: String,
         #[serde(default)]
@@ -28,7 +40,9 @@ pub enum ProviderStep {
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
     },
-    Error { error: ProviderError },
+    Error {
+        error: ProviderError,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

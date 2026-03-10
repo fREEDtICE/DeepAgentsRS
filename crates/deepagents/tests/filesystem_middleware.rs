@@ -23,7 +23,12 @@ async fn filesystem_middleware_updates_state_on_write_edit_delete() {
         .unwrap();
     assert!(delta.is_some());
 
-    let key = out.get("path").and_then(|p| p.as_str()).unwrap().to_string();
+    let key = out
+        .output
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap()
+        .to_string();
     let rec = state.filesystem.files.get(&key).unwrap();
     assert_eq!(rec.content, vec!["hello".to_string(), "world".to_string()]);
     assert!(!rec.deleted);

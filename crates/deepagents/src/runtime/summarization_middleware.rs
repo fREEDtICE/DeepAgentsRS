@@ -95,7 +95,11 @@ impl SummarizationStore for FilesystemSummarizationStore {
                 return Ok(None);
             }
         }
-        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
@@ -127,7 +131,11 @@ impl SummarizationMiddleware {
 
 #[async_trait::async_trait]
 impl RuntimeMiddleware for SummarizationMiddleware {
-    async fn before_provider_step(&self, messages: Vec<Message>, state: &mut AgentState) -> Result<Vec<Message>> {
+    async fn before_provider_step(
+        &self,
+        messages: Vec<Message>,
+        state: &mut AgentState,
+    ) -> Result<Vec<Message>> {
         let (mut effective_messages, prior_event) = apply_prior_event(&messages, state);
         if self.options.redact_tool_args {
             effective_messages = truncate_tool_args(
@@ -174,9 +182,15 @@ impl RuntimeMiddleware for SummarizationMiddleware {
             .filter(|&m| !is_summary_message(m))
             .cloned()
             .collect::<Vec<_>>();
-        let summary_message = build_summary_message(&pruned_messages, self.options.max_summary_chars);
+        let summary_message =
+            build_summary_message(&pruned_messages, self.options.max_summary_chars);
         let thread_id = ensure_thread_id(state);
-        let section = build_history_section(&pruned_messages, &summary_message, state_cutoff, &self.options);
+        let section = build_history_section(
+            &pruned_messages,
+            &summary_message,
+            state_cutoff,
+            &self.options,
+        );
         let file_path = self.store.persist(&thread_id, &section).await?;
         let event = SummarizationEvent {
             cutoff_index: state_cutoff,
@@ -185,7 +199,8 @@ impl RuntimeMiddleware for SummarizationMiddleware {
         };
         store_event(state, &event)?;
 
-        let mut next_effective = Vec::with_capacity(1 + messages.len().saturating_sub(state_cutoff));
+        let mut next_effective =
+            Vec::with_capacity(1 + messages.len().saturating_sub(state_cutoff));
         next_effective.push(summary_message);
         next_effective.extend(messages.iter().skip(state_cutoff).cloned());
         if self.options.redact_tool_args {
@@ -199,7 +214,10 @@ impl RuntimeMiddleware for SummarizationMiddleware {
         Ok(next_effective)
     }
 
-    async fn handle_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> Result<Option<HandledToolCall>> {
+    async fn handle_tool_call(
+        &self,
+        ctx: &mut ToolCallContext<'_>,
+    ) -> Result<Option<HandledToolCall>> {
         if ctx.tool_call.tool_name != "compact_conversation" {
             return Ok(None);
         }
@@ -213,7 +231,8 @@ impl RuntimeMiddleware for SummarizationMiddleware {
             );
         }
         let total_chars = total_chars(&effective_messages);
-        let min_chars = (self.options.max_char_budget as f32 * self.options.compact_min_ratio) as usize;
+        let min_chars =
+            (self.options.max_char_budget as f32 * self.options.compact_min_ratio) as usize;
         if total_chars < min_chars {
             return Ok(Some(HandledToolCall {
                 output: serde_json::json!({
@@ -253,9 +272,15 @@ impl RuntimeMiddleware for SummarizationMiddleware {
             .filter(|&m| !is_summary_message(m))
             .cloned()
             .collect::<Vec<_>>();
-        let summary_message = build_summary_message(&pruned_messages, self.options.max_summary_chars);
+        let summary_message =
+            build_summary_message(&pruned_messages, self.options.max_summary_chars);
         let thread_id = ensure_thread_id(ctx.state);
-        let section = build_history_section(&pruned_messages, &summary_message, state_cutoff, &self.options);
+        let section = build_history_section(
+            &pruned_messages,
+            &summary_message,
+            state_cutoff,
+            &self.options,
+        );
         let file_path = self.store.persist(&thread_id, &section).await?;
         let event = SummarizationEvent {
             cutoff_index: state_cutoff,
@@ -276,9 +301,13 @@ impl RuntimeMiddleware for SummarizationMiddleware {
     }
 }
 
-fn apply_prior_event(messages: &[Message], state: &AgentState) -> (Vec<Message>, Option<SummarizationEvent>) {
+fn apply_prior_event(
+    messages: &[Message],
+    state: &AgentState,
+) -> (Vec<Message>, Option<SummarizationEvent>) {
     if let Some(event) = load_event(state) {
-        let mut effective = Vec::with_capacity(1 + messages.len().saturating_sub(event.cutoff_index));
+        let mut effective =
+            Vec::with_capacity(1 + messages.len().saturating_sub(event.cutoff_index));
         effective.push(event.summary_message.clone());
         effective.extend(messages.iter().skip(event.cutoff_index).cloned());
         return (effective, Some(event));
@@ -300,7 +329,9 @@ fn store_event(state: &mut AgentState, event: &SummarizationEvent) -> Result<()>
         None => Vec::new(),
     };
     events.push(event.clone());
-    state.extra.insert(EVENTS_KEY.to_string(), serde_json::to_value(events)?);
+    state
+        .extra
+        .insert(EVENTS_KEY.to_string(), serde_json::to_value(events)?);
     Ok(())
 }
 
@@ -309,9 +340,10 @@ fn ensure_thread_id(state: &mut AgentState) -> String {
         return v.to_string();
     }
     let id = format!("session_{}", Utc::now().timestamp_millis());
-    state
-        .extra
-        .insert("thread_id".to_string(), serde_json::Value::String(id.clone()));
+    state.extra.insert(
+        "thread_id".to_string(),
+        serde_json::Value::String(id.clone()),
+    );
     id
 }
 
@@ -329,7 +361,14 @@ fn build_summary_message(messages: &[Message], max_chars: usize) -> Message {
     if messages.len() > 6 {
         lines.push("...".to_string());
     }
-    for m in messages.iter().rev().take(2).collect::<Vec<_>>().into_iter().rev() {
+    for m in messages
+        .iter()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         lines.push(format!("{}: {}", m.role, preview(&m.content, 80)));
     }
     let mut content = lines.join("\n");
@@ -339,6 +378,7 @@ fn build_summary_message(messages: &[Message], max_chars: usize) -> Message {
     Message {
         role: "user".to_string(),
         content,
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: Some(SUMMARY_NAME.to_string()),
@@ -362,7 +402,12 @@ fn build_history_section(
     buf.push_str(&summary_message.content);
     buf.push_str("\nmessages:\n");
     for (idx, m) in messages.iter().enumerate() {
-        buf.push_str(&format!("- idx: {}\n  role: {}\n  content: {}\n", idx, m.role, compact_ws(&m.content)));
+        buf.push_str(&format!(
+            "- idx: {}\n  role: {}\n  content: {}\n",
+            idx,
+            m.role,
+            compact_ws(&m.content)
+        ));
         if let Some(calls) = &m.tool_calls {
             let _ = serde_json::to_string(calls).map(|s| {
                 buf.push_str("  tool_calls: ");
@@ -384,8 +429,16 @@ fn should_summarize(messages: &[Message], options: &SummarizationOptions) -> boo
 
 fn compute_cutoff(messages: &[Message], options: &SummarizationOptions) -> usize {
     match options.policy {
-        SummarizationPolicyKind::Turns => cutoff_for_turns(messages, options.max_turns_visible, options.min_recent_messages),
-        _ => cutoff_for_budget(messages, options.max_char_budget, options.min_recent_messages),
+        SummarizationPolicyKind::Turns => cutoff_for_turns(
+            messages,
+            options.max_turns_visible,
+            options.min_recent_messages,
+        ),
+        _ => cutoff_for_budget(
+            messages,
+            options.max_char_budget,
+            options.min_recent_messages,
+        ),
     }
 }
 
@@ -454,7 +507,11 @@ fn should_truncate_tool(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "execute")
 }
 
-fn truncate_value(value: serde_json::Value, max_chars: usize, truncation_text: &str) -> serde_json::Value {
+fn truncate_value(
+    value: serde_json::Value,
+    max_chars: usize,
+    truncation_text: &str,
+) -> serde_json::Value {
     match value {
         serde_json::Value::String(s) => {
             if s.chars().count() > max_chars {
@@ -464,7 +521,10 @@ fn truncate_value(value: serde_json::Value, max_chars: usize, truncation_text: &
             }
         }
         serde_json::Value::Array(items) => {
-            let out = items.into_iter().map(|v| truncate_value(v, max_chars, truncation_text)).collect();
+            let out = items
+                .into_iter()
+                .map(|v| truncate_value(v, max_chars, truncation_text))
+                .collect();
             serde_json::Value::Array(out)
         }
         serde_json::Value::Object(map) => {
@@ -485,7 +545,14 @@ fn truncate_chars(s: &str, max_chars: usize, truncation_text: &str) -> String {
     let head = max_chars / 2;
     let tail = max_chars - head;
     let head_str: String = s.chars().take(head).collect();
-    let tail_str: String = s.chars().rev().take(tail).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail_str: String = s
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head_str}{truncation_text}{tail_str}")
 }
 

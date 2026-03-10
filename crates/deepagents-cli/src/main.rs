@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use deepagents::approval::{redact_command, ApprovalDecision, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode};
+use deepagents::approval::{
+    redact_command, ApprovalDecision, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode,
+};
 use deepagents::audit::{AuditEvent, AuditSink};
 use deepagents::memory::MemoryStore;
-use deepagents::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -66,6 +67,14 @@ enum Cmd {
         max_steps: usize,
         #[arg(long, default_value_t = 1000)]
         provider_timeout_ms: u64,
+        #[arg(long, default_value = "off")]
+        prompt_cache: String,
+        #[arg(long, default_value_t = false)]
+        prompt_cache_l2: bool,
+        #[arg(long, default_value_t = 300000)]
+        prompt_cache_ttl_ms: u64,
+        #[arg(long, default_value_t = 1024)]
+        prompt_cache_max_entries: usize,
         #[arg(long, default_value_t = false)]
         summarization_disable: bool,
         #[arg(long, default_value_t = 12000)]
@@ -80,6 +89,8 @@ enum Cmd {
         summarization_max_tool_arg_chars: usize,
         #[arg(long, default_value_t = 6)]
         summarization_truncate_keep_last: usize,
+        #[arg(long = "interrupt-on")]
+        interrupt_on: Vec<String>,
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
@@ -192,7 +203,9 @@ async fn main() -> Result<()> {
             if let Some(state_file) = state_file {
                 let mut state = load_state(&state_file).unwrap_or_default();
                 let execute_cmd = if name == "execute" {
-                    json.get("command").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    json.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 };
@@ -285,14 +298,22 @@ async fn main() -> Result<()> {
                                     decision: "allow".to_string(),
                                     decision_code: "allow".to_string(),
                                     decision_reason: "allowed".to_string(),
-                                    exit_code: out.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32),
-                                    truncated: out.get("truncated").and_then(|v| v.as_bool()),
+                                    exit_code: out
+                                        .output
+                                        .get("exit_code")
+                                        .and_then(|v| v.as_i64())
+                                        .map(|v| v as i32),
+                                    truncated: out
+                                        .output
+                                        .get("truncated")
+                                        .and_then(|v| v.as_bool()),
                                     duration_ms: Some(started.elapsed().as_millis() as u64),
                                 });
                             }
                         }
                         let resp = serde_json::json!({
-                            "output": out,
+                            "output": out.output,
+                            "content_blocks": out.content_blocks,
                             "state": state,
                             "delta": delta,
                             "error": serde_json::Value::Null
@@ -321,7 +342,9 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let execute_cmd = if name == "execute" {
-                    json.get("command").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    json.get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 };
@@ -384,7 +407,10 @@ async fn main() -> Result<()> {
                             decision: "allow".to_string(),
                             decision_code: "allow".to_string(),
                             decision_reason: "allowed".to_string(),
-                            exit_code: out.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32),
+                            exit_code: out
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|v| v as i32),
                             truncated: out.get("truncated").and_then(|v| v.as_bool()),
                             duration_ms: Some(started.elapsed().as_millis() as u64),
                         });
@@ -411,6 +437,10 @@ async fn main() -> Result<()> {
             memory_disable,
             max_steps,
             provider_timeout_ms,
+            prompt_cache,
+            prompt_cache_l2,
+            prompt_cache_ttl_ms,
+            prompt_cache_max_entries,
             summarization_disable,
             summarization_max_char_budget,
             summarization_max_turns_visible,
@@ -418,18 +448,30 @@ async fn main() -> Result<()> {
             summarization_redact_tool_args,
             summarization_max_tool_arg_chars,
             summarization_truncate_keep_last,
+            interrupt_on,
             pretty,
         } => {
-            let provider: std::sync::Arc<dyn deepagents::provider::Provider> = match provider.as_str() {
+            let provider_id = provider.clone();
+            let provider: std::sync::Arc<dyn deepagents::provider::Provider> = match provider
+                .as_str()
+            {
                 "mock" => {
-                    let path = mock_script.ok_or_else(|| anyhow!("--mock-script is required for --provider mock"))?;
+                    let path = mock_script
+                        .ok_or_else(|| anyhow!("--mock-script is required for --provider mock"))?;
                     let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-                    std::sync::Arc::new(deepagents::provider::mock::MockProvider::from_script(script))
+                    std::sync::Arc::new(deepagents::provider::mock::MockProvider::from_script(
+                        script,
+                    ))
                 }
                 "mock2" => {
-                    let path = mock_script.ok_or_else(|| anyhow!("--mock-script is required for --provider mock2"))?;
+                    let path = mock_script
+                        .ok_or_else(|| anyhow!("--mock-script is required for --provider mock2"))?;
                     let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-                    std::sync::Arc::new(deepagents::provider::mock::MockProvider::from_script_without_call_ids(script))
+                    std::sync::Arc::new(
+                        deepagents::provider::mock::MockProvider::from_script_without_call_ids(
+                            script,
+                        ),
+                    )
                 }
                 other => return Err(anyhow!("unknown --provider: {other}")),
             };
@@ -443,11 +485,19 @@ async fn main() -> Result<()> {
 
             let subagent_registry = deepagents::subagents::builtins::default_registry()?;
             let subagent_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                std::sync::Arc::new(deepagents::subagents::SubAgentMiddleware::new(subagent_registry));
+                std::sync::Arc::new(deepagents::subagents::SubAgentMiddleware::new(
+                    subagent_registry,
+                ));
             let patch_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                std::sync::Arc::new(deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware::new());
-            let mut runtime_middlewares: Vec<std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware>> =
-                vec![patch_mw];
+                std::sync::Arc::new(
+                    deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware::new(),
+                );
+            let mut asm = deepagents::runtime::RuntimeMiddlewareAssembler::new();
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::TodoList,
+                "todolist",
+                std::sync::Arc::new(deepagents::runtime::TodoListMiddleware::new()),
+            );
 
             if !memory_disable {
                 let sources = if memory_source.is_empty() {
@@ -455,12 +505,22 @@ async fn main() -> Result<()> {
                 } else {
                     memory_source
                 };
-                let mut options = deepagents::runtime::MemoryLoadOptions::default();
-                options.allow_host_paths = memory_allow_host_paths;
-                options.max_injected_chars = memory_max_injected_chars;
+                let options = deepagents::runtime::MemoryLoadOptions {
+                    allow_host_paths: memory_allow_host_paths,
+                    max_injected_chars: memory_max_injected_chars,
+                    ..Default::default()
+                };
                 let memory_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                    std::sync::Arc::new(deepagents::runtime::MemoryMiddleware::new(root.clone(), sources, options));
-                runtime_middlewares.push(memory_mw);
+                    std::sync::Arc::new(deepagents::runtime::MemoryMiddleware::new(
+                        root.clone(),
+                        sources,
+                        options,
+                    ));
+                asm.push(
+                    deepagents::runtime::RuntimeMiddlewareSlot::Memory,
+                    "memory",
+                    memory_mw,
+                );
             }
 
             if !skills_source.is_empty() {
@@ -469,24 +529,81 @@ async fn main() -> Result<()> {
                     strict: true,
                 };
                 let skills_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                    std::sync::Arc::new(deepagents::runtime::SkillsMiddleware::new(skills_source, options));
-                runtime_middlewares.push(skills_mw);
+                    std::sync::Arc::new(deepagents::runtime::SkillsMiddleware::new(
+                        skills_source,
+                        options,
+                    ));
+                asm.push(
+                    deepagents::runtime::RuntimeMiddlewareSlot::Skills,
+                    "skills",
+                    skills_mw,
+                );
             }
 
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::FilesystemRuntime,
+                "filesystem_runtime",
+                std::sync::Arc::new(deepagents::runtime::FilesystemRuntimeMiddleware::new(
+                    deepagents::runtime::FilesystemRuntimeOptions::default(),
+                )),
+            );
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::Subagents,
+                "subagents",
+                subagent_mw,
+            );
+
             if !summarization_disable {
-                let mut options = deepagents::runtime::SummarizationOptions::default();
-                options.policy = deepagents::runtime::SummarizationPolicyKind::Budget;
-                options.max_char_budget = summarization_max_char_budget;
-                options.max_turns_visible = summarization_max_turns_visible;
-                options.min_recent_messages = summarization_min_recent_messages;
-                options.redact_tool_args = summarization_redact_tool_args;
-                options.max_tool_arg_chars = summarization_max_tool_arg_chars;
-                options.truncate_tool_args_keep_last = summarization_truncate_keep_last;
+                let options = deepagents::runtime::SummarizationOptions {
+                    policy: deepagents::runtime::SummarizationPolicyKind::Budget,
+                    max_char_budget: summarization_max_char_budget,
+                    max_turns_visible: summarization_max_turns_visible,
+                    min_recent_messages: summarization_min_recent_messages,
+                    redact_tool_args: summarization_redact_tool_args,
+                    max_tool_arg_chars: summarization_max_tool_arg_chars,
+                    truncate_tool_args_keep_last: summarization_truncate_keep_last,
+                    ..Default::default()
+                };
                 let summarization_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                    std::sync::Arc::new(deepagents::runtime::SummarizationMiddleware::new(root.clone(), options));
-                runtime_middlewares.push(summarization_mw);
+                    std::sync::Arc::new(deepagents::runtime::SummarizationMiddleware::new(
+                        root.clone(),
+                        options,
+                    ));
+                asm.push(
+                    deepagents::runtime::RuntimeMiddlewareSlot::Summarization,
+                    "summarization",
+                    summarization_mw,
+                );
             }
-            runtime_middlewares.push(subagent_mw);
+
+            let prompt_cache_enabled = match prompt_cache.as_str() {
+                "off" => false,
+                "memory" => true,
+                other => return Err(anyhow!("unknown --prompt-cache: {other}")),
+            };
+            let prompt_cache_options = deepagents::runtime::PromptCacheOptions {
+                enabled: prompt_cache_enabled,
+                backend: deepagents::runtime::CacheBackend::Memory,
+                enable_l2_response_cache: prompt_cache_l2,
+                ttl_ms: prompt_cache_ttl_ms,
+                max_entries: prompt_cache_max_entries,
+                provider_id,
+                partition: root.clone(),
+            };
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::PromptCaching,
+                "prompt_caching",
+                std::sync::Arc::new(deepagents::runtime::PromptCachingMiddleware::new(
+                    prompt_cache_options,
+                )),
+            );
+            asm.push(
+                deepagents::runtime::RuntimeMiddlewareSlot::PatchToolCalls,
+                "patch_tool_calls",
+                patch_mw,
+            );
+
+            let runtime_middlewares = asm.build()?;
 
             let mut initial_state = deepagents::state::AgentState::default();
             if let Some(tid) = thread_id {
@@ -495,11 +612,21 @@ async fn main() -> Result<()> {
                     .insert("thread_id".to_string(), serde_json::Value::String(tid));
             }
 
-            let runtime = deepagents::runtime::simple::SimpleRuntime::new(
+            let mut interrupt_on_map = std::collections::BTreeMap::new();
+            for t in interrupt_on {
+                interrupt_on_map.insert(t, true);
+            }
+            if interrupt_on_map.is_empty() && matches!(mode, ExecutionMode::Interactive) {
+                for k in ["write_file", "edit_file", "delete_file", "execute"] {
+                    interrupt_on_map.insert(k.to_string(), true);
+                }
+            }
+
+            let mut runner = deepagents::runtime::ResumableRunner::new(
                 agent,
                 provider,
                 skills,
-                deepagents::runtime::simple::SimpleRuntimeOptions {
+                deepagents::runtime::ResumableRunnerOptions {
                     config: deepagents::runtime::RuntimeConfig {
                         max_steps,
                         provider_timeout_ms,
@@ -508,23 +635,76 @@ async fn main() -> Result<()> {
                     audit: audit_sink,
                     root: root.clone(),
                     mode,
+                    interrupt_on: interrupt_on_map,
                 },
             )
             .with_runtime_middlewares(runtime_middlewares)
             .with_initial_state(initial_state);
 
-            let out = runtime
-                .run(vec![deepagents::types::Message {
-                    role: "user".to_string(),
-                    content: input,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    status: None,
-                }])
-                .await;
+            runner.push_user_input(input);
+            let mut out = runner.run().await;
 
-            let ok = out.error.is_none();
+            if matches!(mode, ExecutionMode::Interactive) {
+                let mut stderr = std::io::stderr();
+                loop {
+                    if out.status != deepagents::runtime::RunStatus::Interrupted {
+                        break;
+                    }
+                    let Some(interrupt) = out.interrupts.get(0).cloned() else {
+                        break;
+                    };
+                    eprintln!(
+                        "HITL interrupt: tool={} tool_call_id={}",
+                        interrupt.tool_name, interrupt.tool_call_id
+                    );
+                    eprintln!(
+                        "proposed_args={}",
+                        serde_json::to_string_pretty(&interrupt.proposed_args)
+                            .unwrap_or_else(|_| interrupt.proposed_args.to_string())
+                    );
+                    let decision = loop {
+                        eprint!("decision [a=approve,r=reject,e=edit]> ");
+                        let _ = std::io::Write::flush(&mut stderr);
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        match line.trim() {
+                            "a" | "approve" => break deepagents::runtime::HitlDecision::Approve,
+                            "r" | "reject" => {
+                                break deepagents::runtime::HitlDecision::Reject { reason: None }
+                            }
+                            "e" | "edit" => {
+                                eprint!("edit args JSON> ");
+                                let _ = std::io::Write::flush(&mut stderr);
+                                let mut args_line = String::new();
+                                std::io::stdin().read_line(&mut args_line)?;
+                                match serde_json::from_str::<serde_json::Value>(args_line.trim()) {
+                                    Ok(v) => {
+                                        break deepagents::runtime::HitlDecision::Edit { args: v }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("invalid JSON: {}", e.to_string());
+                                        continue;
+                                    }
+                                }
+                            }
+                            other => {
+                                eprintln!("unknown decision: {}", other);
+                                continue;
+                            }
+                        }
+                    };
+                    out = runner.resume(&interrupt.interrupt_id, decision).await;
+                }
+            } else if out.status == deepagents::runtime::RunStatus::Interrupted {
+                if pretty {
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("{}", serde_json::to_string(&out)?);
+                }
+                std::process::exit(2);
+            }
+
+            let ok = out.error.is_none() && out.status == deepagents::runtime::RunStatus::Completed;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -653,7 +833,7 @@ fn load_skills_from_sources(sources: &[String]) -> Result<deepagents::skills::Lo
         skip_invalid_sources: false,
         strict: true,
     };
-    Ok(deepagents::skills::loader::load_skills(sources, options)?)
+    deepagents::skills::loader::load_skills(sources, options)
 }
 
 fn print_json_value(value: serde_json::Value, pretty: bool) -> Result<()> {
@@ -689,7 +869,10 @@ fn init_skill_template(dir: &str) -> Result<()> {
         }]
     });
     std::fs::write(path.join("SKILL.md"), skill_md)?;
-    std::fs::write(path.join("tools.json"), serde_json::to_vec_pretty(&tools_json)?)?;
+    std::fs::write(
+        path.join("tools.json"),
+        serde_json::to_vec_pretty(&tools_json)?,
+    )?;
     Ok(())
 }
 
@@ -734,7 +917,11 @@ fn resolve_allow_list(args: &Args) -> Vec<String> {
     }
 
     if let Ok(v) = std::env::var("DEEPAGENTS_SHELL_ALLOW") {
-        out.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        out.extend(
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
     }
     if let Ok(p) = std::env::var("DEEPAGENTS_SHELL_ALLOW_FILE") {
         out.extend(read_allow_file(&p).unwrap_or_default());

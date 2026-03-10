@@ -62,7 +62,11 @@ struct ToolPolicyFileSpec {
     max_output_chars: Option<usize>,
 }
 
-pub fn load_skill_dir(path: &Path, source: &str, options: SkillValidationOptions) -> Result<SkillPackage> {
+pub fn load_skill_dir(
+    path: &Path,
+    source: &str,
+    options: SkillValidationOptions,
+) -> Result<SkillPackage> {
     validate_dir_safety(path)?;
     let skill_md = path.join("SKILL.md");
     if !skill_md.exists() {
@@ -142,7 +146,12 @@ fn build_metadata(
             if let Some(k) = key.as_str() {
                 if !matches!(
                     k,
-                    "name" | "description" | "license" | "compatibility" | "metadata" | "allowed-tools"
+                    "name"
+                        | "description"
+                        | "license"
+                        | "compatibility"
+                        | "metadata"
+                        | "allowed-tools"
                 ) {
                     return Err(anyhow::anyhow!("unknown frontmatter field: {}", k));
                 }
@@ -173,7 +182,10 @@ fn validate_skill_name(name: &str, path: &Path) -> Result<()> {
     if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
         return Err(anyhow::anyhow!("invalid name format"));
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(anyhow::anyhow!("invalid name charset"));
     }
     let dir_name = path
@@ -247,7 +259,11 @@ fn get_allowed_tools(map: &serde_yaml::Mapping, key: &str) -> Result<Vec<String>
         return Ok(out);
     }
     if let Some(s) = v.as_str() {
-        let parts = s.split_whitespace().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let parts = s
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         return Ok(parts);
     }
     Err(anyhow::anyhow!("allowed-tools must be list or string"))

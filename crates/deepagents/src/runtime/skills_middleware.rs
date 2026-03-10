@@ -33,13 +33,18 @@ impl SkillsMiddleware {
 
 #[async_trait::async_trait]
 impl RuntimeMiddleware for SkillsMiddleware {
-    async fn before_run(&self, mut messages: Vec<Message>, state: &mut AgentState) -> Result<Vec<Message>> {
+    async fn before_run(
+        &self,
+        mut messages: Vec<Message>,
+        state: &mut AgentState,
+    ) -> Result<Vec<Message>> {
         let mut should_load = true;
         if let (Some(meta), Some(tools)) = (
             state.extra.get("skills_metadata"),
             state.extra.get("skills_tools"),
         ) {
-            let meta_ok = serde_json::from_value::<Vec<crate::skills::SkillMetadata>>(meta.clone()).is_ok();
+            let meta_ok =
+                serde_json::from_value::<Vec<crate::skills::SkillMetadata>>(meta.clone()).is_ok();
             let tools_ok = serde_json::from_value::<Vec<SkillToolSpec>>(tools.clone()).is_ok();
             if meta_ok && tools_ok {
                 should_load = false;
@@ -48,15 +53,18 @@ impl RuntimeMiddleware for SkillsMiddleware {
 
         if should_load {
             let loaded = load_skills(&self.sources, self.options.clone())?;
-            state
-                .extra
-                .insert("skills_metadata".to_string(), serde_json::to_value(&loaded.metadata)?);
-            state
-                .extra
-                .insert("skills_tools".to_string(), serde_json::to_value(&loaded.tools)?);
-            state
-                .extra
-                .insert("skills_diagnostics".to_string(), serde_json::to_value(&loaded.diagnostics)?);
+            state.extra.insert(
+                "skills_metadata".to_string(),
+                serde_json::to_value(&loaded.metadata)?,
+            );
+            state.extra.insert(
+                "skills_tools".to_string(),
+                serde_json::to_value(&loaded.tools)?,
+            );
+            state.extra.insert(
+                "skills_diagnostics".to_string(),
+                serde_json::to_value(&loaded.diagnostics)?,
+            );
             *self.state.write().unwrap() = loaded;
         } else {
             let meta = state
@@ -89,6 +97,7 @@ impl RuntimeMiddleware for SkillsMiddleware {
                 Message {
                     role: "system".to_string(),
                     content: block,
+                    content_blocks: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -100,9 +109,16 @@ impl RuntimeMiddleware for SkillsMiddleware {
         Ok(messages)
     }
 
-    async fn handle_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> Result<Option<HandledToolCall>> {
+    async fn handle_tool_call(
+        &self,
+        ctx: &mut ToolCallContext<'_>,
+    ) -> Result<Option<HandledToolCall>> {
         let loaded = self.state.read().unwrap().clone();
-        let tool = match loaded.tools.iter().find(|t| t.name == ctx.tool_call.tool_name) {
+        let tool = match loaded
+            .tools
+            .iter()
+            .find(|t| t.name == ctx.tool_call.tool_name)
+        {
             Some(t) => t.clone(),
             None => return Ok(None),
         };
@@ -117,7 +133,10 @@ impl RuntimeMiddleware for SkillsMiddleware {
         if tool.steps.len() > tool.policy.max_steps {
             return Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
-                error: Some(format!("skill_steps_exceeded: max={}", tool.policy.max_steps)),
+                error: Some(format!(
+                    "skill_steps_exceeded: max={}",
+                    tool.policy.max_steps
+                )),
             }));
         }
 
@@ -143,7 +162,10 @@ impl RuntimeMiddleware for SkillsMiddleware {
     }
 }
 
-async fn execute_skill_steps(ctx: &mut ToolCallContext<'_>, tool: &SkillToolSpec) -> Result<serde_json::Value, String> {
+async fn execute_skill_steps(
+    ctx: &mut ToolCallContext<'_>,
+    tool: &SkillToolSpec,
+) -> Result<serde_json::Value, String> {
     let mut last_output = serde_json::Value::Null;
     for step in &tool.steps {
         if !is_step_allowed(step, &tool.policy) {
@@ -157,7 +179,7 @@ async fn execute_skill_steps(ctx: &mut ToolCallContext<'_>, tool: &SkillToolSpec
             ctx.agent
                 .call_tool_stateful(&step.tool_name, args, ctx.state)
                 .await
-                .map(|(out, _delta)| out)
+                .map(|(out, _delta)| out.output)
                 .map_err(|e| format!("skill_step_failed: {}: {}", step.tool_name, e))?
         };
         last_output = truncate_output(output, tool.policy.max_output_chars);
@@ -165,7 +187,10 @@ async fn execute_skill_steps(ctx: &mut ToolCallContext<'_>, tool: &SkillToolSpec
     Ok(last_output)
 }
 
-async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+async fn execute_with_approval(
+    ctx: &mut ToolCallContext<'_>,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let cmd = args
         .get("command")
         .and_then(|v| v.as_str())
@@ -188,6 +213,7 @@ async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json:
                 let duration_ms = started.elapsed().as_millis() as u64;
                 match result {
                     Ok((out, _delta)) => {
+                        let output = out.output;
                         record_audit(AuditRecordInput {
                             sink: ctx.audit,
                             cmd: &cmd,
@@ -197,9 +223,9 @@ async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json:
                             decision_code: "allow",
                             decision_reason: reason,
                             duration_ms,
-                            output: Some(&out),
+                            output: Some(&output),
                         });
-                        Ok(out)
+                        Ok(output)
                     }
                     Err(e) => {
                         record_audit(AuditRecordInput {
@@ -250,7 +276,7 @@ async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json:
         ctx.agent
             .call_tool_stateful("execute", args.clone(), ctx.state)
             .await
-            .map(|(out, _delta)| out)
+            .map(|(out, _delta)| out.output)
             .map_err(|e| format!("skill_step_failed: execute: {}", e))
     }
 }
@@ -284,7 +310,9 @@ fn record_audit(input: AuditRecordInput<'_>) {
         .and_then(|v| v.as_object())
         .map(|o| {
             (
-                o.get("exit_code").and_then(|v| v.as_i64()).map(|v| v as i32),
+                o.get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32),
                 o.get("truncated").and_then(|v| v.as_bool()),
             )
         })
@@ -310,7 +338,10 @@ fn mode_str(mode: ExecutionMode) -> String {
     }
 }
 
-fn is_step_allowed(step: &crate::skills::SkillToolStep, policy: &crate::skills::SkillToolPolicy) -> bool {
+fn is_step_allowed(
+    step: &crate::skills::SkillToolStep,
+    policy: &crate::skills::SkillToolPolicy,
+) -> bool {
     if step.tool_name == "execute" {
         return policy.allow_execute;
     }
@@ -349,7 +380,9 @@ fn build_skills_block(loaded: &LoadedSkills) -> String {
 }
 
 fn has_injection_marker(messages: &[Message]) -> bool {
-    messages.iter().any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+    messages
+        .iter()
+        .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
 }
 
 fn merge_args(base: serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
@@ -401,11 +434,17 @@ fn truncate_output(value: serde_json::Value, max: usize) -> serde_json::Value {
     }
 }
 
-fn validate_input_schema(schema: &serde_json::Value, input: &serde_json::Value) -> Result<(), String> {
+fn validate_input_schema(
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> Result<(), String> {
     let Some(schema_obj) = schema.as_object() else {
         return Err("schema must be object".to_string());
     };
-    let typ = schema_obj.get("type").and_then(|v| v.as_str()).unwrap_or("object");
+    let typ = schema_obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("object");
     if typ != "object" {
         return Err("schema type must be object".to_string());
     }
@@ -414,7 +453,9 @@ fn validate_input_schema(schema: &serde_json::Value, input: &serde_json::Value) 
         .ok_or_else(|| "input must be object".to_string())?;
     if let Some(required) = schema_obj.get("required").and_then(|v| v.as_array()) {
         for r in required {
-            let key = r.as_str().ok_or_else(|| "required must be string".to_string())?;
+            let key = r
+                .as_str()
+                .ok_or_else(|| "required must be string".to_string())?;
             if !input_obj.contains_key(key) {
                 return Err(format!("missing required field: {}", key));
             }

@@ -38,14 +38,44 @@ impl LocalSandbox {
 
         let p = Path::new(input);
         let joined = if p.is_absolute() {
-            p.to_path_buf()
+            if p.starts_with(&self.root) {
+                p.to_path_buf()
+            } else {
+                let mut remapped: Option<PathBuf> = None;
+                if p.exists() && p.is_dir() {
+                    if let Ok(canon) = p.canonicalize() {
+                        if canon.starts_with(&self.root) {
+                            remapped = Some(canon);
+                        }
+                    }
+                }
+                if let Some(parent) = p.parent() {
+                    if parent.exists() {
+                        if let Ok(canon_parent) = parent.canonicalize() {
+                            if canon_parent.starts_with(&self.root) {
+                                if let Some(name) = p.file_name() {
+                                    remapped = Some(canon_parent.join(name));
+                                } else {
+                                    remapped = Some(canon_parent);
+                                }
+                            }
+                        }
+                    }
+                }
+                remapped.unwrap_or_else(|| {
+                    let virtual_rel = input.trim_start_matches('/');
+                    self.root.join(virtual_rel)
+                })
+            }
         } else {
             self.root.join(p)
         };
 
         let resolved = normalize_path(&joined).map_err(BackendError::Other)?;
         if !resolved.starts_with(&self.root) {
-            return Err(BackendError::Other("permission_denied: outside root".to_string()));
+            return Err(BackendError::Other(
+                "permission_denied: outside root".to_string(),
+            ));
         }
         Ok(resolved)
     }
@@ -56,7 +86,9 @@ impl LocalSandbox {
             return Err(BackendError::Other("file_not_found".to_string()));
         }
         if !p.is_dir() {
-            return Err(BackendError::Other("invalid_path: not a directory".to_string()));
+            return Err(BackendError::Other(
+                "invalid_path: not a directory".to_string(),
+            ));
         }
         Ok(p)
     }
@@ -81,10 +113,7 @@ impl FilesystemBackend for LocalSandbox {
             let meta = entry
                 .metadata()
                 .map_err(|e| BackendError::Other(e.to_string()))?;
-            let modified_at = meta
-                .modified()
-                .ok()
-                .and_then(system_time_to_iso8601);
+            let modified_at = meta.modified().ok().and_then(system_time_to_iso8601);
             out.push(FileInfo {
                 path: p.to_string_lossy().to_string(),
                 is_dir: Some(meta.is_dir()),
@@ -95,7 +124,26 @@ impl FilesystemBackend for LocalSandbox {
         Ok(out)
     }
 
-    async fn read(&self, file_path: &str, offset: usize, limit: usize) -> Result<String, BackendError> {
+    async fn create_dir_all(&self, dir_path: &str) -> Result<(), BackendError> {
+        let p = self.resolve_path(dir_path)?;
+        if p.exists() {
+            if p.is_dir() {
+                return Ok(());
+            }
+            return Err(BackendError::Other("already_exists_not_dir".to_string()));
+        }
+        tokio::fs::create_dir_all(&p)
+            .await
+            .map_err(|e| BackendError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read(
+        &self,
+        file_path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, BackendError> {
         let p = self.resolve_path(file_path)?;
         if !p.exists() {
             return Err(BackendError::Other("file_not_found".to_string()));
@@ -122,7 +170,35 @@ impl FilesystemBackend for LocalSandbox {
         Ok(buf)
     }
 
-    async fn write_file(&self, file_path: &str, content: &str) -> Result<WriteResult, BackendError> {
+    async fn read_bytes(&self, file_path: &str, max_bytes: usize) -> Result<Vec<u8>, BackendError> {
+        let p = self.resolve_path(file_path)?;
+        if !p.exists() {
+            return Err(BackendError::Other("file_not_found".to_string()));
+        }
+        if p.is_dir() {
+            return Err(BackendError::Other("is_directory".to_string()));
+        }
+        if max_bytes == 0 {
+            return Err(BackendError::Other("too_large".to_string()));
+        }
+        let meta = tokio::fs::metadata(&p)
+            .await
+            .map_err(|e| BackendError::Other(e.to_string()))?;
+        let len = meta.len();
+        if len > max_bytes as u64 {
+            return Err(BackendError::Other("too_large".to_string()));
+        }
+        let buf = tokio::fs::read(&p)
+            .await
+            .map_err(|e| BackendError::Other(e.to_string()))?;
+        Ok(buf)
+    }
+
+    async fn write_file(
+        &self,
+        file_path: &str,
+        content: &str,
+    ) -> Result<WriteResult, BackendError> {
         let p = self.resolve_path(file_path)?;
         if p.exists() {
             return Ok(WriteResult {
@@ -148,7 +224,10 @@ impl FilesystemBackend for LocalSandbox {
         })
     }
 
-    async fn delete_file(&self, file_path: &str) -> Result<crate::types::DeleteResult, BackendError> {
+    async fn delete_file(
+        &self,
+        file_path: &str,
+    ) -> Result<crate::types::DeleteResult, BackendError> {
         let p = self.resolve_path(file_path)?;
         if !p.exists() {
             return Ok(crate::types::DeleteResult {
@@ -224,7 +303,9 @@ impl FilesystemBackend for LocalSandbox {
         let normalized = pat.strip_prefix('/').unwrap_or(pat);
         let glob = Glob::new(normalized).map_err(|e| BackendError::Other(e.to_string()))?;
         builder.add(glob);
-        let set = builder.build().map_err(|e| BackendError::Other(e.to_string()))?;
+        let set = builder
+            .build()
+            .map_err(|e| BackendError::Other(e.to_string()))?;
 
         let mut out = Vec::new();
         for entry in WalkDir::new(&self.root).into_iter().filter_map(|e| e.ok()) {
@@ -258,7 +339,11 @@ impl FilesystemBackend for LocalSandbox {
         let globset = if let Some(g) = glob {
             let mut builder = GlobSetBuilder::new();
             builder.add(Glob::new(g).map_err(|e| BackendError::Other(e.to_string()))?);
-            Some(builder.build().map_err(|e| BackendError::Other(e.to_string()))?)
+            Some(
+                builder
+                    .build()
+                    .map_err(|e| BackendError::Other(e.to_string()))?,
+            )
         } else {
             None
         };
@@ -298,7 +383,11 @@ impl FilesystemBackend for LocalSandbox {
 
 #[async_trait]
 impl SandboxBackend for LocalSandbox {
-    async fn execute(&self, command: &str, timeout_secs: Option<u64>) -> Result<ExecResult, BackendError> {
+    async fn execute(
+        &self,
+        command: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<ExecResult, BackendError> {
         if let Some(allow) = &self.shell_allow_list {
             if !is_shell_command_allowed(command, allow) {
                 return Err(BackendError::Other("command_not_allowed".to_string()));
@@ -309,7 +398,10 @@ impl SandboxBackend for LocalSandbox {
         cmd.arg("-lc").arg(command).current_dir(&self.root);
 
         let run = async {
-            let output = cmd.output().await.map_err(|e| BackendError::Other(e.to_string()))?;
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| BackendError::Other(e.to_string()))?;
             let mut combined = String::new();
             combined.push_str(&String::from_utf8_lossy(&output.stdout));
             combined.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -383,21 +475,7 @@ fn system_time_to_iso8601(t: SystemTime) -> Option<String> {
 
 fn contains_dangerous_patterns(command: &str) -> bool {
     const DANGEROUS_SUBSTRINGS: [&str; 15] = [
-        "$(",
-        "`",
-        "$'",
-        "\n",
-        "\r",
-        "\t",
-        "<(",
-        ">(",
-        "<<<",
-        "<<",
-        ">>",
-        ">",
-        "<",
-        "${",
-        "\u{0}",
+        "$(", "`", "$'", "\n", "\r", "\t", "<(", ">(", "<<<", "<<", ">>", ">", "<", "${", "\u{0}",
     ];
     if DANGEROUS_SUBSTRINGS.iter().any(|p| command.contains(p)) {
         return true;
@@ -436,7 +514,8 @@ fn is_shell_command_allowed(command: &str, allow_list: &[String]) -> bool {
         return false;
     }
 
-    let allow_set: std::collections::HashSet<&str> = allow_list.iter().map(|s| s.as_str()).collect();
+    let allow_set: std::collections::HashSet<&str> =
+        allow_list.iter().map(|s| s.as_str()).collect();
     let segments = split_shell_segments(trimmed);
     let mut found = false;
     for seg in segments {

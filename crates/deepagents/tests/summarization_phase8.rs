@@ -1,4 +1,6 @@
-use deepagents::runtime::{SummarizationMiddleware, SummarizationOptions, SummarizationPolicyKind, RuntimeMiddleware};
+use deepagents::runtime::{
+    RuntimeMiddleware, SummarizationMiddleware, SummarizationOptions, SummarizationPolicyKind,
+};
 use deepagents::state::AgentState;
 use deepagents::types::{Message, ToolCall};
 
@@ -6,6 +8,7 @@ fn build_message(role: &str, content: &str) -> Message {
     Message {
         role: role.to_string(),
         content: content.to_string(),
+        content_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -17,6 +20,7 @@ fn build_tool_message(content: &str, name: &str, args: serde_json::Value) -> Mes
     Message {
         role: "assistant".to_string(),
         content: content.to_string(),
+        content_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
             name: name.to_string(),
@@ -48,13 +52,23 @@ async fn summarization_event_is_emitted_and_history_written() {
         build_message("user", "message three that is quite long"),
     ];
 
-    let effective = mw.before_provider_step(messages.clone(), &mut state).await.unwrap();
+    let effective = mw
+        .before_provider_step(messages.clone(), &mut state)
+        .await
+        .unwrap();
     let event = state.extra.get("_summarization_event").cloned().unwrap();
     let event: deepagents::runtime::SummarizationEvent = serde_json::from_value(event).unwrap();
     assert!(event.cutoff_index > 0);
     assert!(effective.first().unwrap().name.as_deref() == Some("summarization"));
-    let thread_id = state.extra.get("thread_id").and_then(|v| v.as_str()).unwrap();
-    let history_path = temp.path().join("conversation_history").join(format!("{thread_id}.md"));
+    let thread_id = state
+        .extra
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    let history_path = temp
+        .path()
+        .join("conversation_history")
+        .join(format!("{thread_id}.md"));
     assert!(history_path.exists());
 }
 
@@ -84,8 +98,12 @@ async fn truncates_old_tool_args_only() {
     ];
 
     let effective = mw.before_provider_step(messages, &mut state).await.unwrap();
-    let first = effective[0].tool_calls.as_ref().unwrap()[0].arguments.to_string();
-    let second = effective[1].tool_calls.as_ref().unwrap()[0].arguments.to_string();
+    let first = effective[0].tool_calls.as_ref().unwrap()[0]
+        .arguments
+        .to_string();
+    let second = effective[1].tool_calls.as_ref().unwrap()[0]
+        .arguments
+        .to_string();
     assert!(first.contains("truncated"));
     assert!(second.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
 }

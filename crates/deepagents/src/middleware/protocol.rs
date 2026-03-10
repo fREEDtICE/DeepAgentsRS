@@ -20,7 +20,12 @@ pub struct MiddlewareContext<'a> {
 
 #[async_trait]
 pub trait Middleware: Send + Sync {
-    async fn before_tool(&self, _backend: &dyn SandboxBackend, _state: &mut AgentState, _tool: &ToolExecution) -> anyhow::Result<()> {
+    async fn before_tool(
+        &self,
+        _backend: &dyn SandboxBackend,
+        _state: &mut AgentState,
+        _tool: &ToolExecution,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
