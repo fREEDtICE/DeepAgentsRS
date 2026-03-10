@@ -43,6 +43,7 @@ struct Session {
     approval: Arc<dyn ApprovalPolicy>,
     audit: Option<Arc<dyn AuditSink>>,
     runner: Option<deepagents::runtime::ResumableRunner>,
+    provider_info: Option<deepagents::provider::ProviderDiagnostics>,
     closed: bool,
 }
 
@@ -239,6 +240,7 @@ async fn new_session(
         approval,
         audit,
         runner: None,
+        provider_info: None,
         closed: false,
     };
 
@@ -448,17 +450,22 @@ async fn run_session(
         Err(err) => return err,
     };
     let (state_version, out) = execute_run_once(&session).await;
+    let provider_info = session.lock().await.provider_info.clone();
     (
         StatusCode::OK,
-        resp_ok(json!({ "output": out, "state_version": state_version })),
+        resp_ok(
+            json!({ "output": out, "state_version": state_version, "provider_info": provider_info }),
+        ),
     )
 }
 
 async fn run_session_stream(
     State(st): State<AppState>,
     Json(req): Json<RunRequest>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
-{
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<Value>),
+> {
     let session = prepare_run_session(&st, &req).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -479,17 +486,22 @@ async fn resume_session(
         Err(err) => return err,
     };
     let (state_version, out) = execute_resume_once(&session, &req).await;
+    let provider_info = session.lock().await.provider_info.clone();
     (
         StatusCode::OK,
-        resp_ok(json!({ "output": out, "state_version": state_version })),
+        resp_ok(
+            json!({ "output": out, "state_version": state_version, "provider_info": provider_info }),
+        ),
     )
 }
 
 async fn resume_session_stream(
     State(st): State<AppState>,
     Json(req): Json<ResumeRequest>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
-{
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<Value>),
+> {
     let session = prepare_resume_session(&st, &req).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -538,7 +550,8 @@ async fn get_session_state(
         resp_ok(json!({
             "state": session.state,
             "state_version": session.state_version,
-            "pending_interrupt": pending_interrupt
+            "pending_interrupt": pending_interrupt,
+            "provider_info": session.provider_info
         })),
     )
 }
@@ -770,10 +783,7 @@ async fn execute_resume_stream(
     (session_guard.state_version, out)
 }
 
-fn interrupt_not_found_output(
-    session: &Session,
-    message: &str,
-) -> deepagents::runtime::RunOutput {
+fn interrupt_not_found_output(session: &Session, message: &str) -> deepagents::runtime::RunOutput {
     deepagents::runtime::RunOutput {
         status: deepagents::runtime::RunStatus::Error,
         interrupts: Vec::new(),
@@ -829,65 +839,9 @@ fn ensure_runner_initialized(
         return Ok(());
     }
 
-    let provider: Arc<dyn deepagents::provider::Provider> = match req.provider.as_str() {
-        "mock" => {
-            let script = parse_mock_script(req.mock_script.clone())?;
-            Arc::new(MockProvider::from_script(script))
-        }
-        "mock2" => {
-            let script = parse_mock_script(req.mock_script.clone())?;
-            Arc::new(MockProvider::from_script_without_call_ids(script))
-        }
-        "openai-compatible" | "openai_compatible" => {
-            let model = req.model.clone().ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    resp_err(
-                        "invalid_request",
-                        "missing model for openai-compatible provider",
-                        None,
-                    ),
-                )
-            })?;
-            let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
-            if let Some(base_url) = &req.base_url {
-                config = config.with_base_url(base_url.clone());
-            }
-            let api_key = match (&req.api_key, &req.api_key_env) {
-                (Some(api_key), _) => Some(api_key.clone()),
-                (None, Some(env_name)) => Some(std::env::var(env_name).map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        resp_err(
-                            "invalid_request",
-                            "missing env var for api_key_env",
-                            Some(json!({ "env": env_name })),
-                        ),
-                    )
-                })?),
-                (None, None) => std::env::var("OPENAI_API_KEY").ok(),
-            };
-            if let Some(api_key) = api_key {
-                config = config.with_api_key(api_key);
-            }
-            Arc::new(deepagents::provider::LlmProviderAdapter::new(Arc::new(
-                deepagents::provider::OpenAiCompatibleProvider::new(
-                    config,
-                    Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
-                ),
-            )))
-        }
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                resp_err(
-                    "invalid_request",
-                    "unknown provider",
-                    Some(json!({ "provider": other })),
-                ),
-            ))
-        }
-    };
+    let provider_bundle = build_provider_bundle(req)?;
+    let provider = provider_bundle.provider;
+    session.provider_info = Some(provider_bundle.diagnostics);
 
     let subagent_registry = match deepagents::subagents::builtins::default_registry() {
         Ok(v) => v,
@@ -903,8 +857,9 @@ fn ensure_runner_initialized(
         }
     };
 
-    let subagent_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-        Arc::new(deepagents::subagents::SubAgentMiddleware::new(subagent_registry));
+    let subagent_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
+        deepagents::subagents::SubAgentMiddleware::new(subagent_registry),
+    );
     let patch_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> =
         Arc::new(deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware::new());
 
@@ -1010,9 +965,7 @@ fn ensure_runner_initialized(
     Ok(())
 }
 
-fn parse_mock_script(
-    mock_script: Option<Value>,
-) -> Result<MockScript, (StatusCode, Json<Value>)> {
+fn parse_mock_script(mock_script: Option<Value>) -> Result<MockScript, (StatusCode, Json<Value>)> {
     let Some(mock_script) = mock_script else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1035,11 +988,95 @@ fn parse_mock_script(
     })
 }
 
+fn build_provider_bundle(
+    req: &RunRequest,
+) -> Result<ProviderInitBundle, (StatusCode, Json<Value>)> {
+    match req.provider.as_str() {
+        "mock" => {
+            let script = parse_mock_script(req.mock_script.clone())?;
+            Ok(ProviderInitBundle {
+                provider: Arc::new(MockProvider::from_script(script)),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: req.provider.clone(),
+                    llm_capabilities: None,
+                },
+            })
+        }
+        "mock2" => {
+            let script = parse_mock_script(req.mock_script.clone())?;
+            Ok(ProviderInitBundle {
+                provider: Arc::new(MockProvider::from_script_without_call_ids(script)),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: req.provider.clone(),
+                    llm_capabilities: None,
+                },
+            })
+        }
+        "openai-compatible" | "openai_compatible" => {
+            let model = req.model.clone().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "missing model for openai-compatible provider",
+                        None,
+                    ),
+                )
+            })?;
+            let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
+            if let Some(base_url) = &req.base_url {
+                config = config.with_base_url(base_url.clone());
+            }
+            let api_key = match (&req.api_key, &req.api_key_env) {
+                (Some(api_key), _) => Some(api_key.clone()),
+                (None, Some(env_name)) => Some(std::env::var(env_name).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        resp_err(
+                            "invalid_request",
+                            "missing env var for api_key_env",
+                            Some(json!({ "env": env_name })),
+                        ),
+                    )
+                })?),
+                (None, None) => std::env::var("OPENAI_API_KEY").ok(),
+            };
+            if let Some(api_key) = api_key {
+                config = config.with_api_key(api_key);
+            }
+            let llm_provider = Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
+                config,
+                Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
+            ));
+            Ok(ProviderInitBundle {
+                provider: Arc::new(deepagents::provider::LlmProviderAdapter::new(
+                    llm_provider.clone(),
+                )),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: req.provider.clone(),
+                    llm_capabilities: Some(deepagents::provider::LlmProvider::capabilities(
+                        llm_provider.as_ref(),
+                    )),
+                },
+            })
+        }
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            resp_err(
+                "invalid_request",
+                "unknown provider",
+                Some(json!({ "provider": other })),
+            ),
+        )),
+    }
+}
+
 fn sse_from_receiver(
     rx: tokio::sync::mpsc::Receiver<deepagents::runtime::RunEvent>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let stream = ReceiverStream::new(rx).map(|event| {
-        let json = serde_json::to_string(&event).unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
+        let json = serde_json::to_string(&event)
+            .unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
         Ok(Event::default().event("run_event").data(json))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -1057,6 +1094,11 @@ impl deepagents::runtime::RunEventSink for ChannelRunEventSink {
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
+}
+
+struct ProviderInitBundle {
+    provider: Arc<dyn deepagents::provider::Provider>,
+    diagnostics: deepagents::provider::ProviderDiagnostics,
 }
 
 fn mode_str(mode: ExecutionMode) -> String {

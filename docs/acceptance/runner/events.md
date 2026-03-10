@@ -18,28 +18,53 @@ Core 的 E2E 验收并不只关心“最终输出对不对”，还要关心：
 事件类型不要求与 Python 一致，但必须覆盖等价信息。最低集合：
 
 - `ModelRequestBuilt`：轮次号、messages 摘要、tools 名称集合、system 摘要
+- `ProviderStepReceived`：稳定 `ProviderStep` 已组装完成
+- `AssistantTextDelta`：provider-native 文本增量（可选）
 - `AssistantMessage`：完整 assistant message（含 tool_calls）
+- `ToolCallArgsDelta`：provider-native tool args 增量（可选）
 - `ToolCallStarted`：tool_name、tool_call_id、args 摘要
 - `ToolCallFinished`：tool_name、tool_call_id、result 摘要或 error
 - `ToolMessageAppended`：tool_call_id、content 摘要
 - `StateUpdated`：更新的 key 列表（可选带 patch diff）
 - `Interrupt`：tool_name、tool_call_id、proposed_args、policy
+- `UsageReported`：provider usage 元数据（可选）
 - `RunFinished`：终止原因与统计（轮次数、工具次数、错误次数）
 
 ## 3. 事件流的稳定性约束（必须）
 
 ### 3.1 顺序约束
 
-同一轮内事件顺序必须固定：
+同一轮内事件顺序必须固定，但分为两类：
 
-1) ModelRequestBuilt
-2) AssistantMessage
-3) 对每个 tool_call：
-   - ToolCallStarted
-   - ToolCallFinished
-   - ToolMessageAppended
-   - StateUpdated（如果该工具产生 update）
-4) RunFinished（若该轮收敛或终止）
+coarse provider：
+
+1. `ModelRequestBuilt`
+2. `ProviderStepReceived`
+3. `AssistantMessage`
+4. 对每个 tool_call：
+   - `ToolCallStarted`
+   - `ToolCallFinished`
+   - `ToolMessageAppended`
+   - `StateUpdated`（如果该工具产生 update）
+5. `RunFinished`（若该轮收敛或终止）
+
+streaming provider：
+
+1. `ModelRequestBuilt`
+2. `AssistantTextDelta*` / `ToolCallArgsDelta*` / `UsageReported*` 可选
+3. `ProviderStepReceived`
+4. `AssistantMessage`
+5. 对每个 tool_call：
+   - `ToolCallStarted`
+   - `ToolCallFinished`
+   - `ToolMessageAppended`
+   - `StateUpdated`（如果该工具产生 update）
+6. `RunFinished`（若该轮收敛或终止）
+
+说明：
+
+- `ProviderStepReceived` 表示最终稳定 step 已组装完成，不代表首个 provider chunk 到达
+- 因此在 streaming provider 下，delta 允许先于 `ProviderStepReceived`
 
 ### 3.2 可复现性约束
 
@@ -143,8 +168,28 @@ events 不得泄露真实磁盘路径（应使用虚拟路径，如 `/a.txt`、`
 - StateUpdated 事件必须出现在 ToolMessageAppended 之后或之前（二者择一但要固定）
 - StateUpdated 必须明确包含被更新的 key（最少 key 列表）
 
+### RE-07：L2 response cache 命中时只保留 coarse events
+
+给定：
+
+- 同一个请求第一次运行走 streaming provider
+- 第二次运行命中 L2 response cache
+
+当：通过 streaming runtime 运行第二次请求
+
+则：
+
+- 不重放 `AssistantTextDelta`
+- 不重放 `ToolCallArgsDelta`
+- 不重放 `UsageReported`
+- 仍保留 `ProviderStepReceived`、`AssistantMessage`、`RunFinished`
+
+说明：
+
+- L2 cache 存储的是稳定 `ProviderStep`
+- provider-native delta 不属于稳定可重放数据
+
 ## 5. 通过标准
 
-- RE-01 ~ RE-06 全通过
+- RE-01 ~ RE-07 全通过
 - events.jsonl 可用于做 golden snapshot（字段稳定，不引入随机/时间噪声）
-

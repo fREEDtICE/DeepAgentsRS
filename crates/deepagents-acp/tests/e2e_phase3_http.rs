@@ -24,7 +24,11 @@ async fn post_json(
     (status, v)
 }
 
-async fn post_stream(app: axum::Router, path: &str, body: serde_json::Value) -> (StatusCode, String) {
+async fn post_stream(
+    app: axum::Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, String) {
     let req = Request::builder()
         .method("POST")
         .uri(path)
@@ -325,9 +329,9 @@ async fn phase3_run_stream_emits_sse_events() {
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
     assert!(events.iter().any(|event| event["type"] == "run_started"));
-    assert!(events.iter().any(|event| {
-        event["type"] == "tool_call_started" && event["tool_call_id"] == "r1"
-    }));
+    assert!(events
+        .iter()
+        .any(|event| { event["type"] == "tool_call_started" && event["tool_call_id"] == "r1" }));
     assert!(matches!(
         events.last(),
         Some(event) if event["type"] == "run_finished" && event["status"] == "completed"
@@ -391,9 +395,9 @@ async fn phase3_resume_stream_continues_after_interrupt() {
 
     assert_eq!(st, StatusCode::OK);
     let resume_events = parse_sse_events(&body);
-    assert!(resume_events.iter().any(|event| {
-        event["type"] == "tool_call_started" && event["tool_call_id"] == "w1"
-    }));
+    assert!(resume_events
+        .iter()
+        .any(|event| { event["type"] == "tool_call_started" && event["tool_call_id"] == "w1" }));
     assert!(matches!(
         resume_events.last(),
         Some(event) if event["type"] == "run_finished" && event["status"] == "completed"
@@ -404,7 +408,7 @@ async fn phase3_resume_stream_continues_after_interrupt() {
 async fn phase3_openai_compatible_run_works() {
     let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider_addr = provider_listener.local_addr().unwrap();
-    let provider_app = Router::new().route("/chat/completions", post(openai_stream_handler));
+    let provider_app = Router::new().route("/chat/completions", post(openai_chat_handler));
     tokio::spawn(async move {
         axum::serve(provider_listener, provider_app).await.unwrap();
     });
@@ -441,7 +445,15 @@ async fn phase3_openai_compatible_run_works() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v["ok"], true);
     assert_eq!(v["result"]["output"]["final_text"], "done");
-  }
+    assert_eq!(
+        v["result"]["provider_info"]["llm_capabilities"]["supports_streaming"],
+        true
+    );
+    assert_eq!(
+        v["result"]["provider_info"]["llm_capabilities"]["supports_structured_output"],
+        false
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn phase3_openai_compatible_run_stream_emits_deltas() {
@@ -483,35 +495,62 @@ async fn phase3_openai_compatible_run_stream_emits_deltas() {
 
     assert_eq!(st, StatusCode::OK);
     let events = parse_sse_events(&body);
-    assert!(events.iter().any(|event| event["type"] == "assistant_text_delta"));
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "assistant_text_delta"));
     assert!(events.iter().any(|event| event["type"] == "usage_reported"));
     assert!(matches!(
         events.last(),
         Some(event) if event["type"] == "run_finished" && event["status"] == "completed"
     ));
 }
+
+async fn openai_chat_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    assert_eq!(body["model"], "gpt-4o-mini");
+    Json(serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7
+        }
+    }))
+}
+
 async fn openai_stream_handler(
     Json(body): Json<serde_json::Value>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     assert_eq!(body["model"], "gpt-4o-mini");
     let stream = tokio_stream::iter([
-        Ok(Event::default().data(serde_json::json!({
-            "choices": [{
-                "delta": { "content": "do" },
-                "finish_reason": null
-            }]
-        }).to_string())),
-        Ok(Event::default().data(serde_json::json!({
-            "choices": [{
-                "delta": { "content": "ne" },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 5,
-                "completion_tokens": 2,
-                "total_tokens": 7
-            }
-        }).to_string())),
+        Ok(Event::default().data(
+            serde_json::json!({
+                "choices": [{
+                    "delta": { "content": "do" },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        )),
+        Ok(Event::default().data(
+            serde_json::json!({
+                "choices": [{
+                    "delta": { "content": "ne" },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7
+                }
+            })
+            .to_string(),
+        )),
         Ok(Event::default().data("[DONE]")),
     ]);
     Sse::new(stream).keep_alive(KeepAlive::default())

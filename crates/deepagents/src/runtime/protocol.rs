@@ -13,6 +13,16 @@ use crate::DeepAgent;
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
+    #[serde(default = "default_tool_input_schema")]
+    pub input_schema: serde_json::Value,
+}
+
+pub fn default_tool_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +159,8 @@ pub trait Runtime: Send + Sync {
 #[async_trait]
 pub trait StreamingRuntime: Send + Sync {
     async fn run_with_events(
-        &mut self,
+        &self,
+        messages: Vec<Message>,
         sink: &mut dyn crate::runtime::RunEventSink,
     ) -> RunOutput;
 }

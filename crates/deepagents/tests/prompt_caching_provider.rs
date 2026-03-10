@@ -4,11 +4,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use deepagents::approval::ExecutionMode;
-use deepagents::provider::{Provider, ProviderRequest, ProviderStep};
+use deepagents::provider::{Provider, ProviderEventCollector, ProviderRequest, ProviderStep};
 use deepagents::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use deepagents::runtime::{
-    CacheBackend, PromptCacheOptions, PromptCachingMiddleware, RunStatus, Runtime, RuntimeConfig,
-    RuntimeMiddlewareAssembler, RuntimeMiddlewareSlot,
+    CacheBackend, PromptCacheOptions, PromptCachingMiddleware, ProviderStepKind, RunEvent,
+    RunStatus, Runtime, RuntimeConfig, RuntimeMiddlewareAssembler, RuntimeMiddlewareSlot,
+    VecRunEventSink,
 };
 use deepagents::types::Message;
 
@@ -46,6 +47,48 @@ impl Provider for SingleCallProvider {
         if idx >= 1 {
             anyhow::bail!("provider should not be called on cache hit");
         }
+        Ok(ProviderStep::FinalText {
+            text: "OK".to_string(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct StreamingSingleCallProvider {
+    step_calls: AtomicUsize,
+    collector_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for StreamingSingleCallProvider {
+    async fn step(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+        self.step_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ProviderStep::FinalText {
+            text: "OK".to_string(),
+        })
+    }
+
+    async fn step_with_collector(
+        &self,
+        _req: ProviderRequest,
+        collector: &mut dyn ProviderEventCollector,
+    ) -> anyhow::Result<ProviderStep> {
+        let idx = self.collector_calls.fetch_add(1, Ordering::SeqCst);
+        if idx >= 1 {
+            anyhow::bail!("provider should not be called on cache hit");
+        }
+        collector
+            .emit(deepagents::provider::ProviderEvent::AssistantTextDelta {
+                text: "OK".to_string(),
+            })
+            .await?;
+        collector
+            .emit(deepagents::provider::ProviderEvent::Usage {
+                input_tokens: Some(2),
+                output_tokens: Some(1),
+                total_tokens: Some(3),
+            })
+            .await?;
         Ok(ProviderStep::FinalText {
             text: "OK".to_string(),
         })
@@ -475,4 +518,84 @@ async fn pc_07_secret_never_appears_in_cache_events() {
     assert_eq!(out.status, RunStatus::Completed);
     let trace_str = serde_json::to_string(&out.trace).unwrap();
     assert!(!trace_str.contains("SECRET_TOKEN_ABC123"));
+}
+
+#[tokio::test]
+async fn pc_08_l2_hit_in_streaming_runtime_skips_delta_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_string_lossy().to_string();
+    let provider = Arc::new(StreamingSingleCallProvider::default());
+    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let rt = build_runtime(
+        &root,
+        provider_dyn,
+        PromptCacheOptions {
+            enabled: true,
+            backend: CacheBackend::Memory,
+            enable_l2_response_cache: true,
+            ttl_ms: 300000,
+            max_entries: 1024,
+            provider_id: "streaming-single".to_string(),
+            partition: "t".to_string(),
+        },
+    );
+
+    let msgs = vec![Message {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+        content_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        status: None,
+    }];
+
+    let mut sink1 = VecRunEventSink::new();
+    let out1 = rt.run_with_events(msgs.clone(), &mut sink1).await;
+    assert_eq!(out1.status, RunStatus::Completed);
+    assert_eq!(provider.collector_calls.load(Ordering::SeqCst), 1);
+    assert!(sink1
+        .events()
+        .iter()
+        .any(|event| matches!(event, RunEvent::AssistantTextDelta { text, .. } if text == "OK")));
+    assert!(sink1.events().iter().any(|event| matches!(
+        event,
+        RunEvent::UsageReported {
+            input_tokens: Some(2),
+            output_tokens: Some(1),
+            total_tokens: Some(3),
+            ..
+        }
+    )));
+
+    let mut sink2 = VecRunEventSink::new();
+    let out2 = rt.run_with_events(msgs, &mut sink2).await;
+    assert_eq!(out2.status, RunStatus::Completed);
+    assert_eq!(provider.collector_calls.load(Ordering::SeqCst), 1);
+    assert!(!sink2
+        .events()
+        .iter()
+        .any(|event| matches!(event, RunEvent::AssistantTextDelta { .. })));
+    assert!(!sink2
+        .events()
+        .iter()
+        .any(|event| matches!(event, RunEvent::UsageReported { .. })));
+    assert!(sink2.events().iter().any(|event| matches!(
+        event,
+        RunEvent::ProviderStepReceived {
+            step_type: ProviderStepKind::FinalText,
+            ..
+        }
+    )));
+    assert!(sink2
+        .events()
+        .iter()
+        .any(|event| matches!(event, RunEvent::AssistantMessage { .. })));
+    assert!(matches!(
+        sink2.events().last(),
+        Some(RunEvent::RunFinished {
+            status: RunStatus::Completed,
+            ..
+        })
+    ));
 }

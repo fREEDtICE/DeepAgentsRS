@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use deepagents::provider::{
-    LlmEvent, LlmProvider, OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiDelta, OpenAiFunctionCall,
-    OpenAiFunctionCallDelta, OpenAiMessage, OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
-    ProviderRequest, ProviderStep, build_chat_request, MockOpenAiTransport,
+    build_chat_request, LlmEvent, LlmProvider, LlmProviderCapabilities, MockOpenAiTransport,
+    OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, OpenAiDelta, OpenAiFunctionCall, OpenAiFunctionCallDelta,
+    OpenAiMessage, OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage, ProviderRequest, ProviderStep,
 };
 
 fn sample_request() -> ProviderRequest {
@@ -45,6 +45,14 @@ fn sample_request() -> ProviderRequest {
         tool_specs: vec![deepagents::runtime::ToolSpec {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string" }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
         }],
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
@@ -63,6 +71,39 @@ fn openai_build_chat_request_maps_messages_and_tools() {
     assert_eq!(req.messages[2].tool_call_id.as_deref(), Some("call_1"));
     assert_eq!(req.tools.len(), 1);
     assert_eq!(req.tools[0].function.name, "read_file");
+    assert_eq!(
+        req.tools[0].function.parameters,
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": { "type": "string" }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[test]
+fn openai_provider_declares_expected_capabilities() {
+    let provider = OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig::new("gpt-4o-mini"),
+        Arc::new(MockOpenAiTransport::for_response(OpenAiChatResponse {
+            choices: Vec::new(),
+            usage: None,
+        })),
+    );
+
+    assert_eq!(
+        provider.capabilities(),
+        LlmProviderCapabilities {
+            supports_streaming: true,
+            supports_tool_calling: true,
+            reports_usage: true,
+            supports_structured_output: false,
+            supports_reasoning_content: false,
+        }
+    );
 }
 
 #[tokio::test]

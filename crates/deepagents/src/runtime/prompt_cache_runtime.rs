@@ -5,7 +5,8 @@ use std::time::Duration;
 use tokio::time::{timeout, Duration as TokioDuration};
 
 use crate::provider::{
-    Provider, ProviderRequest, ProviderStep, ProviderEvent, VecProviderEventCollector,
+    Provider, ProviderEvent, ProviderEventCollector, ProviderRequest, ProviderStep,
+    VecProviderEventCollector,
 };
 use crate::runtime::cache_store::{CacheStore, MemoryCacheStore};
 use crate::runtime::stable_hash::stable_json_sha256_hex;
@@ -165,20 +166,10 @@ pub async fn step_with_prompt_cache(
     provider_timeout_ms: u64,
     state: &mut AgentState,
 ) -> Result<ProviderStep, CachedProviderError> {
-    let (step, _) = step_with_prompt_cache_and_events(provider, req, provider_timeout_ms, state).await?;
-    Ok(step)
-}
-
-pub async fn step_with_prompt_cache_and_events(
-    provider: &Arc<dyn Provider>,
-    req: ProviderRequest,
-    provider_timeout_ms: u64,
-    state: &mut AgentState,
-) -> Result<(ProviderStep, Vec<ProviderEvent>), CachedProviderError> {
     let opts = load_prompt_cache_options(state);
     if !opts.enabled || opts.backend != CacheBackend::Memory {
-        return match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
-            Ok(Ok((s, events))) => Ok((s, events)),
+        return match timeout_with_step(provider, req, provider_timeout_ms).await {
+            Ok(Ok(step)) => Ok(step),
             Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
             Err(_) => Err(CachedProviderError::Timeout),
         };
@@ -230,11 +221,11 @@ pub async fn step_with_prompt_cache_and_events(
                     expired: if l2_lookup.expired { Some(true) } else { None },
                 },
             );
-            return Ok((step, Vec::new()));
+            return Ok(step);
         }
 
-        let (step, events) = match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
-            Ok(Ok((s, events))) => (s, events),
+        let step = match timeout_with_step(provider, req, provider_timeout_ms).await {
+            Ok(Ok(step)) => step,
             Ok(Err(e)) => {
                 push_provider_cache_event(
                     state,
@@ -291,29 +282,191 @@ pub async fn step_with_prompt_cache_and_events(
                 expired: if l2_lookup.expired { Some(true) } else { None },
             },
         );
-        return Ok((step, events));
+        return Ok(step);
     }
 
-    match timeout_with_provider_events(provider, req, provider_timeout_ms).await {
-        Ok(Ok((s, events))) => Ok((s, events)),
+    match timeout_with_step(provider, req, provider_timeout_ms).await {
+        Ok(Ok(step)) => Ok(step),
         Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
         Err(_) => Err(CachedProviderError::Timeout),
     }
 }
 
-async fn timeout_with_provider_events(
+pub async fn step_with_prompt_cache_and_collector(
     provider: &Arc<dyn Provider>,
     req: ProviderRequest,
     provider_timeout_ms: u64,
-) -> Result<Result<(ProviderStep, Vec<ProviderEvent>), anyhow::Error>, tokio::time::error::Elapsed>
-{
-    timeout(
-        TokioDuration::from_millis(provider_timeout_ms),
-        async {
-            let mut collector = VecProviderEventCollector::new();
-            let step = provider.step_with_collector(req, &mut collector).await?;
-            Ok((step, collector.into_events()))
+    state: &mut AgentState,
+    collector: &mut dyn ProviderEventCollector,
+) -> Result<ProviderStep, CachedProviderError> {
+    let opts = load_prompt_cache_options(state);
+    if !opts.enabled || opts.backend != CacheBackend::Memory {
+        return match timeout_with_provider_collector(provider, req, provider_timeout_ms, collector)
+            .await
+        {
+            Ok(Ok(step)) => Ok(step),
+            Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
+            Err(_) => Err(CachedProviderError::Timeout),
+        };
+    }
+
+    let components = build_key_components(&req, state, &opts);
+    let l1_hash = l1_key_hash(&components);
+    let pkey = partition_key(&opts);
+    let cache = PromptCacheRegistry::global().partition(pkey, &opts);
+
+    let l1_lookup = cache.l1.get(&l1_hash);
+    let mut l1_event_inserted: Option<bool> = None;
+    let mut l1_event_evicted: Option<u64> = None;
+    if l1_lookup.value.is_none() {
+        let ins = cache.l1.insert(l1_hash.clone(), ());
+        l1_event_inserted = Some(ins.inserted);
+        if ins.evicted > 0 {
+            l1_event_evicted = Some(ins.evicted);
+        }
+    }
+    push_provider_cache_event(
+        state,
+        ProviderCacheEvent::ProviderCache {
+            cache_backend: CacheBackend::Memory,
+            cache_level: CacheLevel::L1,
+            lookup_hit: l1_lookup.value.is_some(),
+            cache_key_hash: l1_hash.clone(),
+            components: components.clone(),
+            inserted: l1_event_inserted,
+            evicted: l1_event_evicted,
+            expired: if l1_lookup.expired { Some(true) } else { None },
         },
+    );
+
+    if opts.enable_l2_response_cache {
+        let l2_hash = l2_key_hash(&components, &l1_hash);
+        let l2_lookup = cache.l2.get(&l2_hash);
+        if let Some(step) = l2_lookup.value {
+            push_provider_cache_event(
+                state,
+                ProviderCacheEvent::ProviderCache {
+                    cache_backend: CacheBackend::Memory,
+                    cache_level: CacheLevel::L2,
+                    lookup_hit: true,
+                    cache_key_hash: l2_hash,
+                    components,
+                    inserted: None,
+                    evicted: None,
+                    expired: if l2_lookup.expired { Some(true) } else { None },
+                },
+            );
+            return Ok(step);
+        }
+
+        let step =
+            match timeout_with_provider_collector(provider, req, provider_timeout_ms, collector)
+                .await
+            {
+                Ok(Ok(step)) => step,
+                Ok(Err(e)) => {
+                    push_provider_cache_event(
+                        state,
+                        ProviderCacheEvent::ProviderCache {
+                            cache_backend: CacheBackend::Memory,
+                            cache_level: CacheLevel::L2,
+                            lookup_hit: false,
+                            cache_key_hash: l2_hash,
+                            components,
+                            inserted: Some(false),
+                            evicted: None,
+                            expired: if l2_lookup.expired { Some(true) } else { None },
+                        },
+                    );
+                    return Err(CachedProviderError::Provider(e));
+                }
+                Err(_) => {
+                    push_provider_cache_event(
+                        state,
+                        ProviderCacheEvent::ProviderCache {
+                            cache_backend: CacheBackend::Memory,
+                            cache_level: CacheLevel::L2,
+                            lookup_hit: false,
+                            cache_key_hash: l2_hash,
+                            components,
+                            inserted: Some(false),
+                            evicted: None,
+                            expired: if l2_lookup.expired { Some(true) } else { None },
+                        },
+                    );
+                    return Err(CachedProviderError::Timeout);
+                }
+            };
+
+        let mut inserted = Some(false);
+        let mut evicted = None;
+        if !matches!(step, ProviderStep::Error { .. }) {
+            let ins = cache.l2.insert(l2_hash.clone(), step.clone());
+            inserted = Some(ins.inserted);
+            if ins.evicted > 0 {
+                evicted = Some(ins.evicted);
+            }
+        }
+        push_provider_cache_event(
+            state,
+            ProviderCacheEvent::ProviderCache {
+                cache_backend: CacheBackend::Memory,
+                cache_level: CacheLevel::L2,
+                lookup_hit: false,
+                cache_key_hash: l2_hash,
+                components,
+                inserted,
+                evicted,
+                expired: if l2_lookup.expired { Some(true) } else { None },
+            },
+        );
+        return Ok(step);
+    }
+
+    match timeout_with_provider_collector(provider, req, provider_timeout_ms, collector).await {
+        Ok(Ok(step)) => Ok(step),
+        Ok(Err(e)) => Err(CachedProviderError::Provider(e)),
+        Err(_) => Err(CachedProviderError::Timeout),
+    }
+}
+
+pub async fn step_with_prompt_cache_and_events(
+    provider: &Arc<dyn Provider>,
+    req: ProviderRequest,
+    provider_timeout_ms: u64,
+    state: &mut AgentState,
+) -> Result<(ProviderStep, Vec<ProviderEvent>), CachedProviderError> {
+    let mut collector = VecProviderEventCollector::new();
+    let step = step_with_prompt_cache_and_collector(
+        provider,
+        req,
+        provider_timeout_ms,
+        state,
+        &mut collector,
     )
+    .await?;
+    Ok((step, collector.into_events()))
+}
+
+async fn timeout_with_step(
+    provider: &Arc<dyn Provider>,
+    req: ProviderRequest,
+    provider_timeout_ms: u64,
+) -> Result<Result<ProviderStep, anyhow::Error>, tokio::time::error::Elapsed> {
+    timeout(TokioDuration::from_millis(provider_timeout_ms), async {
+        provider.step(req).await
+    })
+    .await
+}
+
+async fn timeout_with_provider_collector(
+    provider: &Arc<dyn Provider>,
+    req: ProviderRequest,
+    provider_timeout_ms: u64,
+    collector: &mut dyn ProviderEventCollector,
+) -> Result<Result<ProviderStep, anyhow::Error>, tokio::time::error::Elapsed> {
+    timeout(TokioDuration::from_millis(provider_timeout_ms), async {
+        provider.step_with_collector(req, collector).await
+    })
     .await
 }

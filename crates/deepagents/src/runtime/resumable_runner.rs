@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::approval::{
     redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ExecutionMode,
 };
 use crate::audit::{AuditEvent, AuditSink};
-use crate::provider::{Provider, ProviderRequest, ProviderStep, ProviderToolCall};
+use crate::provider::{
+    Provider, ProviderEvent, ProviderEventCollector, ProviderRequest, ProviderStep,
+    ProviderToolCall,
+};
 use crate::runtime::attach_provider_cache_events_to_trace;
 use crate::runtime::events::{
     diff_state_keys, preview_json, preview_text, provider_step_kind, summarize_messages, RunEvent,
@@ -17,7 +21,9 @@ use crate::runtime::filesystem_runtime_middleware::{
     LargeToolResultOffloadOptions, LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY,
 };
 use crate::runtime::patch_tool_calls::{sanitize_tool_call_id, tool_calls_from_provider_calls};
-use crate::runtime::prompt_cache_runtime::{step_with_prompt_cache_and_events, CachedProviderError};
+use crate::runtime::prompt_cache_runtime::{
+    step_with_prompt_cache, step_with_prompt_cache_and_collector, CachedProviderError,
+};
 use crate::runtime::protocol::{
     HandledToolCall, HitlDecision, HitlInterrupt, RunOutput, RunStatus, RuntimeError,
     RuntimeMiddleware, ToolCallContext, ToolCallRecord, ToolResultRecord,
@@ -70,6 +76,123 @@ fn finalize_run_output(mut out: RunOutput) -> RunOutput {
     out
 }
 
+fn tool_schema_string() -> serde_json::Value {
+    serde_json::json!({ "type": "string" })
+}
+
+fn tool_schema_integer() -> serde_json::Value {
+    serde_json::json!({ "type": "integer" })
+}
+
+fn tool_schema_object(
+    properties: Vec<(&str, serde_json::Value)>,
+    required: &[&str],
+    additional_properties: bool,
+) -> serde_json::Value {
+    let mut props = serde_json::Map::new();
+    for (name, schema) in properties {
+        props.insert(name.to_string(), schema);
+    }
+    serde_json::json!({
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": additional_properties
+    })
+}
+
+fn builtin_tool_input_schema(name: &str) -> serde_json::Value {
+    match name {
+        "ls" => tool_schema_object(vec![("path", tool_schema_string())], &["path"], false),
+        "read_file" => tool_schema_object(
+            vec![
+                ("file_path", tool_schema_string()),
+                ("offset", tool_schema_integer()),
+                ("limit", tool_schema_integer()),
+                (
+                    "mode",
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": ["auto", "text", "image"]
+                    }),
+                ),
+                ("max_bytes", tool_schema_integer()),
+            ],
+            &["file_path"],
+            false,
+        ),
+        "write_file" => tool_schema_object(
+            vec![
+                ("file_path", tool_schema_string()),
+                ("content", tool_schema_string()),
+            ],
+            &["file_path", "content"],
+            false,
+        ),
+        "edit_file" => tool_schema_object(
+            vec![
+                ("file_path", tool_schema_string()),
+                ("old_string", tool_schema_string()),
+                ("new_string", tool_schema_string()),
+            ],
+            &["file_path", "old_string", "new_string"],
+            false,
+        ),
+        "delete_file" => tool_schema_object(
+            vec![("file_path", tool_schema_string())],
+            &["file_path"],
+            false,
+        ),
+        "glob" => tool_schema_object(vec![("pattern", tool_schema_string())], &["pattern"], false),
+        "grep" => tool_schema_object(
+            vec![
+                ("pattern", tool_schema_string()),
+                ("path", tool_schema_string()),
+                ("glob", tool_schema_string()),
+                (
+                    "output_mode",
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": ["files_with_matches", "content", "count"]
+                    }),
+                ),
+                ("head_limit", tool_schema_integer()),
+            ],
+            &["pattern"],
+            false,
+        ),
+        "execute" => tool_schema_object(
+            vec![
+                ("command", tool_schema_string()),
+                (
+                    "timeout",
+                    serde_json::json!({ "type": "integer", "minimum": 1 }),
+                ),
+            ],
+            &["command"],
+            false,
+        ),
+        "task" => tool_schema_object(
+            vec![
+                ("description", tool_schema_string()),
+                ("subagent_type", tool_schema_string()),
+            ],
+            &["description", "subagent_type"],
+            false,
+        ),
+        "compact_conversation" => tool_schema_object(Vec::new(), &[], false),
+        _ => crate::runtime::default_tool_input_schema(),
+    }
+}
+
+fn builtin_tool_spec(name: &str, description: &str) -> crate::runtime::ToolSpec {
+    crate::runtime::ToolSpec {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: builtin_tool_input_schema(name),
+    }
+}
+
 #[derive(Clone)]
 pub struct ResumableRunnerOptions {
     pub config: crate::runtime::RuntimeConfig,
@@ -107,6 +230,42 @@ pub struct ResumableRunner {
     step_counter: usize,
     pending: Option<PendingInterrupt>,
     task_depth: usize,
+}
+
+struct RunEventForwardingCollector<'a> {
+    step_index: usize,
+    sink: &'a mut dyn RunEventSink,
+}
+
+#[async_trait]
+impl ProviderEventCollector for RunEventForwardingCollector<'_> {
+    async fn emit(&mut self, event: ProviderEvent) -> anyhow::Result<()> {
+        let event = match event {
+            ProviderEvent::AssistantTextDelta { text } => RunEvent::AssistantTextDelta {
+                step_index: self.step_index,
+                text,
+            },
+            ProviderEvent::ToolCallArgsDelta {
+                tool_call_id,
+                delta,
+            } => RunEvent::ToolCallArgsDelta {
+                step_index: self.step_index,
+                tool_call_id,
+                delta,
+            },
+            ProviderEvent::Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            } => RunEvent::UsageReported {
+                step_index: self.step_index,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            },
+        };
+        self.sink.emit(event).await
+    }
 }
 
 impl ResumableRunner {
@@ -198,6 +357,34 @@ impl ResumableRunner {
         let _ = sink.emit(event).await;
     }
 
+    async fn call_provider(
+        &mut self,
+        req: ProviderRequest,
+        sink: &mut dyn RunEventSink,
+        step_index: usize,
+        stream_provider_events: bool,
+    ) -> Result<ProviderStep, CachedProviderError> {
+        if stream_provider_events {
+            let mut collector = RunEventForwardingCollector { step_index, sink };
+            step_with_prompt_cache_and_collector(
+                &self.provider,
+                req,
+                self.config.provider_timeout_ms,
+                &mut self.state,
+                &mut collector,
+            )
+            .await
+        } else {
+            step_with_prompt_cache(
+                &self.provider,
+                req,
+                self.config.provider_timeout_ms,
+                &mut self.state,
+            )
+            .await
+        }
+    }
+
     async fn emit_run_finished(
         &self,
         sink: &mut dyn RunEventSink,
@@ -252,55 +439,6 @@ impl ResumableRunner {
                 },
             )
             .await;
-        }
-    }
-
-    async fn emit_provider_events(
-        &self,
-        step_index: usize,
-        events: &[crate::provider::ProviderEvent],
-        sink: &mut dyn RunEventSink,
-    ) {
-        for event in events {
-            match event {
-                crate::provider::ProviderEvent::AssistantTextDelta { text } => {
-                    self.emit_event(
-                        sink,
-                        RunEvent::AssistantTextDelta {
-                            step_index,
-                            text: text.clone(),
-                        },
-                    )
-                    .await;
-                }
-                crate::provider::ProviderEvent::ToolCallArgsDelta { tool_call_id, delta } => {
-                    self.emit_event(
-                        sink,
-                        RunEvent::ToolCallArgsDelta {
-                            step_index,
-                            tool_call_id: tool_call_id.clone(),
-                            delta: delta.clone(),
-                        },
-                    )
-                    .await;
-                }
-                crate::provider::ProviderEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                } => {
-                    self.emit_event(
-                        sink,
-                        RunEvent::UsageReported {
-                            step_index,
-                            input_tokens: *input_tokens,
-                            output_tokens: *output_tokens,
-                            total_tokens: *total_tokens,
-                        },
-                    )
-                    .await;
-                }
-            }
         }
     }
 
@@ -373,10 +511,18 @@ impl ResumableRunner {
 
     pub async fn run(&mut self) -> RunOutput {
         let mut sink = crate::runtime::NoopRunEventSink;
-        self.run_with_events(&mut sink).await
+        self.run_internal(&mut sink, false).await
     }
 
     pub async fn run_with_events(&mut self, sink: &mut dyn RunEventSink) -> RunOutput {
+        self.run_internal(sink, true).await
+    }
+
+    async fn run_internal(
+        &mut self,
+        sink: &mut dyn RunEventSink,
+        stream_provider_events: bool,
+    ) -> RunOutput {
         if self.pending.is_some() {
             if let Some(interrupt) = self.pending_interrupt().cloned() {
                 self.emit_event(
@@ -525,15 +671,11 @@ impl ResumableRunner {
                 last_tool_results: self.tool_results.clone(),
             };
 
-            let (mut provider_step, mut provider_events) = match step_with_prompt_cache_and_events(
-                &self.provider,
-                req,
-                self.config.provider_timeout_ms,
-                &mut self.state,
-            )
-            .await
+            let mut provider_step = match self
+                .call_provider(req, sink, event_step_idx, stream_provider_events)
+                .await
             {
-                Ok(s) => s,
+                Ok(step) => step,
                 Err(CachedProviderError::Provider(e)) => {
                     let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
@@ -645,15 +787,11 @@ impl ResumableRunner {
                         state: self.state.clone(),
                         last_tool_results: self.tool_results.clone(),
                     };
-                    (provider_step, provider_events) = match step_with_prompt_cache_and_events(
-                        &self.provider,
-                        retry_req,
-                        self.config.provider_timeout_ms,
-                        &mut self.state,
-                    )
-                    .await
+                    provider_step = match self
+                        .call_provider(retry_req, sink, event_step_idx, stream_provider_events)
+                        .await
                     {
-                        Ok(s) => s,
+                        Ok(step) => step,
                         Err(CachedProviderError::Provider(e)) => {
                             let out = finalize_run_output(RunOutput {
                                 status: RunStatus::Error,
@@ -765,8 +903,6 @@ impl ResumableRunner {
                 },
             )
             .await;
-            self.emit_provider_events(event_step_idx, &provider_events, sink)
-                .await;
 
             match provider_step {
                 ProviderStep::AssistantMessage { text } => {
@@ -907,7 +1043,11 @@ impl ResumableRunner {
                                 .await;
                         }
                     };
-                    if self.execute_calls(event_step_idx, calls, sink).await.is_some() {
+                    if self
+                        .execute_calls(event_step_idx, calls, sink)
+                        .await
+                        .is_some()
+                    {
                         let out = self.pending_output();
                         self.emit_run_finished(
                             sink,
@@ -943,7 +1083,11 @@ impl ResumableRunner {
                         },
                     )
                     .await;
-                    if self.execute_calls(event_step_idx, calls, sink).await.is_some() {
+                    if self
+                        .execute_calls(event_step_idx, calls, sink)
+                        .await
+                        .is_some()
+                    {
                         let out = self.pending_output();
                         self.emit_run_finished(
                             sink,
@@ -989,7 +1133,8 @@ impl ResumableRunner {
 
     pub async fn resume(&mut self, interrupt_id: &str, decision: HitlDecision) -> RunOutput {
         let mut sink = crate::runtime::NoopRunEventSink;
-        self.resume_with_events(interrupt_id, decision, &mut sink).await
+        self.resume_internal(interrupt_id, decision, &mut sink, false)
+            .await
     }
 
     pub async fn resume_with_events(
@@ -997,6 +1142,17 @@ impl ResumableRunner {
         interrupt_id: &str,
         decision: HitlDecision,
         sink: &mut dyn RunEventSink,
+    ) -> RunOutput {
+        self.resume_internal(interrupt_id, decision, sink, true)
+            .await
+    }
+
+    async fn resume_internal(
+        &mut self,
+        interrupt_id: &str,
+        decision: HitlDecision,
+        sink: &mut dyn RunEventSink,
+        stream_provider_events: bool,
     ) -> RunOutput {
         let Some(p) = self.pending.clone() else {
             let out = finalize_run_output(RunOutput {
@@ -1102,7 +1258,7 @@ impl ResumableRunner {
             return out;
         }
 
-        self.run_with_events(sink).await
+        self.run_internal(sink, stream_provider_events).await
     }
 
     fn pending_output(&self) -> RunOutput {
@@ -1150,10 +1306,7 @@ impl ResumableRunner {
                 "Compacts conversation history by summarizing older messages.",
             ),
         ] {
-            out.push(crate::runtime::ToolSpec {
-                name: name.to_string(),
-                description: desc.to_string(),
-            });
+            out.push(builtin_tool_spec(name, desc));
         }
         if let Some(v) = state.extra.get("skills_tools") {
             if let Ok(skills) =
@@ -1163,6 +1316,7 @@ impl ResumableRunner {
                     out.push(crate::runtime::ToolSpec {
                         name: s.name,
                         description: s.description,
+                        input_schema: s.input_schema,
                     });
                 }
             }
@@ -1947,7 +2101,10 @@ impl ResumableRunner {
                                 });
                                 if edited_args.is_some() {
                                     if let serde_json::Value::Object(map) = &mut message_json {
-                                        map.insert("edited".to_string(), serde_json::Value::Bool(true));
+                                        map.insert(
+                                            "edited".to_string(),
+                                            serde_json::Value::Bool(true),
+                                        );
                                         if let Some(orig) = original_args {
                                             map.insert("original_args".to_string(), orig);
                                         }
@@ -2185,13 +2342,6 @@ impl ResumableRunner {
             None,
         )
         .await;
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::runtime::StreamingRuntime for ResumableRunner {
-    async fn run_with_events(&mut self, sink: &mut dyn crate::runtime::RunEventSink) -> RunOutput {
-        ResumableRunner::run_with_events(self, sink).await
     }
 }
 

@@ -33,6 +33,14 @@ fn sample_request() -> ProviderRequest {
         tool_specs: vec![deepagents::runtime::ToolSpec {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string" }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
         }],
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
@@ -71,6 +79,10 @@ async fn reqwest_transport_posts_json_and_parses_chat_response() {
     let body = state.last_body.lock().await.clone().unwrap();
     assert_eq!(body["model"], "gpt-4o-mini");
     assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"]["required"][0],
+        "file_path"
+    );
 }
 
 #[tokio::test]
@@ -192,9 +204,7 @@ async fn stream_handler(
     let stream = tokio_stream::iter(
         chunks
             .into_iter()
-            .map(|chunk| {
-                Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()))
-            })
+            .map(|chunk| Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())))
             .chain(std::iter::once(Ok(Event::default().data("[DONE]")))),
     );
     Sse::new(stream).keep_alive(KeepAlive::default())

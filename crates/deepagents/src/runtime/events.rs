@@ -208,7 +208,8 @@ pub fn summarize_messages(messages: &[Message]) -> Vec<MessageSummary> {
 pub fn diff_state_keys(before: &AgentState, after: &AgentState) -> Vec<String> {
     let mut keys = Vec::new();
 
-    if serde_json::to_value(&before.filesystem).ok() != serde_json::to_value(&after.filesystem).ok() {
+    if serde_json::to_value(&before.filesystem).ok() != serde_json::to_value(&after.filesystem).ok()
+    {
         keys.push("filesystem".to_string());
     }
     if before.todos != after.todos {

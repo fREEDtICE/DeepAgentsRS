@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
-use crate::provider::llm::{LlmEvent, LlmEventStream, LlmProvider};
+use crate::provider::llm::{LlmEvent, LlmEventStream, LlmProvider, LlmProviderCapabilities};
 use crate::provider::{ProviderRequest, ProviderStep, ProviderToolCall};
 
 #[derive(Debug, Clone)]
@@ -90,6 +90,16 @@ impl ReqwestOpenAiTransport {
 
 #[async_trait]
 impl LlmProvider for OpenAiCompatibleProvider {
+    fn capabilities(&self) -> LlmProviderCapabilities {
+        LlmProviderCapabilities {
+            supports_streaming: true,
+            supports_tool_calling: true,
+            reports_usage: true,
+            supports_structured_output: false,
+            supports_reasoning_content: false,
+        }
+    }
+
     async fn chat(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
         let request = build_chat_request(&self.config.model, &req, false);
         let response = self
@@ -225,11 +235,7 @@ pub struct OpenAiFunctionCallDelta {
     pub arguments: Option<String>,
 }
 
-pub fn build_chat_request(
-    model: &str,
-    req: &ProviderRequest,
-    stream: bool,
-) -> OpenAiChatRequest {
+pub fn build_chat_request(model: &str, req: &ProviderRequest, stream: bool) -> OpenAiChatRequest {
     OpenAiChatRequest {
         model: model.to_string(),
         messages: req.messages.iter().map(convert_message).collect(),
@@ -241,11 +247,7 @@ pub fn build_chat_request(
                 function: OpenAiFunctionSpec {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": true
-                    }),
+                    parameters: tool.input_schema.clone(),
                 },
             })
             .collect(),
@@ -262,7 +264,8 @@ fn convert_message(message: &crate::types::Message) -> OpenAiMessage {
             Some(message.content.clone())
         },
         tool_calls: message.tool_calls.as_ref().map(|calls| {
-            calls.iter()
+            calls
+                .iter()
                 .map(|call| OpenAiToolCall {
                     id: call.id.clone(),
                     kind: "function".to_string(),
@@ -558,7 +561,10 @@ fn parse_sse_response(
 fn extract_sse_data(frame: &str) -> Option<String> {
     let lines: Vec<String> = frame
         .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(|value| value.trim_start().to_string()))
+        .filter_map(|line| {
+            line.strip_prefix("data:")
+                .map(|value| value.trim_start().to_string())
+        })
         .collect();
     if lines.is_empty() {
         None

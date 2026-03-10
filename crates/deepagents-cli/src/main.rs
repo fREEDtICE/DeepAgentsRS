@@ -7,6 +7,11 @@ use deepagents::audit::{AuditEvent, AuditSink};
 use deepagents::memory::MemoryStore;
 use tracing_subscriber::EnvFilter;
 
+struct ProviderInitBundle {
+    provider: std::sync::Arc<dyn deepagents::provider::Provider>,
+    diagnostics: deepagents::provider::ProviderDiagnostics,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "deepagents", version, about = "deepagents (Rust)")]
 struct Args {
@@ -469,55 +474,19 @@ async fn main() -> Result<()> {
             stream_events,
             pretty,
         } => {
+            let provider_bundle = build_provider_bundle(
+                &provider,
+                mock_script,
+                model,
+                base_url,
+                api_key,
+                api_key_env,
+            )?;
             let provider_id = provider.clone();
-            let provider: std::sync::Arc<dyn deepagents::provider::Provider> = match provider
-                .as_str()
-            {
-                "mock" => {
-                    let path = mock_script
-                        .ok_or_else(|| anyhow!("--mock-script is required for --provider mock"))?;
-                    let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-                    std::sync::Arc::new(deepagents::provider::mock::MockProvider::from_script(
-                        script,
-                    ))
-                }
-                "mock2" => {
-                    let path = mock_script
-                        .ok_or_else(|| anyhow!("--mock-script is required for --provider mock2"))?;
-                    let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-                    std::sync::Arc::new(
-                        deepagents::provider::mock::MockProvider::from_script_without_call_ids(
-                            script,
-                        ),
-                    )
-                }
-                "openai-compatible" | "openai_compatible" => {
-                    let model =
-                        model.ok_or_else(|| anyhow!("--model is required for --provider openai-compatible"))?;
-                    let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
-                    if let Some(base_url) = base_url {
-                        config = config.with_base_url(base_url);
-                    }
-                    let api_key = match (api_key, api_key_env) {
-                        (Some(api_key), _) => Some(api_key),
-                        (None, Some(env_name)) => Some(
-                            std::env::var(&env_name)
-                                .map_err(|_| anyhow!("missing env var for --api-key-env: {env_name}"))?,
-                        ),
-                        (None, None) => std::env::var("OPENAI_API_KEY").ok(),
-                    };
-                    if let Some(api_key) = api_key {
-                        config = config.with_api_key(api_key);
-                    }
-                    std::sync::Arc::new(deepagents::provider::LlmProviderAdapter::new(
-                        std::sync::Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
-                            config,
-                            std::sync::Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
-                        )),
-                    ))
-                }
-                other => return Err(anyhow!("unknown --provider: {other}")),
-            };
+            let provider = provider_bundle.provider;
+            if stream_events {
+                eprintln!("{}", serde_json::to_string(&provider_bundle.diagnostics)?);
+            }
 
             let mut skills: Vec<std::sync::Arc<dyn deepagents::skills::SkillPlugin>> = Vec::new();
             for p in plugin {
@@ -685,8 +654,20 @@ async fn main() -> Result<()> {
             .with_initial_state(initial_state);
 
             runner.push_user_input(input);
-            let mut event_sink = CliRunEventSink::new(events_jsonl.as_deref(), stream_events)?;
-            let mut out = runner.run_with_events(&mut event_sink).await;
+            let use_event_stream = events_jsonl.is_some() || stream_events;
+            let mut event_sink = if use_event_stream {
+                Some(CliRunEventSink::new(
+                    events_jsonl.as_deref(),
+                    stream_events,
+                )?)
+            } else {
+                None
+            };
+            let mut out = if let Some(sink) = event_sink.as_mut() {
+                runner.run_with_events(sink).await
+            } else {
+                runner.run().await
+            };
 
             if matches!(mode, ExecutionMode::Interactive) {
                 let mut stderr = std::io::stderr();
@@ -737,9 +718,13 @@ async fn main() -> Result<()> {
                             }
                         }
                     };
-                    out = runner
-                        .resume_with_events(&interrupt.interrupt_id, decision, &mut event_sink)
-                        .await;
+                    out = if let Some(sink) = event_sink.as_mut() {
+                        runner
+                            .resume_with_events(&interrupt.interrupt_id, decision, sink)
+                            .await
+                    } else {
+                        runner.resume(&interrupt.interrupt_id, decision).await
+                    };
                 }
             } else if out.status == deepagents::runtime::RunStatus::Interrupted {
                 if pretty {
@@ -1023,6 +1008,82 @@ fn now_ms() -> i64 {
 struct CliRunEventSink {
     file: Option<std::fs::File>,
     echo_stderr: bool,
+}
+
+fn build_provider_bundle(
+    provider_id: &str,
+    mock_script: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+) -> Result<ProviderInitBundle> {
+    match provider_id {
+        "mock" => {
+            let path = mock_script
+                .ok_or_else(|| anyhow!("--mock-script is required for --provider mock"))?;
+            let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
+            Ok(ProviderInitBundle {
+                provider: std::sync::Arc::new(
+                    deepagents::provider::mock::MockProvider::from_script(script),
+                ),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: provider_id.to_string(),
+                    llm_capabilities: None,
+                },
+            })
+        }
+        "mock2" => {
+            let path = mock_script
+                .ok_or_else(|| anyhow!("--mock-script is required for --provider mock2"))?;
+            let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
+            Ok(ProviderInitBundle {
+                provider: std::sync::Arc::new(
+                    deepagents::provider::mock::MockProvider::from_script_without_call_ids(script),
+                ),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: provider_id.to_string(),
+                    llm_capabilities: None,
+                },
+            })
+        }
+        "openai-compatible" | "openai_compatible" => {
+            let model = model
+                .ok_or_else(|| anyhow!("--model is required for --provider openai-compatible"))?;
+            let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
+            if let Some(base_url) = base_url {
+                config = config.with_base_url(base_url);
+            }
+            let api_key = match (api_key, api_key_env) {
+                (Some(api_key), _) => Some(api_key),
+                (None, Some(env_name)) => Some(
+                    std::env::var(&env_name)
+                        .map_err(|_| anyhow!("missing env var for --api-key-env: {env_name}"))?,
+                ),
+                (None, None) => std::env::var("OPENAI_API_KEY").ok(),
+            };
+            if let Some(api_key) = api_key {
+                config = config.with_api_key(api_key);
+            }
+            let llm_provider =
+                std::sync::Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
+                    config,
+                    std::sync::Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
+                ));
+            Ok(ProviderInitBundle {
+                provider: std::sync::Arc::new(deepagents::provider::LlmProviderAdapter::new(
+                    llm_provider.clone(),
+                )),
+                diagnostics: deepagents::provider::ProviderDiagnostics {
+                    provider_id: provider_id.to_string(),
+                    llm_capabilities: Some(deepagents::provider::LlmProvider::capabilities(
+                        llm_provider.as_ref(),
+                    )),
+                },
+            })
+        }
+        other => Err(anyhow!("unknown --provider: {other}")),
+    }
 }
 
 impl CliRunEventSink {

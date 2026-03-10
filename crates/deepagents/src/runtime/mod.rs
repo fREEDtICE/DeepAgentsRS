@@ -20,17 +20,16 @@ pub use assembly::{
     sort_runtime_middlewares, RuntimeMiddlewareAssembler, RuntimeMiddlewareDescriptor,
     RuntimeMiddlewareSlot,
 };
-pub use filesystem_runtime_middleware::{FilesystemRuntimeMiddleware, FilesystemRuntimeOptions};
 pub use events::{
-    MessageSummary, NoopRunEventSink, ProviderStepKind, RunEvent, RunEventSink,
-    VecRunEventSink,
+    MessageSummary, NoopRunEventSink, ProviderStepKind, RunEvent, RunEventSink, VecRunEventSink,
 };
+pub use filesystem_runtime_middleware::{FilesystemRuntimeMiddleware, FilesystemRuntimeOptions};
 pub use memory_middleware::{LoadedMemory, MemoryLoadOptions, MemoryMiddleware};
 pub use prompt_caching_middleware::PromptCachingMiddleware;
 pub use protocol::{
-    HandledToolCall, HitlDecision, HitlHints, HitlInterrupt, HitlPolicy, RunOutput, RunStatus,
-    Runtime, RuntimeConfig, RuntimeError, RuntimeMiddleware, StreamingRuntime,
-    ToolCallContext, ToolCallRecord, ToolResultRecord, ToolSpec,
+    default_tool_input_schema, HandledToolCall, HitlDecision, HitlHints, HitlInterrupt, HitlPolicy,
+    RunOutput, RunStatus, Runtime, RuntimeConfig, RuntimeError, RuntimeMiddleware,
+    StreamingRuntime, ToolCallContext, ToolCallRecord, ToolResultRecord, ToolSpec,
 };
 pub use provider_cache::{
     attach_provider_cache_events_to_trace, push_provider_cache_event, take_provider_cache_events,

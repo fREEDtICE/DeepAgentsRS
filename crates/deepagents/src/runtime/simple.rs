@@ -8,7 +8,7 @@ use crate::audit::AuditSink;
 use crate::provider::Provider;
 use crate::runtime::events::RunEventSink;
 use crate::runtime::protocol::{
-    RunOutput, Runtime, RuntimeConfig, RuntimeMiddleware,
+    RunOutput, Runtime, RuntimeConfig, RuntimeMiddleware, StreamingRuntime,
 };
 use crate::runtime::{ResumableRunner, ResumableRunnerOptions};
 use crate::skills::SkillPlugin;
@@ -120,5 +120,16 @@ impl Runtime for SimpleRuntime {
     async fn run(&self, messages: Vec<Message>) -> RunOutput {
         let mut runner = self.build_runner(messages);
         runner.run().await
+    }
+}
+
+#[async_trait]
+impl StreamingRuntime for SimpleRuntime {
+    async fn run_with_events(
+        &self,
+        messages: Vec<Message>,
+        sink: &mut dyn RunEventSink,
+    ) -> RunOutput {
+        Self::run_with_events(self, messages, sink).await
     }
 }

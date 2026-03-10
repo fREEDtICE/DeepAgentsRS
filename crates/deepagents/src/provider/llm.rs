@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
@@ -10,8 +11,23 @@ use crate::provider::protocol::{
     ProviderToolCall,
 };
 
-pub type LlmEventStream =
-    Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send + 'static>>;
+pub type LlmEventStream = Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send + 'static>>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmProviderCapabilities {
+    pub supports_streaming: bool,
+    pub supports_tool_calling: bool,
+    pub reports_usage: bool,
+    pub supports_structured_output: bool,
+    pub supports_reasoning_content: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDiagnostics {
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_capabilities: Option<LlmProviderCapabilities>,
+}
 
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
@@ -34,6 +50,10 @@ pub enum LlmEvent {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    fn capabilities(&self) -> LlmProviderCapabilities {
+        LlmProviderCapabilities::default()
+    }
+
     async fn chat(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep>;
 
     async fn stream_chat(&self, req: ProviderRequest) -> anyhow::Result<LlmEventStream>;
@@ -60,6 +80,10 @@ impl Provider for LlmProviderAdapter {
         req: ProviderRequest,
         collector: &mut dyn ProviderEventCollector,
     ) -> anyhow::Result<ProviderStep> {
+        if !self.inner.capabilities().supports_streaming {
+            return self.inner.chat(req).await;
+        }
+
         let mut stream = self.inner.stream_chat(req).await?;
         let mut final_step = None;
 
@@ -70,9 +94,15 @@ impl Provider for LlmProviderAdapter {
                         .emit(ProviderEvent::AssistantTextDelta { text })
                         .await?;
                 }
-                LlmEvent::ToolCallArgsDelta { tool_call_id, delta } => {
+                LlmEvent::ToolCallArgsDelta {
+                    tool_call_id,
+                    delta,
+                } => {
                     collector
-                        .emit(ProviderEvent::ToolCallArgsDelta { tool_call_id, delta })
+                        .emit(ProviderEvent::ToolCallArgsDelta {
+                            tool_call_id,
+                            delta,
+                        })
                         .await?;
                 }
                 LlmEvent::Usage {
@@ -101,18 +131,43 @@ impl Provider for LlmProviderAdapter {
 #[derive(Clone)]
 pub struct MockLlmProvider {
     events: Arc<Vec<LlmEvent>>,
+    capabilities: LlmProviderCapabilities,
 }
 
 impl MockLlmProvider {
     pub fn new(events: Vec<LlmEvent>) -> Self {
+        let mut capabilities = LlmProviderCapabilities::default();
+        capabilities.supports_streaming = true;
+        capabilities.reports_usage = events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Usage { .. }));
+        capabilities.supports_tool_calling = events.iter().any(|event| {
+            matches!(
+                event,
+                LlmEvent::ToolCallArgsDelta { .. }
+                    | LlmEvent::FinalStep {
+                        step: ProviderStep::ToolCalls { .. }
+                    }
+            )
+        });
         Self {
             events: Arc::new(events),
+            capabilities,
         }
+    }
+
+    pub fn with_capabilities(mut self, capabilities: LlmProviderCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
+    fn capabilities(&self) -> LlmProviderCapabilities {
+        self.capabilities
+    }
+
     async fn chat(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
         self.events
             .iter()

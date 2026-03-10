@@ -49,9 +49,9 @@ fn e2e_run_writes_events_jsonl() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
 
-    assert!(events.iter().any(|event| {
-        event.get("type").and_then(|v| v.as_str()) == Some("run_started")
-    }));
+    assert!(events
+        .iter()
+        .any(|event| { event.get("type").and_then(|v| v.as_str()) == Some("run_started") }));
     assert!(events.iter().any(|event| {
         event.get("type").and_then(|v| v.as_str()) == Some("tool_call_started")
             && event.get("tool_call_id").and_then(|v| v.as_str()) == Some("w1")
