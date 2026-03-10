@@ -123,6 +123,12 @@ impl PatchToolCallsMiddleware {
     }
 }
 
+impl Default for PatchToolCallsMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl RuntimeMiddleware for PatchToolCallsMiddleware {
     async fn before_run(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {

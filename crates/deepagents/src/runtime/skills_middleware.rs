@@ -188,41 +188,61 @@ async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json:
                 let duration_ms = started.elapsed().as_millis() as u64;
                 match result {
                     Ok((out, _delta)) => {
-                        record_audit(ctx.audit, &cmd, ctx.root, ctx.mode, "allow", "allow", reason, duration_ms, Some(&out));
+                        record_audit(AuditRecordInput {
+                            sink: ctx.audit,
+                            cmd: &cmd,
+                            root: ctx.root,
+                            mode: ctx.mode,
+                            decision: "allow",
+                            decision_code: "allow",
+                            decision_reason: reason,
+                            duration_ms,
+                            output: Some(&out),
+                        });
                         Ok(out)
                     }
                     Err(e) => {
-                        record_audit(
-                            ctx.audit,
-                            &cmd,
-                            ctx.root,
-                            ctx.mode,
-                            "allow",
-                            "allow",
-                            "allowed but execution failed".to_string(),
+                        record_audit(AuditRecordInput {
+                            sink: ctx.audit,
+                            cmd: &cmd,
+                            root: ctx.root,
+                            mode: ctx.mode,
+                            decision: "allow",
+                            decision_code: "allow",
+                            decision_reason: "allowed but execution failed".to_string(),
                             duration_ms,
-                            None,
-                        );
+                            output: None,
+                        });
                         Err(format!("skill_step_failed: execute: {}", e))
                     }
                 }
             }
             ApprovalDecision::Deny { code, reason } => {
-                record_audit(ctx.audit, &cmd, ctx.root, ctx.mode, "deny", &code, reason.clone(), 0, None);
+                record_audit(AuditRecordInput {
+                    sink: ctx.audit,
+                    cmd: &cmd,
+                    root: ctx.root,
+                    mode: ctx.mode,
+                    decision: "deny",
+                    decision_code: &code,
+                    decision_reason: reason.clone(),
+                    duration_ms: 0,
+                    output: None,
+                });
                 Err(format!("command_not_allowed: {}: {}", code, reason))
             }
             ApprovalDecision::RequireApproval { code, reason } => {
-                record_audit(
-                    ctx.audit,
-                    &cmd,
-                    ctx.root,
-                    ctx.mode,
-                    "require_approval",
-                    &code,
-                    reason.clone(),
-                    0,
-                    None,
-                );
+                record_audit(AuditRecordInput {
+                    sink: ctx.audit,
+                    cmd: &cmd,
+                    root: ctx.root,
+                    mode: ctx.mode,
+                    decision: "require_approval",
+                    decision_code: &code,
+                    decision_reason: reason.clone(),
+                    duration_ms: 0,
+                    output: None,
+                });
                 Err(format!("command_not_allowed: {}: {}", code, reason))
             }
         }
@@ -235,17 +255,30 @@ async fn execute_with_approval(ctx: &mut ToolCallContext<'_>, args: &serde_json:
     }
 }
 
-fn record_audit(
-    sink: Option<&Arc<dyn AuditSink>>,
-    cmd: &str,
-    root: &str,
+struct AuditRecordInput<'a> {
+    sink: Option<&'a Arc<dyn AuditSink>>,
+    cmd: &'a str,
+    root: &'a str,
     mode: ExecutionMode,
-    decision: &str,
-    decision_code: &str,
+    decision: &'a str,
+    decision_code: &'a str,
     decision_reason: String,
     duration_ms: u64,
-    output: Option<&serde_json::Value>,
-) {
+    output: Option<&'a serde_json::Value>,
+}
+
+fn record_audit(input: AuditRecordInput<'_>) {
+    let AuditRecordInput {
+        sink,
+        cmd,
+        root,
+        mode,
+        decision,
+        decision_code,
+        decision_reason,
+        duration_ms,
+        output,
+    } = input;
     let Some(sink) = sink else { return };
     let (exit_code, truncated) = output
         .and_then(|v| v.as_object())
@@ -305,7 +338,7 @@ fn build_skills_block(loaded: &LoadedSkills) -> String {
         out.push_str(&skill.description);
         out.push_str(" (source: ");
         out.push_str(&skill.source);
-        out.push_str(")");
+        out.push(')');
         if !skill.allowed_tools.is_empty() {
             out.push_str(" Allowed tools: ");
             out.push_str(&skill.allowed_tools.join(", "));

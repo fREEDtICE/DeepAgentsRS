@@ -43,7 +43,7 @@ impl LocalSandbox {
             self.root.join(p)
         };
 
-        let resolved = normalize_path(&joined).map_err(|e| BackendError::Other(e))?;
+        let resolved = normalize_path(&joined).map_err(BackendError::Other)?;
         if !resolved.starts_with(&self.root) {
             return Err(BackendError::Other("permission_denied: outside root".to_string()));
         }
@@ -461,13 +461,11 @@ fn split_shell_segments(command: &str) -> Vec<String> {
     let mut buf = String::new();
     let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '&' {
-            if chars.peek() == Some(&'&') {
-                chars.next();
-                segments.push(buf.trim().to_string());
-                buf.clear();
-                continue;
-            }
+        if ch == '&' && chars.peek() == Some(&'&') {
+            chars.next();
+            segments.push(buf.trim().to_string());
+            buf.clear();
+            continue;
         }
         if ch == '|' {
             if chars.peek() == Some(&'|') {
@@ -496,9 +494,8 @@ fn split_shell_segments(command: &str) -> Vec<String> {
 fn shell_like_split(segment: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
-    let mut chars = segment.chars().peekable();
     let mut quote: Option<char> = None;
-    while let Some(ch) = chars.next() {
+    for ch in segment.chars() {
         match quote {
             Some(q) => {
                 if ch == q {

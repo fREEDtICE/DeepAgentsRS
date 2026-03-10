@@ -52,6 +52,8 @@ pub struct RunOutput {
     pub state: AgentState,
     pub error: Option<RuntimeError>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarization_events: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trace: Option<serde_json::Value>,
 }
 
@@ -98,6 +100,10 @@ pub struct HandledToolCall {
 #[async_trait]
 pub trait RuntimeMiddleware: Send + Sync {
     async fn before_run(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
+        Ok(messages)
+    }
+
+    async fn before_provider_step(&self, messages: Vec<Message>, _state: &mut AgentState) -> anyhow::Result<Vec<Message>> {
         Ok(messages)
     }
 

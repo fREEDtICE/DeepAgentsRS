@@ -30,44 +30,40 @@ pub fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len());
     for mut msg in messages {
         if msg.role == "assistant" && msg.tool_calls.is_none() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                if let serde_json::Value::Object(map) = v {
-                    if let Some(tc_val) = map.get("tool_calls") {
-                        if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()) {
-                            msg.content = map
-                                .get("content")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            msg.tool_calls = Some(calls);
-                        }
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                if let Some(tc_val) = map.get("tool_calls") {
+                    if let Ok(calls) = serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()) {
+                        msg.content = map
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        msg.tool_calls = Some(calls);
                     }
                 }
             }
         }
 
         if msg.role == "tool" && msg.tool_call_id.is_none() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                if let serde_json::Value::Object(map) = v {
-                    if let Some(id) = extract_string(
-                        &map,
-                        &["tool_call_id", "tool_use_id", "toolUseId", "call_id", "id", "tool_callid"],
-                    ) {
-                        msg.tool_call_id = Some(id.to_string());
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                if let Some(id) = extract_string(
+                    &map,
+                    &["tool_call_id", "tool_use_id", "toolUseId", "call_id", "id", "tool_callid"],
+                ) {
+                    msg.tool_call_id = Some(id.to_string());
+                }
+                if msg.name.is_none() {
+                    if let Some(name) = extract_string(&map, &["tool_name", "name"]) {
+                        msg.name = Some(name.to_string());
                     }
-                    if msg.name.is_none() {
-                        if let Some(name) = extract_string(&map, &["tool_name", "name"]) {
-                            msg.name = Some(name.to_string());
-                        }
-                    }
-                    if msg.status.is_none() {
-                        if let Some(status) = extract_string(&map, &["status"]) {
-                            msg.status = Some(status.to_string());
-                        } else if map.get("error").is_some_and(|e| !e.is_null()) {
-                            msg.status = Some("error".to_string());
-                        } else {
-                            msg.status = Some("success".to_string());
-                        }
+                }
+                if msg.status.is_none() {
+                    if let Some(status) = extract_string(&map, &["status"]) {
+                        msg.status = Some(status.to_string());
+                    } else if map.get("error").is_some_and(|e| !e.is_null()) {
+                        msg.status = Some("error".to_string());
+                    } else {
+                        msg.status = Some("success".to_string());
                     }
                 }
             }
@@ -182,4 +178,3 @@ pub fn normalize_tool_call_for_execution(mut call: ProviderToolCall, next_call_i
         },
     }
 }
-

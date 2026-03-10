@@ -310,14 +310,16 @@ impl CompiledSubAgent for RuntimeMockSubAgent {
             req.agent,
             provider,
             Vec::new(),
-            RuntimeConfig {
-                max_steps: 8,
-                provider_timeout_ms: 1000,
+            crate::runtime::simple::SimpleRuntimeOptions {
+                config: RuntimeConfig {
+                    max_steps: 8,
+                    provider_timeout_ms: 1000,
+                },
+                approval: req.approval,
+                audit: req.audit,
+                root: req.root,
+                mode: req.mode,
             },
-            req.approval,
-            req.audit,
-            req.root,
-            req.mode,
         )
         .with_runtime_middlewares(req.runtime_middlewares)
         .with_initial_state(req.state)

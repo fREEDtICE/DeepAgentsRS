@@ -99,14 +99,16 @@ async fn skills_tool_executes_steps() {
         agent,
         provider,
         Vec::new(),
-        RuntimeConfig {
-            max_steps: 4,
-            provider_timeout_ms: 1000,
+        deepagents::runtime::simple::SimpleRuntimeOptions {
+            config: RuntimeConfig {
+                max_steps: 4,
+                provider_timeout_ms: 1000,
+            },
+            approval: None,
+            audit: None,
+            root: temp.path().to_string_lossy().to_string(),
+            mode: ExecutionMode::NonInteractive,
         },
-        None,
-        None,
-        temp.path().to_string_lossy().to_string(),
-        ExecutionMode::NonInteractive,
     )
     .with_runtime_middlewares(vec![skills_mw]);
 
@@ -158,14 +160,16 @@ async fn skills_tools_are_injected_into_tool_specs() {
         agent,
         provider,
         Vec::new(),
-        RuntimeConfig {
-            max_steps: 1,
-            provider_timeout_ms: 1000,
+        deepagents::runtime::simple::SimpleRuntimeOptions {
+            config: RuntimeConfig {
+                max_steps: 1,
+                provider_timeout_ms: 1000,
+            },
+            approval: None,
+            audit: None,
+            root: temp.path().to_string_lossy().to_string(),
+            mode: ExecutionMode::NonInteractive,
         },
-        None,
-        None,
-        temp.path().to_string_lossy().to_string(),
-        ExecutionMode::NonInteractive,
     )
     .with_runtime_middlewares(vec![skills_mw]);
 

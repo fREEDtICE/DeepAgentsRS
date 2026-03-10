@@ -45,6 +45,8 @@ enum Cmd {
         #[arg(long, default_value = "mock")]
         provider: String,
         #[arg(long)]
+        thread_id: Option<String>,
+        #[arg(long)]
         mock_script: Option<String>,
         #[arg(long)]
         plugin: Vec<String>,
@@ -64,6 +66,20 @@ enum Cmd {
         max_steps: usize,
         #[arg(long, default_value_t = 1000)]
         provider_timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        summarization_disable: bool,
+        #[arg(long, default_value_t = 12000)]
+        summarization_max_char_budget: usize,
+        #[arg(long, default_value_t = 12)]
+        summarization_max_turns_visible: usize,
+        #[arg(long, default_value_t = 3)]
+        summarization_min_recent_messages: usize,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        summarization_redact_tool_args: bool,
+        #[arg(long, default_value_t = 2000)]
+        summarization_max_tool_arg_chars: usize,
+        #[arg(long, default_value_t = 6)]
+        summarization_truncate_keep_last: usize,
         #[arg(long, default_value_t = false)]
         pretty: bool,
     },
@@ -384,6 +400,7 @@ async fn main() -> Result<()> {
         Cmd::Run {
             input,
             provider,
+            thread_id,
             mock_script,
             plugin,
             skills_source,
@@ -394,6 +411,13 @@ async fn main() -> Result<()> {
             memory_disable,
             max_steps,
             provider_timeout_ms,
+            summarization_disable,
+            summarization_max_char_budget,
+            summarization_max_turns_visible,
+            summarization_min_recent_messages,
+            summarization_redact_tool_args,
+            summarization_max_tool_arg_chars,
+            summarization_truncate_keep_last,
             pretty,
         } => {
             let provider: std::sync::Arc<dyn deepagents::provider::Provider> = match provider.as_str() {
@@ -448,22 +472,46 @@ async fn main() -> Result<()> {
                     std::sync::Arc::new(deepagents::runtime::SkillsMiddleware::new(skills_source, options));
                 runtime_middlewares.push(skills_mw);
             }
+
+            if !summarization_disable {
+                let mut options = deepagents::runtime::SummarizationOptions::default();
+                options.policy = deepagents::runtime::SummarizationPolicyKind::Budget;
+                options.max_char_budget = summarization_max_char_budget;
+                options.max_turns_visible = summarization_max_turns_visible;
+                options.min_recent_messages = summarization_min_recent_messages;
+                options.redact_tool_args = summarization_redact_tool_args;
+                options.max_tool_arg_chars = summarization_max_tool_arg_chars;
+                options.truncate_tool_args_keep_last = summarization_truncate_keep_last;
+                let summarization_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
+                    std::sync::Arc::new(deepagents::runtime::SummarizationMiddleware::new(root.clone(), options));
+                runtime_middlewares.push(summarization_mw);
+            }
             runtime_middlewares.push(subagent_mw);
+
+            let mut initial_state = deepagents::state::AgentState::default();
+            if let Some(tid) = thread_id {
+                initial_state
+                    .extra
+                    .insert("thread_id".to_string(), serde_json::Value::String(tid));
+            }
 
             let runtime = deepagents::runtime::simple::SimpleRuntime::new(
                 agent,
                 provider,
                 skills,
-                deepagents::runtime::RuntimeConfig {
-                    max_steps,
-                    provider_timeout_ms,
+                deepagents::runtime::simple::SimpleRuntimeOptions {
+                    config: deepagents::runtime::RuntimeConfig {
+                        max_steps,
+                        provider_timeout_ms,
+                    },
+                    approval: Some(policy),
+                    audit: audit_sink,
+                    root: root.clone(),
+                    mode,
                 },
-                Some(policy),
-                audit_sink,
-                root.clone(),
-                mode,
             )
-            .with_runtime_middlewares(runtime_middlewares);
+            .with_runtime_middlewares(runtime_middlewares)
+            .with_initial_state(initial_state);
 
             let out = runtime
                 .run(vec![deepagents::types::Message {

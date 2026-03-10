@@ -175,14 +175,16 @@ async fn normalize_accepts_string_json_arguments_for_tool_calls() {
         agent,
         provider,
         Vec::new(),
-        RuntimeConfig {
-            max_steps: 8,
-            provider_timeout_ms: 1000,
+        deepagents::runtime::simple::SimpleRuntimeOptions {
+            config: RuntimeConfig {
+                max_steps: 8,
+                provider_timeout_ms: 1000,
+            },
+            approval: None,
+            audit: None,
+            root: root.to_string_lossy().to_string(),
+            mode: ExecutionMode::NonInteractive,
         },
-        None,
-        None,
-        root.to_string_lossy().to_string(),
-        ExecutionMode::NonInteractive,
     )
     .with_runtime_middlewares(vec![patch_mw]);
 

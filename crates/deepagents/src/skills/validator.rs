@@ -195,7 +195,7 @@ fn validate_description(desc: &str) -> Result<()> {
 
 fn get_str(map: &serde_yaml::Mapping, key: &str) -> Result<String> {
     let v = map
-        .get(&serde_yaml::Value::String(key.to_string()))
+        .get(serde_yaml::Value::String(key.to_string()))
         .ok_or_else(|| anyhow::anyhow!("missing field: {}", key))?;
     v.as_str()
         .map(|s| s.trim().to_string())
@@ -204,14 +204,14 @@ fn get_str(map: &serde_yaml::Mapping, key: &str) -> Result<String> {
 }
 
 fn get_opt_str(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 fn get_metadata(map: &serde_yaml::Mapping, key: &str) -> Result<BTreeMap<String, String>> {
-    let Some(v) = map.get(&serde_yaml::Value::String(key.to_string())) else {
+    let Some(v) = map.get(serde_yaml::Value::String(key.to_string())) else {
         return Ok(BTreeMap::new());
     };
     let Some(m) = v.as_mapping() else {
@@ -233,7 +233,7 @@ fn get_metadata(map: &serde_yaml::Mapping, key: &str) -> Result<BTreeMap<String,
 }
 
 fn get_allowed_tools(map: &serde_yaml::Mapping, key: &str) -> Result<Vec<String>> {
-    let Some(v) = map.get(&serde_yaml::Value::String(key.to_string())) else {
+    let Some(v) = map.get(serde_yaml::Value::String(key.to_string())) else {
         return Ok(Vec::new());
     };
     if let Some(seq) = v.as_sequence() {

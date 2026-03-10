@@ -2,6 +2,7 @@ pub mod protocol;
 pub mod patch_tool_calls;
 pub mod memory_middleware;
 pub mod skills_middleware;
+pub mod summarization_middleware;
 pub mod simple;
 pub mod tool_compat;
 
@@ -11,3 +12,7 @@ pub use protocol::{
 };
 pub use memory_middleware::{LoadedMemory, MemoryLoadOptions, MemoryMiddleware};
 pub use skills_middleware::SkillsMiddleware;
+pub use summarization_middleware::{
+    FilesystemSummarizationStore, SummarizationEvent, SummarizationMiddleware, SummarizationOptions, SummarizationPolicyKind,
+    SummarizationStore,
+};

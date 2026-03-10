@@ -54,7 +54,7 @@ pub struct MemoryQuery {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryEvictionReport {
     pub before_entries: usize,
@@ -66,20 +66,7 @@ pub struct MemoryEvictionReport {
     pub after_bytes_total: usize,
 }
 
-impl Default for MemoryEvictionReport {
-    fn default() -> Self {
-        Self {
-            before_entries: 0,
-            after_entries: 0,
-            evicted: 0,
-            evicted_keys: Vec::new(),
-            before_bytes_total: 0,
-            after_bytes_total: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryDiagnostics {
     pub loaded_sources: usize,
@@ -89,19 +76,6 @@ pub struct MemoryDiagnostics {
     pub truncated: bool,
     pub injected_chars: usize,
     pub combined_chars: usize,
-}
-
-impl Default for MemoryDiagnostics {
-    fn default() -> Self {
-        Self {
-            loaded_sources: 0,
-            skipped_not_found: 0,
-            errors: Vec::new(),
-            truncated: false,
-            injected_chars: 0,
-            combined_chars: 0,
-        }
-    }
 }
 
 #[derive(Debug, Error)]

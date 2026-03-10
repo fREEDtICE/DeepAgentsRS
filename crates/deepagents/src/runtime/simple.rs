@@ -39,17 +39,28 @@ pub struct SimpleRuntime {
     task_depth: usize,
 }
 
+pub struct SimpleRuntimeOptions {
+    pub config: RuntimeConfig,
+    pub approval: Option<Arc<dyn ApprovalPolicy>>,
+    pub audit: Option<Arc<dyn AuditSink>>,
+    pub root: String,
+    pub mode: ExecutionMode,
+}
+
 impl SimpleRuntime {
     pub fn new(
         agent: DeepAgent,
         provider: Arc<dyn Provider>,
         skills: Vec<Arc<dyn SkillPlugin>>,
-        config: RuntimeConfig,
-        approval: Option<Arc<dyn ApprovalPolicy>>,
-        audit: Option<Arc<dyn AuditSink>>,
-        root: String,
-        mode: ExecutionMode,
+        options: SimpleRuntimeOptions,
     ) -> Self {
+        let SimpleRuntimeOptions {
+            config,
+            approval,
+            audit,
+            root,
+            mode,
+        } = options;
         Self {
             agent,
             provider,
@@ -99,11 +110,12 @@ impl Runtime for SimpleRuntime {
                             final_text: String::new(),
                             tool_calls,
                             tool_results,
-                            state,
+                            state: state.clone(),
                             error: Some(RuntimeError {
                                 code: "middleware_error".to_string(),
                                 message: e.to_string(),
                             }),
+                            summarization_events: state.extra.get("_summarization_events").cloned(),
                             trace: Some(serde_json::json!({ "terminated_at_step": 0, "reason": "middleware_before_run_error" })),
                         };
                     }
@@ -120,11 +132,35 @@ impl Runtime for SimpleRuntime {
                 .iter()
                 .flat_map(|p| p.list_skills())
                 .collect::<Vec<_>>();
+            let skill_specs_for_req = skill_specs.clone();
+
+            let mut provider_messages = messages.clone();
+            if !self.runtime_middlewares.is_empty() {
+                for mw in &self.runtime_middlewares {
+                    match mw.before_provider_step(provider_messages, &mut state).await {
+                        Ok(m) => provider_messages = m,
+                        Err(e) => {
+                            return RunOutput {
+                                final_text: String::new(),
+                                tool_calls,
+                                tool_results,
+                                state: state.clone(),
+                                error: Some(RuntimeError {
+                                    code: "middleware_error".to_string(),
+                                    message: e.to_string(),
+                                }),
+                                summarization_events: state.extra.get("_summarization_events").cloned(),
+                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" })),
+                            };
+                        }
+                    }
+                }
+            }
 
             let req = ProviderRequest {
-                messages: messages.clone(),
+                messages: provider_messages.clone(),
                 tool_specs,
-                skills: skill_specs,
+                skills: skill_specs_for_req,
                 state: state.clone(),
                 last_tool_results: tool_results.clone(),
             };
@@ -141,11 +177,12 @@ impl Runtime for SimpleRuntime {
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
-                        state,
+                        state: state.clone(),
                         error: Some(RuntimeError {
                             code: "provider_error".to_string(),
                             message: e.to_string(),
                         }),
+                        summarization_events: state.extra.get("_summarization_events").cloned(),
                         trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" })),
                     };
                 }
@@ -154,15 +191,90 @@ impl Runtime for SimpleRuntime {
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
-                        state,
+                        state: state.clone(),
                         error: Some(RuntimeError {
                             code: "provider_timeout".to_string(),
                             message: "provider timed out".to_string(),
                         }),
+                        summarization_events: state.extra.get("_summarization_events").cloned(),
                         trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" })),
                     };
                 }
             };
+
+            if let ProviderStep::Error { error } = &provider_step {
+                if error.code == "context_overflow" {
+                    state
+                        .extra
+                        .insert("_summarization_force".to_string(), serde_json::Value::Bool(true));
+                    let mut overflow_messages = messages.clone();
+                    if !self.runtime_middlewares.is_empty() {
+                        for mw in &self.runtime_middlewares {
+                            match mw.before_provider_step(overflow_messages, &mut state).await {
+                                Ok(m) => overflow_messages = m,
+                                Err(e) => {
+                                    return RunOutput {
+                                        final_text: String::new(),
+                                        tool_calls,
+                                        tool_results,
+                                        state: state.clone(),
+                                        error: Some(RuntimeError {
+                                            code: "middleware_error".to_string(),
+                                            message: e.to_string(),
+                                        }),
+                                        summarization_events: state.extra.get("_summarization_events").cloned(),
+                                        trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_before_provider_step_error" })),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    state.extra.remove("_summarization_force");
+                    let retry_req = ProviderRequest {
+                        messages: overflow_messages,
+                        tool_specs: self.agent_tools(&state),
+                        skills: skill_specs.clone(),
+                        state: state.clone(),
+                        last_tool_results: tool_results.clone(),
+                    };
+                    provider_step = match timeout(
+                        Duration::from_millis(self.config.provider_timeout_ms),
+                        self.provider.step(retry_req),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            return RunOutput {
+                                final_text: String::new(),
+                                tool_calls,
+                                tool_results,
+                                state: state.clone(),
+                                error: Some(RuntimeError {
+                                    code: "provider_error".to_string(),
+                                    message: e.to_string(),
+                                }),
+                                summarization_events: state.extra.get("_summarization_events").cloned(),
+                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_error" })),
+                            };
+                        }
+                        Err(_) => {
+                            return RunOutput {
+                                final_text: String::new(),
+                                tool_calls,
+                                tool_results,
+                                state: state.clone(),
+                                error: Some(RuntimeError {
+                                    code: "provider_timeout".to_string(),
+                                    message: "provider timed out".to_string(),
+                                }),
+                                summarization_events: state.extra.get("_summarization_events").cloned(),
+                                trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_timeout" })),
+                            };
+                        }
+                    };
+                }
+            }
 
             if !self.runtime_middlewares.is_empty() {
                 for mw in &self.runtime_middlewares {
@@ -173,11 +285,12 @@ impl Runtime for SimpleRuntime {
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
-                                state,
+                                state: state.clone(),
                                 error: Some(RuntimeError {
                                     code: "middleware_error".to_string(),
                                     message: e.to_string(),
                                 }),
+                                summarization_events: state.extra.get("_summarization_events").cloned(),
                                 trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "middleware_patch_provider_step_error" })),
                             };
                         }
@@ -201,8 +314,9 @@ impl Runtime for SimpleRuntime {
                         final_text: text,
                         tool_calls,
                         tool_results,
-                        state,
+                        state: state.clone(),
                         error: None,
+                        summarization_events: state.extra.get("_summarization_events").cloned(),
                         trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "final_text" })),
                     };
                 }
@@ -211,11 +325,12 @@ impl Runtime for SimpleRuntime {
                         final_text: String::new(),
                         tool_calls,
                         tool_results,
-                        state,
+                        state: state.clone(),
                         error: Some(RuntimeError {
                             code: error.code,
                             message: error.message,
                         }),
+                        summarization_events: state.extra.get("_summarization_events").cloned(),
                         trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "provider_step_error" })),
                     };
                 }
@@ -228,11 +343,12 @@ impl Runtime for SimpleRuntime {
                                 final_text: String::new(),
                                 tool_calls,
                                 tool_results,
-                                state,
+                                state: state.clone(),
                                 error: Some(RuntimeError {
                                     code: e.code,
                                     message: e.message,
                                 }),
+                                summarization_events: state.extra.get("_summarization_events").cloned(),
                                 trace: Some(serde_json::json!({ "terminated_at_step": step_idx, "reason": "skill_error" })),
                             };
                         }
@@ -273,11 +389,12 @@ impl Runtime for SimpleRuntime {
             final_text: String::new(),
             tool_calls,
             tool_results,
-            state,
+            state: state.clone(),
             error: Some(RuntimeError {
                 code: "max_steps_exceeded".to_string(),
                 message: "runtime exceeded max_steps".to_string(),
             }),
+            summarization_events: state.extra.get("_summarization_events").cloned(),
             trace: Some(serde_json::json!({ "terminated_at_step": self.config.max_steps, "reason": "max_steps_exceeded" })),
         }
     }
@@ -296,6 +413,7 @@ impl SimpleRuntime {
             ("grep", "Search for a literal text pattern across files."),
             ("execute", "Executes a shell command in an isolated sandbox environment."),
             ("task", "Launch a sub-agent and assign a task to it."),
+            ("compact_conversation", "Compacts conversation history by summarizing older messages."),
         ] {
             out.push(ToolSpec {
                 name: name.to_string(),
