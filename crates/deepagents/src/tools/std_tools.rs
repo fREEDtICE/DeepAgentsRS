@@ -164,11 +164,7 @@ impl Tool for ReadFileTool {
             };
             return Ok(ToolResult {
                 output: serde_json::to_value(output)?,
-                content_blocks: Some(vec![ContentBlock {
-                    block_type: "image_base64".to_string(),
-                    mime_type: Some(mime.to_string()),
-                    base64: Some(base64),
-                }]),
+                content_blocks: Some(vec![ContentBlock::image_base64(mime, base64)]),
             });
         }
 

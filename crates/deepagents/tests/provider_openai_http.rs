@@ -5,12 +5,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::{Json, Router};
-use deepagents::provider::{
-    LlmEvent, LlmProvider, OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiDelta, OpenAiFunctionCall,
-    OpenAiFunctionCallDelta, OpenAiMessage, OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
-    ProviderRequest, ReqwestOpenAiTransport,
+use deepagents::provider::openai_compatible::{
+    OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice, OpenAiCompatibleConfig,
+    OpenAiCompatibleProvider, OpenAiDelta, OpenAiFunctionCall, OpenAiFunctionCallDelta,
+    OpenAiMessage, OpenAiMessageContent, OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
+    ReqwestOpenAiTransport,
 };
+use deepagents::provider::{LlmEvent, LlmProvider, ProviderRequest, ToolChoice};
 use tokio_stream::StreamExt;
 
 #[derive(Clone, Default)]
@@ -25,6 +26,7 @@ fn sample_request() -> ProviderRequest {
             role: "user".to_string(),
             content: "hello".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -42,9 +44,11 @@ fn sample_request() -> ProviderRequest {
                 "additionalProperties": false
             }),
         }],
+        tool_choice: ToolChoice::Auto,
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
+        structured_output: None,
     }
 }
 
@@ -69,7 +73,7 @@ async fn reqwest_transport_posts_json_and_parses_chat_response() {
 
     let step = provider.chat(sample_request()).await.unwrap();
     assert!(matches!(
-        step,
+        step.step,
         deepagents::provider::ProviderStep::ToolCalls { calls }
             if calls.len() == 1 && calls[0].tool_name == "read_file"
     ));
@@ -143,6 +147,7 @@ async fn chat_handler(
                 message: OpenAiMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![OpenAiToolCall {
                         id: "call_1".to_string(),
                         kind: "function".to_string(),
@@ -170,7 +175,8 @@ async fn stream_handler(
         OpenAiChatChunk {
             choices: vec![OpenAiChunkChoice {
                 delta: OpenAiDelta {
-                    content: Some("Hel".to_string()),
+                    content: Some(OpenAiMessageContent::from("Hel")),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: None,
@@ -180,7 +186,8 @@ async fn stream_handler(
         OpenAiChatChunk {
             choices: vec![OpenAiChunkChoice {
                 delta: OpenAiDelta {
-                    content: Some("lo".to_string()),
+                    content: Some(OpenAiMessageContent::from("lo")),
+                    reasoning_content: None,
                     tool_calls: Some(vec![OpenAiToolCallDelta {
                         index: 0,
                         id: Some("call_1".to_string()),

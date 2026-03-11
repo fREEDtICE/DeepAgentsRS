@@ -5,7 +5,7 @@
 - Python：`../../deepagents/`
 - Rust：`../`
 
-更新时间：2026-03-10
+更新时间：2026-03-11
 
 另见：
 - [PYTHON_PARITY_MATRIX.md](acceptance/PYTHON_PARITY_MATRIX.md)
@@ -16,6 +16,9 @@
 
 ### 已明显补齐/对齐的能力
 
+- 对外主入口的非法状态已收紧：`DeepAgent.run()` 不再返回空成功，而是显式报错；推荐入口改为 `DeepAgent::runtime(provider).with_root(...).build()` 的 typed builder。  
+  - builder 入口：[agent.rs](../crates/deepagents/src/agent.rs)  
+  - builder 测试：[runtime_builder.rs](../crates/deepagents/tests/runtime_builder.rs)
 - 默认中间件顺序：Rust CLI 的默认装配已通过 `RuntimeMiddlewareAssembler` 以 slot 固化，并与 Python `create_deep_agent()` 的主 agent 默认顺序对齐（TodoList / Memory / Skills / FilesystemRuntime / Subagents / Summarization / PromptCaching / PatchToolCalls）。  
   - 装配入口：[main.rs:L479-L574](../crates/deepagents-cli/src/main.rs#L479-L574)  
   - slot/排序规则：[assembly.rs](../crates/deepagents/src/runtime/assembly.rs)
@@ -30,8 +33,8 @@
 
 ### 仍然未补齐的关键缺口
 
-- 对外 API 主入口：`DeepAgent.run()` 仍为空实现；主路径依赖 runtime/runner。  
-  - [agent.rs:L48-L52](../crates/deepagents/src/agent.rs#L48-L52)
+- 对外 API 仍有“双层入口”认知成本：`DeepAgent` 现在已通过 typed builder 显式引导到 runtime，但 `run()` 仍作为兼容方法存在并返回配置错误；后续仍可考虑在大版本里彻底移除这个误导性入口。  
+  - [agent.rs](../crates/deepagents/src/agent.rs)
 - 真实 Provider 生态：Rust 仍以 mock provider 为主，缺少 OpenAI/Anthropic 等真实接入。
 - PromptCaching：Rust 目前为占位统计实现，尚未实现缓存命中/复用语义（方案与迭代拆分见 [PROMPT_CACHING_PLAN.md](iteration/PROMPT_CACHING_PLAN.md)）。  
   - [prompt_caching_middleware.rs](../crates/deepagents/src/runtime/prompt_caching_middleware.rs)
@@ -49,10 +52,15 @@
 
 ### 1.1 对外 API 的主入口不完整
 
-Rust 侧 `DeepAgent.run()` 目前是空实现；真正可用的对话循环在 `SimpleRuntime`。对集成方而言，这是明显的产品/API 缺口：调用者需要自行理解并组装 runtime/provider/middlewares，而不是面向一个稳定的 agent 主入口。
+Rust 侧此前的 `DeepAgent.run()` 是空实现，这属于典型的“非法状态可表示”问题：类型名叫 agent，但缺 provider/runtime 仍可被调用。当前已改为两步收敛：
+
+- `DeepAgent.run()` 显式返回配置错误，不再伪装成成功执行
+- 推荐路径改为 `DeepAgent::runtime(provider).with_root(...).build()`，用 typed builder 明确要求 runtime 依赖
+
+这一版已经把最危险的 API 陷阱消掉，但调用方仍需要显式装配 provider/root/runtime middleware；因此它更像“Rust 风格的显式 wiring”，而不是 Python 那种单入口工厂。
 
 - 相关代码
-  - [agent.rs:L41-L45](../crates/deepagents/src/agent.rs#L41-L45)
+  - [agent.rs](../crates/deepagents/src/agent.rs)
   - [simple.rs:L95-L203](../crates/deepagents/src/runtime/simple.rs#L95-L203)
 
 ### 1.2 缺真实 Provider 生态

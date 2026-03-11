@@ -100,6 +100,7 @@ impl RuntimeMiddleware for SubAgentMiddleware {
             role: "user".to_string(),
             content: input.description.clone(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

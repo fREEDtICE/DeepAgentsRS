@@ -12,6 +12,7 @@ use crate::types::Message;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStepKind {
     AssistantMessage,
+    AssistantMessageWithToolCalls,
     FinalText,
     ToolCalls,
     SkillCall,
@@ -151,6 +152,9 @@ impl RunEventSink for VecRunEventSink {
 pub fn provider_step_kind(step: &ProviderStep) -> ProviderStepKind {
     match step {
         ProviderStep::AssistantMessage { .. } => ProviderStepKind::AssistantMessage,
+        ProviderStep::AssistantMessageWithToolCalls { .. } => {
+            ProviderStepKind::AssistantMessageWithToolCalls
+        }
         ProviderStep::FinalText { .. } => ProviderStepKind::FinalText,
         ProviderStep::ToolCalls { .. } => ProviderStepKind::ToolCalls,
         ProviderStep::SkillCall { .. } => ProviderStepKind::SkillCall,

@@ -74,6 +74,7 @@ pub fn patch_dangling_tool_calls(messages: Vec<Message>) -> Vec<Message> {
                 role: "tool".to_string(),
                 content,
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: Some(tc.id),
                 name: Some(tc.name),
@@ -154,6 +155,10 @@ impl RuntimeMiddleware for PatchToolCallsMiddleware {
         next_call_id: &mut u64,
     ) -> anyhow::Result<ProviderStep> {
         match step {
+            ProviderStep::AssistantMessageWithToolCalls { text, calls } => {
+                let calls = normalize_provider_tool_calls(calls, next_call_id);
+                Ok(ProviderStep::AssistantMessageWithToolCalls { text, calls })
+            }
             ProviderStep::ToolCalls { calls } => {
                 let calls = normalize_provider_tool_calls(calls, next_call_id);
                 Ok(ProviderStep::ToolCalls { calls })

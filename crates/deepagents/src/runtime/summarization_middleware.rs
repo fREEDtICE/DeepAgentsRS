@@ -379,6 +379,7 @@ fn build_summary_message(messages: &[Message], max_chars: usize) -> Message {
         role: "user".to_string(),
         content,
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: Some(SUMMARY_NAME.to_string()),

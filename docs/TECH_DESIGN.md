@@ -141,7 +141,8 @@ Rust 版本提供统一 Tool 协议：
 后续扩展方向：
 
 - 引入 Middleware 链，允许像 Python 一样“按能力注入工具 + 拦截/改写请求/响应”
-- 将 `DeepAgent::run()` 从空实现扩展为可插拔 runtime（例如：对接 LLM 的 tool-calling 协议，或集成图执行）
+- 使用 typed runtime builder 作为显式装配入口：`DeepAgent::runtime(provider).with_root(...).build()`
+- `DeepAgent::run()` 仅保留为兼容入口，并显式返回配置错误，避免“空实现 + 成功返回”的伪合法状态
 
 ### 4) Agent Runtime（Rust 版必须补齐的核心）
 
@@ -170,6 +171,17 @@ Rust 版如果目标是完整替代 `/py`，必须明确 runtime 形态并形成
 - 执行：tool 执行返回结构化 result/error
 - 回填：FilesystemState/MemoryState 等 reducer 合并到 state
 - 输出：最终 assistant 消息
+
+#### 当前公共装配形态
+
+当前 public API 已采用更 Rust-shaped 的显式装配路径：
+
+- `DeepAgent`：负责 backend、tools、middleware 组合
+- `DeepAgent::runtime(provider)`：进入 typed builder
+- `with_root(...)`：作为必填步骤，将 workspace/root 显式绑定到 runtime
+- `build()`：产出 `SimpleRuntime`
+
+这样做的目的不是隐藏 wiring，而是把“provider/root 未配置”的非法状态提前到类型与构造阶段，而不是留到运行时才出现静默空行为。
 
 ### 5) Provider 抽象（模型接入）
 

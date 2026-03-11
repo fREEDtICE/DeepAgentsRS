@@ -129,6 +129,8 @@ pub struct RunOutput {
     #[serde(default)]
     pub state: AgentState,
     pub error: Option<RuntimeError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summarization_events: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +151,15 @@ fn default_max_steps() -> usize {
 
 fn default_provider_timeout_ms() -> u64 {
     1000
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: default_max_steps(),
+            provider_timeout_ms: default_provider_timeout_ms(),
+        }
+    }
 }
 
 #[async_trait]

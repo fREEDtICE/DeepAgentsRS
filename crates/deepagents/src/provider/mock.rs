@@ -14,6 +14,10 @@ pub enum MockStep {
     AssistantMessage {
         text: String,
     },
+    AssistantMessageWithToolCalls {
+        text: String,
+        calls: Vec<ProviderToolCall>,
+    },
     FinalText {
         text: String,
     },
@@ -96,6 +100,9 @@ impl Provider for MockProvider {
                 })
             }
             MockStep::AssistantMessage { text } => Ok(ProviderStep::AssistantMessage { text }),
+            MockStep::AssistantMessageWithToolCalls { text, calls } => {
+                Ok(ProviderStep::AssistantMessageWithToolCalls { text, calls })
+            }
             MockStep::FinalText { text } => Ok(ProviderStep::FinalText { text }),
             MockStep::FinalFromLastToolFirstLine { prefix } => {
                 let mut out = prefix.unwrap_or_default();

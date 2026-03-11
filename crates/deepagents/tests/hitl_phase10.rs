@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use deepagents::approval::ExecutionMode;
+use deepagents::approval::{DefaultApprovalPolicy, ExecutionMode};
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
 use deepagents::provider::ProviderToolCall;
 use deepagents::runtime::{HitlDecision, ResumableRunner, ResumableRunnerOptions, RunStatus};
@@ -363,4 +363,155 @@ async fn h05_invalid_resume_keeps_pending_and_allows_retry() {
     assert_eq!(out3.status, RunStatus::Completed);
     assert!(!root.join("a.txt").exists());
     assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "2\n");
+}
+
+#[tokio::test]
+async fn h06_interactive_execute_resume_approve_runs_when_policy_requires_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let script = MockScript {
+        steps: vec![
+            MockStep::ToolCalls {
+                calls: vec![ProviderToolCall {
+                    tool_name: "execute".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "echo hi",
+                        "timeout": 5
+                    }),
+                    call_id: Some("e1".to_string()),
+                }],
+            },
+            MockStep::FinalText {
+                text: "DONE".to_string(),
+            },
+        ],
+    };
+    let provider: Arc<dyn deepagents::provider::Provider> =
+        Arc::new(MockProvider::from_script(script));
+    let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
+    let agent = deepagents::create_deep_agent_with_backend(backend);
+
+    let mut runner = ResumableRunner::new(
+        agent,
+        provider,
+        Vec::new(),
+        ResumableRunnerOptions {
+            config: deepagents::runtime::RuntimeConfig {
+                max_steps: 8,
+                provider_timeout_ms: 1000,
+            },
+            approval: Some(Arc::new(DefaultApprovalPolicy::new(Vec::<String>::new()))),
+            audit: None,
+            root: root.to_string_lossy().to_string(),
+            mode: ExecutionMode::Interactive,
+            interrupt_on: BTreeMap::new(),
+        },
+    );
+
+    runner.push_user_input("go".to_string());
+    let out1 = runner.run().await;
+    assert_eq!(out1.status, RunStatus::Interrupted);
+    assert_eq!(out1.interrupts.len(), 1);
+    assert_eq!(out1.interrupts[0].tool_name, "execute");
+    assert_eq!(out1.interrupts[0].tool_call_id, "e1");
+
+    let out2 = runner.resume("e1", HitlDecision::Approve).await;
+    assert_eq!(out2.status, RunStatus::Completed);
+    assert_eq!(out2.final_text, "DONE");
+    let execute_record = out2
+        .tool_results
+        .iter()
+        .find(|record| record.tool_name == "execute")
+        .unwrap();
+    assert_eq!(execute_record.status.as_deref(), Some("success"));
+    assert_eq!(
+        execute_record
+            .output
+            .get("exit_code")
+            .and_then(|value| value.as_i64()),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn h07_interactive_execute_resume_edit_runs_when_policy_requires_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let script = MockScript {
+        steps: vec![
+            MockStep::ToolCalls {
+                calls: vec![ProviderToolCall {
+                    tool_name: "execute".to_string(),
+                    arguments: serde_json::json!({
+                        "command": "echo blocked",
+                        "timeout": 5
+                    }),
+                    call_id: Some("e2".to_string()),
+                }],
+            },
+            MockStep::FinalText {
+                text: "DONE".to_string(),
+            },
+        ],
+    };
+    let provider: Arc<dyn deepagents::provider::Provider> =
+        Arc::new(MockProvider::from_script(script));
+    let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
+    let agent = deepagents::create_deep_agent_with_backend(backend);
+
+    let mut runner = ResumableRunner::new(
+        agent,
+        provider,
+        Vec::new(),
+        ResumableRunnerOptions {
+            config: deepagents::runtime::RuntimeConfig {
+                max_steps: 8,
+                provider_timeout_ms: 1000,
+            },
+            approval: Some(Arc::new(DefaultApprovalPolicy::new(Vec::<String>::new()))),
+            audit: None,
+            root: root.to_string_lossy().to_string(),
+            mode: ExecutionMode::Interactive,
+            interrupt_on: BTreeMap::new(),
+        },
+    );
+
+    runner.push_user_input("go".to_string());
+    let out1 = runner.run().await;
+    assert_eq!(out1.status, RunStatus::Interrupted);
+    assert_eq!(out1.interrupts.len(), 1);
+    assert_eq!(out1.interrupts[0].tool_name, "execute");
+    assert!(out1
+        .tool_results
+        .iter()
+        .all(|record| record.tool_name != "execute"));
+
+    let out2 = runner
+        .resume(
+            "e2",
+            HitlDecision::Edit {
+                args: serde_json::json!({
+                    "command": "echo edited",
+                    "timeout": 5
+                }),
+            },
+        )
+        .await;
+    assert_eq!(out2.status, RunStatus::Completed);
+    assert_eq!(out2.final_text, "DONE");
+    let execute_record = out2
+        .tool_results
+        .iter()
+        .find(|record| record.tool_name == "execute")
+        .unwrap();
+    assert_eq!(execute_record.status.as_deref(), Some("edited"));
+    assert_eq!(
+        execute_record
+            .output
+            .get("exit_code")
+            .and_then(|value| value.as_i64()),
+        Some(0)
+    );
 }

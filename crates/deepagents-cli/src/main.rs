@@ -7,11 +7,6 @@ use deepagents::audit::{AuditEvent, AuditSink};
 use deepagents::memory::MemoryStore;
 use tracing_subscriber::EnvFilter;
 
-struct ProviderInitBundle {
-    provider: std::sync::Arc<dyn deepagents::provider::Provider>,
-    diagnostics: deepagents::provider::ProviderDiagnostics,
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "deepagents", version, about = "deepagents (Rust)")]
 struct Args {
@@ -58,6 +53,14 @@ enum Cmd {
         api_key: Option<String>,
         #[arg(long)]
         api_key_env: Option<String>,
+        #[arg(long)]
+        tool_choice: Option<String>,
+        #[arg(long)]
+        structured_output_schema: Option<String>,
+        #[arg(long)]
+        structured_output_name: Option<String>,
+        #[arg(long)]
+        structured_output_description: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
         #[arg(long)]
@@ -447,6 +450,10 @@ async fn main() -> Result<()> {
             base_url,
             api_key,
             api_key_env,
+            tool_choice,
+            structured_output_schema,
+            structured_output_name,
+            structured_output_description,
             thread_id,
             mock_script,
             plugin,
@@ -484,6 +491,17 @@ async fn main() -> Result<()> {
             )?;
             let provider_id = provider.clone();
             let provider = provider_bundle.provider;
+            let tool_choice = resolve_tool_choice(tool_choice.as_deref())?;
+            let structured_output = resolve_structured_output(
+                structured_output_schema.as_deref(),
+                structured_output_name.as_deref(),
+                structured_output_description.as_deref(),
+            )?;
+            ensure_provider_request_supported(
+                &provider_bundle.diagnostics,
+                &tool_choice,
+                structured_output.as_ref(),
+            )?;
             if stream_events {
                 eprintln!("{}", serde_json::to_string(&provider_bundle.diagnostics)?);
             }
@@ -651,7 +669,11 @@ async fn main() -> Result<()> {
                 },
             )
             .with_runtime_middlewares(runtime_middlewares)
-            .with_initial_state(initial_state);
+            .with_initial_state(initial_state)
+            .with_tool_choice(tool_choice);
+            if let Some(structured_output) = structured_output {
+                runner = runner.with_structured_output(structured_output);
+            }
 
             runner.push_user_input(input);
             let use_event_stream = events_jsonl.is_some() || stream_events;
@@ -931,6 +953,90 @@ fn resolve_execution_mode(flag: Option<&str>) -> ExecutionMode {
     }
 }
 
+fn resolve_tool_choice(flag: Option<&str>) -> Result<deepagents::provider::ToolChoice> {
+    let Some(flag) = flag.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(deepagents::provider::ToolChoice::Auto);
+    };
+
+    match flag {
+        "auto" => Ok(deepagents::provider::ToolChoice::Auto),
+        "none" => Ok(deepagents::provider::ToolChoice::None),
+        "required" => Ok(deepagents::provider::ToolChoice::Required),
+        _ => {
+            if let Some(name) = flag.strip_prefix("named:") {
+                let name = name.trim();
+                if name.is_empty() {
+                    anyhow::bail!("invalid --tool-choice: named tool cannot be empty");
+                }
+                return Ok(deepagents::provider::ToolChoice::Named {
+                    name: name.to_string(),
+                });
+            }
+            anyhow::bail!("invalid --tool-choice: expected auto|none|required|named:<tool>")
+        }
+    }
+}
+
+fn resolve_structured_output(
+    schema_flag: Option<&str>,
+    name_flag: Option<&str>,
+    description_flag: Option<&str>,
+) -> Result<Option<deepagents::provider::StructuredOutputSpec>> {
+    let Some(schema_flag) = schema_flag.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    let schema_source = if let Some(path) = schema_flag.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("invalid --structured-output-schema @file: {e}"))?
+    } else {
+        schema_flag.to_string()
+    };
+    let schema = serde_json::from_str(&schema_source)
+        .map_err(|e| anyhow!("invalid --structured-output-schema json: {e}"))?;
+    let spec = deepagents::provider::StructuredOutputSpec {
+        name: name_flag
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("structured_output")
+            .to_string(),
+        schema,
+        description: description_flag
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        strict: true,
+    };
+    spec.validate()?;
+    Ok(Some(spec))
+}
+
+fn ensure_provider_request_supported(
+    diagnostics: &deepagents::provider::ProviderDiagnostics,
+    tool_choice: &deepagents::provider::ToolChoice,
+    structured_output: Option<&deepagents::provider::StructuredOutputSpec>,
+) -> Result<()> {
+    if structured_output.is_some() && !diagnostics.supports_structured_output() {
+        anyhow::bail!(
+            "provider_unsupported_structured_output: {}",
+            diagnostics.provider_id
+        );
+    }
+
+    if matches!(
+        tool_choice,
+        deepagents::provider::ToolChoice::Required | deepagents::provider::ToolChoice::Named { .. }
+    ) && !diagnostics.supports_tool_choice()
+    {
+        anyhow::bail!(
+            "provider_unsupported_tool_calling: {}",
+            diagnostics.provider_id
+        );
+    }
+
+    Ok(())
+}
+
 fn resolve_audit_path(flag: Option<&str>) -> Option<String> {
     flag.map(|s| s.to_string())
         .or_else(|| std::env::var("DEEPAGENTS_AUDIT_JSON").ok())
@@ -1017,35 +1123,31 @@ fn build_provider_bundle(
     base_url: Option<String>,
     api_key: Option<String>,
     api_key_env: Option<String>,
-) -> Result<ProviderInitBundle> {
+) -> Result<deepagents::provider::ProviderInitBundle> {
     match provider_id {
         "mock" => {
             let path = mock_script
                 .ok_or_else(|| anyhow!("--mock-script is required for --provider mock"))?;
             let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-            Ok(ProviderInitBundle {
-                provider: std::sync::Arc::new(
-                    deepagents::provider::mock::MockProvider::from_script(script),
-                ),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: provider_id.to_string(),
-                    llm_capabilities: None,
+            Ok(deepagents::provider::build_provider_bundle(
+                provider_id,
+                deepagents::provider::ProviderInitSpec::Mock {
+                    script,
+                    omit_call_ids: false,
                 },
-            })
+            ))
         }
         "mock2" => {
             let path = mock_script
                 .ok_or_else(|| anyhow!("--mock-script is required for --provider mock2"))?;
             let script = deepagents::provider::mock::MockProvider::load_from_file(&path)?;
-            Ok(ProviderInitBundle {
-                provider: std::sync::Arc::new(
-                    deepagents::provider::mock::MockProvider::from_script_without_call_ids(script),
-                ),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: provider_id.to_string(),
-                    llm_capabilities: None,
+            Ok(deepagents::provider::build_provider_bundle(
+                provider_id,
+                deepagents::provider::ProviderInitSpec::Mock {
+                    script,
+                    omit_call_ids: true,
                 },
-            })
+            ))
         }
         "openai-compatible" | "openai_compatible" => {
             let model = model
@@ -1065,22 +1167,10 @@ fn build_provider_bundle(
             if let Some(api_key) = api_key {
                 config = config.with_api_key(api_key);
             }
-            let llm_provider =
-                std::sync::Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
-                    config,
-                    std::sync::Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
-                ));
-            Ok(ProviderInitBundle {
-                provider: std::sync::Arc::new(deepagents::provider::LlmProviderAdapter::new(
-                    llm_provider.clone(),
-                )),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: provider_id.to_string(),
-                    llm_capabilities: Some(deepagents::provider::LlmProvider::capabilities(
-                        llm_provider.as_ref(),
-                    )),
-                },
-            })
+            Ok(deepagents::provider::build_provider_bundle(
+                provider_id,
+                deepagents::provider::ProviderInitSpec::OpenAiCompatible { config },
+            ))
         }
         other => Err(anyhow!("unknown --provider: {other}")),
     }

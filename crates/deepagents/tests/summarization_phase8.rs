@@ -9,6 +9,7 @@ fn build_message(role: &str, content: &str) -> Message {
         role: role.to_string(),
         content: content.to_string(),
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -21,6 +22,7 @@ fn build_tool_message(content: &str, name: &str, args: serde_json::Value) -> Mes
         role: "assistant".to_string(),
         content: content.to_string(),
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
             name: name.to_string(),

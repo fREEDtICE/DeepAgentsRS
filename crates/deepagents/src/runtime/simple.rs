@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::approval::{ApprovalPolicy, ExecutionMode};
 use crate::audit::AuditSink;
-use crate::provider::Provider;
+use crate::provider::{Provider, StructuredOutputSpec, ToolChoice};
 use crate::runtime::events::RunEventSink;
 use crate::runtime::protocol::{
     RunOutput, Runtime, RuntimeConfig, RuntimeMiddleware, StreamingRuntime,
@@ -25,6 +25,8 @@ pub struct SimpleRuntime {
     audit: Option<Arc<dyn AuditSink>>,
     root: String,
     mode: ExecutionMode,
+    tool_choice: ToolChoice,
+    structured_output: Option<StructuredOutputSpec>,
     runtime_middlewares: Vec<Arc<dyn RuntimeMiddleware>>,
     initial_state: AgentState,
     task_depth: usize,
@@ -61,6 +63,8 @@ impl SimpleRuntime {
             audit,
             root,
             mode,
+            tool_choice: ToolChoice::Auto,
+            structured_output: None,
             runtime_middlewares: Vec::new(),
             initial_state: AgentState::default(),
             task_depth: 0,
@@ -85,6 +89,16 @@ impl SimpleRuntime {
         self
     }
 
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = tool_choice;
+        self
+    }
+
+    pub fn with_structured_output(mut self, structured_output: StructuredOutputSpec) -> Self {
+        self.structured_output = Some(structured_output);
+        self
+    }
+
     pub async fn run_with_events(
         &self,
         messages: Vec<Message>,
@@ -95,7 +109,7 @@ impl SimpleRuntime {
     }
 
     fn build_runner(&self, messages: Vec<Message>) -> ResumableRunner {
-        ResumableRunner::new(
+        let runner = ResumableRunner::new(
             self.agent.clone(),
             self.provider.clone(),
             self.skills.clone(),
@@ -112,6 +126,13 @@ impl SimpleRuntime {
         .with_initial_state(self.initial_state.clone())
         .with_initial_messages(messages)
         .with_task_depth(self.task_depth)
+        .with_tool_choice(self.tool_choice.clone());
+
+        if let Some(structured_output) = self.structured_output.clone() {
+            runner.with_structured_output(structured_output)
+        } else {
+            runner
+        }
     }
 }
 

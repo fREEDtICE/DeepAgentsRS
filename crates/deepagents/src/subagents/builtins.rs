@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::provider::mock::{MockProvider, MockScript, MockStep};
 use crate::provider::ProviderToolCall;
 use crate::runtime::simple::SimpleRuntime;
-use crate::runtime::{Runtime, RuntimeConfig};
+use crate::runtime::{RunStatus, Runtime, RuntimeConfig};
 use crate::subagents::protocol::{CompiledSubAgent, SubAgentRunOutput, SubAgentRunRequest};
 use crate::subagents::registry::InMemorySubAgentRegistry;
 use crate::subagents::SubAgentRegistry;
@@ -345,12 +345,25 @@ impl CompiledSubAgent for RuntimeMockSubAgent {
         let out = runtime.run(req.messages).await;
         let text = match self.output_mode {
             RuntimeMockOutputMode::FinalText => out.final_text,
-            RuntimeMockOutputMode::LastToolError => out
-                .tool_results
-                .iter()
-                .rev()
-                .find_map(|r| r.error.clone())
-                .unwrap_or_else(|| "no_error".to_string()),
+            RuntimeMockOutputMode::LastToolError => {
+                if let Some(err) = out.tool_results.iter().rev().find_map(|r| r.error.clone()) {
+                    err
+                } else if let Some(error) = out.error.as_ref() {
+                    format!("runtime_error: {}: {}", error.code, error.message)
+                } else if out.status == RunStatus::Interrupted {
+                    out.interrupts
+                        .first()
+                        .map(|i| {
+                            format!(
+                                "runtime_interrupted: tool={} tool_call_id={}",
+                                i.tool_name, i.tool_call_id
+                            )
+                        })
+                        .unwrap_or_else(|| "runtime_interrupted".to_string())
+                } else {
+                    "no_error".to_string()
+                }
+            }
         };
 
         Ok(SubAgentRunOutput {

@@ -41,8 +41,8 @@ async fn post_stream(
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
-fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
-    let mut events = Vec::new();
+fn parse_sse_payloads(body: &str, expected_event: &str) -> Vec<serde_json::Value> {
+    let mut payloads = Vec::new();
     for chunk in body.split("\n\n") {
         let mut event_name = None;
         let mut data = None;
@@ -54,13 +54,17 @@ fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
                 data = Some(rest.to_string());
             }
         }
-        if event_name.as_deref() == Some("run_event") {
+        if event_name.as_deref() == Some(expected_event) {
             if let Some(data) = data {
-                events.push(serde_json::from_str(&data).unwrap());
+                payloads.push(serde_json::from_str(&data).unwrap());
             }
         }
     }
-    events
+    payloads
+}
+
+fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
+    parse_sse_payloads(body, "run_event")
 }
 
 async fn get(app: axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
@@ -327,6 +331,13 @@ async fn phase3_run_stream_emits_sse_events() {
     .await;
 
     assert_eq!(st, StatusCode::OK);
+    let provider_info = parse_sse_payloads(&body, "provider_info");
+    assert_eq!(provider_info.len(), 1);
+    assert_eq!(provider_info[0]["provider_id"], "mock");
+    assert_eq!(
+        provider_info[0]["surface_capabilities"]["supports_tool_choice"],
+        true
+    );
     let events = parse_sse_events(&body);
     assert!(events.iter().any(|event| event["type"] == "run_started"));
     assert!(events
@@ -450,8 +461,82 @@ async fn phase3_openai_compatible_run_works() {
         true
     );
     assert_eq!(
+        v["result"]["provider_info"]["surface_capabilities"]["supports_provider_streaming"],
+        true
+    );
+    assert_eq!(
+        v["result"]["provider_info"]["surface_capabilities"]["reports_usage"],
+        true
+    );
+    assert_eq!(
         v["result"]["provider_info"]["llm_capabilities"]["supports_structured_output"],
-        false
+        true
+    );
+    assert_eq!(
+        v["result"]["provider_info"]["llm_capabilities"]["multimodal"]["input_image_roles"]["user"],
+        true
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phase3_openai_compatible_run_returns_structured_output() {
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_addr = provider_listener.local_addr().unwrap();
+    let provider_app = Router::new().route("/chat/completions", post(openai_structured_handler));
+    tokio::spawn(async move {
+        axum::serve(provider_listener, provider_app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let app = deepagents_acp::server::router();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let (_, v) = post_json(
+        app.clone(),
+        "/new_session",
+        serde_json::json!({
+            "root": root.to_string_lossy(),
+            "execution_mode": "non_interactive"
+        }),
+    )
+    .await;
+    let session_id = v["result"]["session_id"].as_str().unwrap().to_string();
+
+    let (st, v) = post_json(
+        app,
+        "/run",
+        serde_json::json!({
+            "session_id": session_id,
+            "provider": "openai-compatible",
+            "model": "gpt-4o-mini",
+            "base_url": format!("http://{}", provider_addr),
+            "input": "hello",
+            "structured_output": {
+                "name": "final_answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": { "type": "string" }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+    assert_eq!(
+        v["result"]["output"]["final_text"],
+        "{\"summary\":\"done\"}"
+    );
+    assert_eq!(
+        v["result"]["output"]["structured_output"]["summary"],
+        "done"
     );
 }
 
@@ -494,6 +579,16 @@ async fn phase3_openai_compatible_run_stream_emits_deltas() {
     .await;
 
     assert_eq!(st, StatusCode::OK);
+    let provider_info = parse_sse_payloads(&body, "provider_info");
+    assert_eq!(provider_info.len(), 1);
+    assert_eq!(
+        provider_info[0]["surface_capabilities"]["supports_provider_streaming"],
+        true
+    );
+    assert_eq!(
+        provider_info[0]["surface_capabilities"]["reports_usage"],
+        true
+    );
     let events = parse_sse_events(&body);
     assert!(events
         .iter()
@@ -519,6 +614,28 @@ async fn openai_chat_handler(Json(body): Json<serde_json::Value>) -> Json<serde_
             "prompt_tokens": 5,
             "completion_tokens": 2,
             "total_tokens": 7
+        }
+    }))
+}
+
+async fn openai_structured_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"],
+        "final_answer"
+    );
+    Json(serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"summary\":\"done\"}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 4,
+            "total_tokens": 9
         }
     }))
 }

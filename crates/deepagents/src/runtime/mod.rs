@@ -12,6 +12,7 @@ pub mod resumable_runner;
 pub mod simple;
 pub mod skills_middleware;
 pub mod stable_hash;
+pub mod structured_output;
 pub mod summarization_middleware;
 pub mod todolist_middleware;
 pub mod tool_compat;
@@ -38,6 +39,7 @@ pub use provider_cache::{
 };
 pub use resumable_runner::{ResumableRunner, ResumableRunnerOptions};
 pub use skills_middleware::SkillsMiddleware;
+pub use structured_output::parse_structured_output;
 pub use summarization_middleware::{
     FilesystemSummarizationStore, SummarizationEvent, SummarizationMiddleware,
     SummarizationOptions, SummarizationPolicyKind, SummarizationStore,

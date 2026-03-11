@@ -13,7 +13,7 @@ use deepagents::approval::{
     ExecutionMode,
 };
 use deepagents::audit::{AuditEvent, AuditSink};
-use deepagents::provider::mock::{MockProvider, MockScript};
+use deepagents::provider::mock::MockScript;
 use deepagents::state::AgentState;
 use deepagents::{create_deep_agent_with_backend, create_local_sandbox_backend, DeepAgent};
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,10 @@ struct RunRequest {
     api_key: Option<String>,
     #[serde(default)]
     api_key_env: Option<String>,
+    #[serde(default)]
+    tool_choice: Option<deepagents::provider::ToolChoice>,
+    #[serde(default)]
+    structured_output: Option<deepagents::provider::StructuredOutputSpec>,
     #[serde(default)]
     mock_script: Option<Value>,
     input: String,
@@ -469,6 +473,9 @@ async fn run_session_stream(
     let session = prepare_run_session(&st, &req).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    if let Some(provider_info) = session.lock().await.provider_info.clone() {
+        let _ = tx.send(SsePayload::ProviderInfo(provider_info)).await;
+    }
     tokio::spawn(async move {
         let mut sink = ChannelRunEventSink { tx };
         let _ = execute_run_stream(session, &mut sink).await;
@@ -505,6 +512,9 @@ async fn resume_session_stream(
     let session = prepare_resume_session(&st, &req).await?;
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
+    if let Some(provider_info) = session.lock().await.provider_info.clone() {
+        let _ = tx.send(SsePayload::ProviderInfo(provider_info)).await;
+    }
     tokio::spawn(async move {
         let mut sink = ChannelRunEventSink { tx };
         let _ = execute_resume_stream(session, req, &mut sink).await;
@@ -795,6 +805,7 @@ fn interrupt_not_found_output(session: &Session, message: &str) -> deepagents::r
             code: "interrupt_not_found".to_string(),
             message: message.to_string(),
         }),
+        structured_output: None,
         summarization_events: None,
         trace: None,
     }
@@ -840,6 +851,24 @@ fn ensure_runner_initialized(
     }
 
     let provider_bundle = build_provider_bundle(req)?;
+    if let Some(spec) = req.structured_output.as_ref() {
+        if let Err(error) = spec.validate() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                resp_err(
+                    "invalid_request",
+                    "invalid structured_output",
+                    Some(json!({ "error": error.to_string() })),
+                ),
+            ));
+        }
+    }
+    let tool_choice = req.tool_choice.clone().unwrap_or_default();
+    ensure_provider_request_supported(
+        &provider_bundle.diagnostics,
+        &tool_choice,
+        req.structured_output.as_ref(),
+    )?;
     let provider = provider_bundle.provider;
     session.provider_info = Some(provider_bundle.diagnostics);
 
@@ -941,26 +970,30 @@ fn ensure_runner_initialized(
         interrupt_on.insert(k.to_string(), true);
     }
 
-    session.runner = Some(
-        deepagents::runtime::ResumableRunner::new(
-            session.agent.clone(),
-            provider,
-            vec![],
-            deepagents::runtime::ResumableRunnerOptions {
-                config: deepagents::runtime::RuntimeConfig {
-                    max_steps: req.max_steps.unwrap_or(8),
-                    provider_timeout_ms: req.provider_timeout_ms.unwrap_or(1000),
-                },
-                approval: Some(session.approval.clone()),
-                audit: session.audit.clone(),
-                root: session.root.clone(),
-                mode: session.mode,
-                interrupt_on,
+    let mut runner = deepagents::runtime::ResumableRunner::new(
+        session.agent.clone(),
+        provider,
+        vec![],
+        deepagents::runtime::ResumableRunnerOptions {
+            config: deepagents::runtime::RuntimeConfig {
+                max_steps: req.max_steps.unwrap_or(8),
+                provider_timeout_ms: req.provider_timeout_ms.unwrap_or(1000),
             },
-        )
-        .with_runtime_middlewares(runtime_middlewares)
-        .with_initial_state(session.state.clone()),
-    );
+            approval: Some(session.approval.clone()),
+            audit: session.audit.clone(),
+            root: session.root.clone(),
+            mode: session.mode,
+            interrupt_on,
+        },
+    )
+    .with_runtime_middlewares(runtime_middlewares)
+    .with_initial_state(session.state.clone())
+    .with_tool_choice(tool_choice);
+    if let Some(structured_output) = req.structured_output.clone() {
+        runner = runner.with_structured_output(structured_output);
+    }
+
+    session.runner = Some(runner);
 
     Ok(())
 }
@@ -990,27 +1023,27 @@ fn parse_mock_script(mock_script: Option<Value>) -> Result<MockScript, (StatusCo
 
 fn build_provider_bundle(
     req: &RunRequest,
-) -> Result<ProviderInitBundle, (StatusCode, Json<Value>)> {
+) -> Result<deepagents::provider::ProviderInitBundle, (StatusCode, Json<Value>)> {
     match req.provider.as_str() {
         "mock" => {
             let script = parse_mock_script(req.mock_script.clone())?;
-            Ok(ProviderInitBundle {
-                provider: Arc::new(MockProvider::from_script(script)),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: req.provider.clone(),
-                    llm_capabilities: None,
+            Ok(deepagents::provider::build_provider_bundle(
+                req.provider.clone(),
+                deepagents::provider::ProviderInitSpec::Mock {
+                    script,
+                    omit_call_ids: false,
                 },
-            })
+            ))
         }
         "mock2" => {
             let script = parse_mock_script(req.mock_script.clone())?;
-            Ok(ProviderInitBundle {
-                provider: Arc::new(MockProvider::from_script_without_call_ids(script)),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: req.provider.clone(),
-                    llm_capabilities: None,
+            Ok(deepagents::provider::build_provider_bundle(
+                req.provider.clone(),
+                deepagents::provider::ProviderInitSpec::Mock {
+                    script,
+                    omit_call_ids: true,
                 },
-            })
+            ))
         }
         "openai-compatible" | "openai_compatible" => {
             let model = req.model.clone().ok_or_else(|| {
@@ -1044,21 +1077,10 @@ fn build_provider_bundle(
             if let Some(api_key) = api_key {
                 config = config.with_api_key(api_key);
             }
-            let llm_provider = Arc::new(deepagents::provider::OpenAiCompatibleProvider::new(
-                config,
-                Arc::new(deepagents::provider::ReqwestOpenAiTransport::new()),
-            ));
-            Ok(ProviderInitBundle {
-                provider: Arc::new(deepagents::provider::LlmProviderAdapter::new(
-                    llm_provider.clone(),
-                )),
-                diagnostics: deepagents::provider::ProviderDiagnostics {
-                    provider_id: req.provider.clone(),
-                    llm_capabilities: Some(deepagents::provider::LlmProvider::capabilities(
-                        llm_provider.as_ref(),
-                    )),
-                },
-            })
+            Ok(deepagents::provider::build_provider_bundle(
+                req.provider.clone(),
+                deepagents::provider::ProviderInitSpec::OpenAiCompatible { config },
+            ))
         }
         other => Err((
             StatusCode::BAD_REQUEST,
@@ -1071,34 +1093,73 @@ fn build_provider_bundle(
     }
 }
 
+fn ensure_provider_request_supported(
+    diagnostics: &deepagents::provider::ProviderDiagnostics,
+    tool_choice: &deepagents::provider::ToolChoice,
+    structured_output: Option<&deepagents::provider::StructuredOutputSpec>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if structured_output.is_some() && !diagnostics.supports_structured_output() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            resp_err(
+                "invalid_request",
+                "provider does not support structured_output",
+                Some(json!({ "provider": diagnostics.provider_id.as_str() })),
+            ),
+        ));
+    }
+
+    if matches!(
+        tool_choice,
+        deepagents::provider::ToolChoice::Required | deepagents::provider::ToolChoice::Named { .. }
+    ) && !diagnostics.supports_tool_choice()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            resp_err(
+                "invalid_request",
+                "provider does not support tool_choice",
+                Some(json!({ "provider": diagnostics.provider_id.as_str() })),
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 fn sse_from_receiver(
-    rx: tokio::sync::mpsc::Receiver<deepagents::runtime::RunEvent>,
+    rx: tokio::sync::mpsc::Receiver<SsePayload>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = ReceiverStream::new(rx).map(|event| {
-        let json = serde_json::to_string(&event)
-            .unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
-        Ok(Event::default().event("run_event").data(json))
+    let stream = ReceiverStream::new(rx).map(|payload| {
+        let (event_name, json) = match payload {
+            SsePayload::ProviderInfo(provider_info) => {
+                ("provider_info", serde_json::to_string(&provider_info))
+            }
+            SsePayload::RunEvent(event) => ("run_event", serde_json::to_string(&event)),
+        };
+        let data = json.unwrap_or_else(|_| "{\"type\":\"serialization_error\"}".to_string());
+        Ok(Event::default().event(event_name).data(data))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+enum SsePayload {
+    ProviderInfo(deepagents::provider::ProviderDiagnostics),
+    RunEvent(deepagents::runtime::RunEvent),
+}
+
 struct ChannelRunEventSink {
-    tx: tokio::sync::mpsc::Sender<deepagents::runtime::RunEvent>,
+    tx: tokio::sync::mpsc::Sender<SsePayload>,
 }
 
 #[async_trait::async_trait]
 impl deepagents::runtime::RunEventSink for ChannelRunEventSink {
     async fn emit(&mut self, event: deepagents::runtime::RunEvent) -> anyhow::Result<()> {
         self.tx
-            .send(event)
+            .send(SsePayload::RunEvent(event))
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
-}
-
-struct ProviderInitBundle {
-    provider: Arc<dyn deepagents::provider::Provider>,
-    diagnostics: deepagents::provider::ProviderDiagnostics,
 }
 
 fn mode_str(mode: ExecutionMode) -> String {

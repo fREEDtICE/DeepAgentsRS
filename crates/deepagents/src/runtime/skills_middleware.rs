@@ -98,6 +98,7 @@ impl RuntimeMiddleware for SkillsMiddleware {
                     role: "system".to_string(),
                     content: block,
                     content_blocks: None,
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,

@@ -10,6 +10,12 @@ pub enum ExecutionMode {
     Interactive,
 }
 
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::NonInteractive
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub command: String,

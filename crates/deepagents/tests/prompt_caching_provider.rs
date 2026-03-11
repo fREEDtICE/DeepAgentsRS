@@ -4,7 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use deepagents::approval::ExecutionMode;
-use deepagents::provider::{Provider, ProviderEventCollector, ProviderRequest, ProviderStep};
+use deepagents::provider::{
+    Provider, ProviderEventCollector, ProviderRequest, ProviderStep, ProviderStepOutput,
+};
 use deepagents::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use deepagents::runtime::{
     CacheBackend, PromptCacheOptions, PromptCachingMiddleware, ProviderStepKind, RunEvent,
@@ -93,6 +95,14 @@ impl Provider for StreamingSingleCallProvider {
             text: "OK".to_string(),
         })
     }
+
+    async fn step_output_with_collector(
+        &self,
+        req: ProviderRequest,
+        collector: &mut dyn ProviderEventCollector,
+    ) -> anyhow::Result<ProviderStepOutput> {
+        Ok(self.step_with_collector(req, collector).await?.into())
+    }
 }
 
 fn build_runtime(
@@ -178,6 +188,7 @@ async fn pc_01_off_produces_no_cache_events() {
             role: "system".to_string(),
             content: "SECRET_SHOULD_NOT_LEAK".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -216,6 +227,7 @@ async fn pc_02_l2_hit_short_circuits_provider_on_second_run() {
             role: "system".to_string(),
             content: "SYS".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -225,6 +237,7 @@ async fn pc_02_l2_hit_short_circuits_provider_on_second_run() {
             role: "user".to_string(),
             content: "hi".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -266,6 +279,7 @@ async fn pk_01_l1_hits_when_only_user_message_changes() {
         role: "system".to_string(),
         content: "SYS".to_string(),
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -280,6 +294,7 @@ async fn pk_01_l1_hits_when_only_user_message_changes() {
                     role: "user".to_string(),
                     content: "a".to_string(),
                     content_blocks: None,
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -297,6 +312,7 @@ async fn pk_01_l1_hits_when_only_user_message_changes() {
                     role: "user".to_string(),
                     content: "b".to_string(),
                     content_blocks: None,
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -365,6 +381,7 @@ async fn pc_03_tools_change_causes_l1_miss() {
             role: "system".to_string(),
             content: "SYS".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -374,6 +391,7 @@ async fn pc_03_tools_change_causes_l1_miss() {
             role: "user".to_string(),
             content: "hi".to_string(),
             content_blocks: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -422,6 +440,7 @@ async fn pk_03_system_change_causes_l1_miss() {
                 role: "system".to_string(),
                 content: "A".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -431,6 +450,7 @@ async fn pk_03_system_change_causes_l1_miss() {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -444,6 +464,7 @@ async fn pk_03_system_change_causes_l1_miss() {
                 role: "system".to_string(),
                 content: "B".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -453,6 +474,7 @@ async fn pk_03_system_change_causes_l1_miss() {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -499,6 +521,7 @@ async fn pc_07_secret_never_appears_in_cache_events() {
                 role: "system".to_string(),
                 content: "SECRET_TOKEN_ABC123".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -508,6 +531,7 @@ async fn pc_07_secret_never_appears_in_cache_events() {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 content_blocks: None,
+                reasoning_content: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -544,6 +568,7 @@ async fn pc_08_l2_hit_in_streaming_runtime_skips_delta_replay() {
         role: "user".to_string(),
         content: "hi".to_string(),
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,

@@ -43,6 +43,12 @@ pub fn normalize_messages(messages: Vec<Message>) -> Vec<Message> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        if msg.reasoning_content.is_none() {
+                            msg.reasoning_content = map
+                                .get("reasoning_content")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                        }
                         msg.tool_calls = Some(calls);
                     }
                 }

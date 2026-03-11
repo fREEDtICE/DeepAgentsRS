@@ -267,21 +267,18 @@ fn phase2_run_path_does_not_bypass_policy_deny() {
         &[],
         "do it",
     );
-    assert!(!st.success());
-    assert_eq!(st.code(), Some(2));
-    assert_eq!(
-        v.get("status").and_then(|s| s.as_str()),
-        Some("interrupted")
-    );
-    let interrupt = v
-        .get("interrupts")
+    assert!(st.success());
+    assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("completed"));
+    let err = v
+        .get("tool_results")
         .and_then(|v| v.as_array())
-        .and_then(|v| v.get(0))
-        .unwrap();
-    assert_eq!(
-        interrupt.get("tool_name").and_then(|v| v.as_str()),
-        Some("execute")
-    );
+        .and_then(|arr| {
+            arr.iter()
+                .find(|record| record.get("tool_name").and_then(|v| v.as_str()) == Some("execute"))
+                .and_then(|record| record.get("error"))
+                .and_then(|v| v.as_str())
+        });
+    assert!(err.unwrap_or("").contains("command_not_allowed"));
 
     let lines = read_audit_lines(&audit_file);
     assert_eq!(lines.len(), 1);

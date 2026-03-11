@@ -87,8 +87,58 @@ async fn e2e_stream_events_print_provider_capabilities() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("\"provider_id\":\"openai-compatible\""));
+    assert!(stderr.contains("\"surface_capabilities\""));
+    assert!(stderr.contains("\"supports_provider_streaming\":true"));
+    assert!(stderr.contains("\"reports_usage\":true"));
     assert!(stderr.contains("\"supports_streaming\":true"));
-    assert!(stderr.contains("\"supports_structured_output\":false"));
+    assert!(stderr.contains("\"supports_structured_output\":true"));
+    assert!(stderr.contains("\"multimodal\""));
+    assert!(stderr.contains("\"input_image_roles\":{\"user\":true}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_run_with_openai_structured_output() {
+    let app = Router::new().route("/chat/completions", post(chat_structured_output_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let bin = env!("CARGO_BIN_EXE_deepagents");
+    let out = Command::new(bin)
+        .args([
+            "--root",
+            root.to_string_lossy().as_ref(),
+            "run",
+            "--provider",
+            "openai-compatible",
+            "--model",
+            "gpt-4o-mini",
+            "--base-url",
+            &format!("http://{}", addr),
+            "--structured-output-name",
+            "final_answer",
+            "--structured-output-schema",
+            "{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"additionalProperties\":false}",
+            "--input",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["final_text"], "{\"summary\":\"done\"}");
+    assert_eq!(v["structured_output"]["summary"], "done");
 }
 
 async fn chat_json_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -107,6 +157,30 @@ async fn chat_json_handler(Json(body): Json<serde_json::Value>) -> Json<serde_js
             "prompt_tokens": 5,
             "completion_tokens": 1,
             "total_tokens": 6
+        }
+    }))
+}
+
+async fn chat_structured_output_handler(
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"],
+        "final_answer"
+    );
+    Json(serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "{\"summary\":\"done\"}"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 4,
+            "total_tokens": 9
         }
     }))
 }

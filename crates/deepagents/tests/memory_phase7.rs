@@ -96,6 +96,7 @@ async fn memory_middleware_injects_once_and_keeps_memory_private() {
         role: "user".to_string(),
         content: "hi".to_string(),
         content_blocks: None,
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
