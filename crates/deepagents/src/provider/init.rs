@@ -16,6 +16,7 @@ pub struct ProviderInitBundle {
     pub diagnostics: ProviderDiagnostics,
 }
 
+#[derive(Debug, Clone)]
 pub enum ProviderInitSpec {
     Mock {
         script: MockScript,
