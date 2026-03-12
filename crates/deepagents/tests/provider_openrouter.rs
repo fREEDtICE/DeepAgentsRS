@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::{Json, Router};
 use deepagents::llm::openai_compatible::{
-    OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice, OpenAiDelta,
-    OpenAiFunctionCall, OpenAiFunctionCallDelta, OpenAiMessage, OpenAiMessageContent,
-    OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
+    OpenAiChatChunk, OpenAiChatRequest, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice,
+    OpenAiCompatibleConfig, OpenAiCompatibleTransport, OpenAiDelta, OpenAiFunctionCall,
+    OpenAiFunctionCallDelta, OpenAiMessage, OpenAiMessageContent, OpenAiToolCall,
+    OpenAiToolCallDelta, OpenAiToolChoice, OpenAiUsage,
 };
 use deepagents::llm::{
     ChatMessage, ChatRequest, LlmEvent, LlmProvider, OpenRouterConfig, OpenRouterProvider,
@@ -22,6 +24,64 @@ struct CaptureState {
     referer_header: Arc<tokio::sync::Mutex<Option<String>>>,
     title_header: Arc<tokio::sync::Mutex<Option<String>>>,
     last_body: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+#[derive(Clone)]
+struct CaptureTransport {
+    response: OpenAiChatResponse,
+    chunks: Vec<OpenAiChatChunk>,
+    last_chat_request: Arc<std::sync::Mutex<Option<OpenAiChatRequest>>>,
+    last_stream_request: Arc<std::sync::Mutex<Option<OpenAiChatRequest>>>,
+}
+
+impl CaptureTransport {
+    fn new(response: OpenAiChatResponse, chunks: Vec<OpenAiChatChunk>) -> Self {
+        Self {
+            response,
+            chunks,
+            last_chat_request: Arc::new(std::sync::Mutex::new(None)),
+            last_stream_request: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn last_chat_request(&self) -> OpenAiChatRequest {
+        self.last_chat_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured chat request")
+    }
+
+    fn last_stream_request(&self) -> OpenAiChatRequest {
+        self.last_stream_request
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("captured stream request")
+    }
+}
+
+#[async_trait]
+impl OpenAiCompatibleTransport for CaptureTransport {
+    async fn create_chat_completion(
+        &self,
+        _config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChatResponse> {
+        *self.last_chat_request.lock().unwrap() = Some(request);
+        Ok(self.response.clone())
+    }
+
+    async fn stream_chat_completion(
+        &self,
+        _config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<deepagents::llm::openai_compatible::OpenAiChunkStream> {
+        *self.last_stream_request.lock().unwrap() = Some(request);
+        Ok(Box::pin(tokio_stream::iter(
+            self.chunks.clone().into_iter().map(Ok::<_, anyhow::Error>),
+        )))
+    }
 }
 
 fn sample_request() -> ChatRequest {
@@ -84,6 +144,8 @@ async fn openrouter_posts_headers_and_parses_chat_response() {
     );
     let body = state.last_body.lock().await.clone().unwrap();
     assert_eq!(body["model"], "openai/gpt-4o-mini");
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["stream"], false);
 }
 
 #[tokio::test]
@@ -136,6 +198,62 @@ async fn openrouter_stream_chat_parses_sse_chunks() {
         state.title_header.lock().await.as_deref(),
         Some("deepagents-stream-test")
     );
+    let body = state.last_body.lock().await.clone().unwrap();
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["stream"], true);
+}
+
+#[tokio::test]
+async fn openrouter_with_transport_applies_zeroclaw_request_defaults() {
+    let transport = Arc::new(CaptureTransport::new(
+        OpenAiChatResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        },
+        vec![OpenAiChatChunk {
+            choices: vec![OpenAiChunkChoice {
+                delta: OpenAiDelta {
+                    content: Some("done".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        }],
+    ));
+    let provider = OpenRouterProvider::with_transport(
+        OpenRouterConfig::new("openai/gpt-4o-mini"),
+        transport.clone(),
+    );
+
+    let _ = provider.chat(sample_request()).await.unwrap();
+    let chat_request = transport.last_chat_request();
+    assert_eq!(
+        chat_request.tool_choice,
+        Some(OpenAiToolChoice::Mode("auto".to_string()))
+    );
+    assert_eq!(chat_request.stream, Some(false));
+
+    let mut stream = provider.stream_chat(sample_request()).await.unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let stream_request = transport.last_stream_request();
+    assert_eq!(
+        stream_request.tool_choice,
+        Some(OpenAiToolChoice::Mode("auto".to_string()))
+    );
+    assert_eq!(stream_request.stream, Some(true));
 }
 
 async fn chat_handler(
