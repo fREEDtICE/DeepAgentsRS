@@ -24,6 +24,7 @@ tracing.workspace = true
 walkdir.workspace = true
 sha2.workspace = true
 hex.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 axum = "0.7"

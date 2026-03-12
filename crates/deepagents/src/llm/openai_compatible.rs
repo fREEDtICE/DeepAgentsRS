@@ -1,28 +1,23 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
-use crate::provider::llm::{
-    FunctionTool, LlmEvent, LlmEventStream, LlmProvider, LlmProviderCapabilities,
-    MultimodalCapabilities, MultimodalInputRoles, ToolsPayload,
+use crate::llm::common::{
+    build_data_url, finalize_assistant_text, parse_image_content_block, parse_sse_json_response,
+    send_openai_compatible_request,
 };
-use crate::provider::{
-    AssistantMessageMetadata, ProviderRequest, ProviderStep, ProviderStepOutput, ProviderToolCall,
-    ToolChoice,
+use crate::llm::{
+    AssistantMessageMetadata, ChatMessage, ChatRequest, ChatResponse, FunctionTool, LlmEvent,
+    LlmEventStream, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities,
+    MultimodalInputRoles, TokenUsage, ToolCall as LlmToolCall, ToolChoice, ToolSpec, ToolsPayload,
 };
-use crate::runtime::ToolSpec;
-use crate::types::{fallback_text_for_content_blocks, ContentBlock, Message};
-
-use super::transport::{OpenAiChunkStream, OpenAiCompatibleTransport};
-use super::wire::{
-    OpenAiChatRequest, OpenAiChatResponse, OpenAiContentPart, OpenAiFunctionCall,
-    OpenAiFunctionSpec, OpenAiJsonSchemaResponseFormat, OpenAiMessage, OpenAiMessageContent,
-    OpenAiResponseFormat, OpenAiTool, OpenAiToolCall, OpenAiToolChoice, OpenAiToolChoiceFunction,
-};
+use crate::types::{fallback_text_for_content_blocks, ContentBlock};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleConfig {
@@ -107,7 +102,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         Ok(ToolsPayload::FunctionTools { tools })
     }
 
-    async fn chat(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         let tools_payload = self.convert_tools(&req.tool_specs)?;
         let request = build_chat_request(
             &self.config.model,
@@ -123,7 +118,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
         parse_chat_response(response)
     }
 
-    async fn stream_chat(&self, req: ProviderRequest) -> anyhow::Result<LlmEventStream> {
+    async fn stream_chat(&self, req: ChatRequest) -> anyhow::Result<LlmEventStream> {
         let tools_payload = self.convert_tools(&req.tool_specs)?;
         let request = build_chat_request(
             &self.config.model,
@@ -140,9 +135,355 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
+pub type OpenAiChunkStream =
+    Pin<Box<dyn Stream<Item = anyhow::Result<OpenAiChatChunk>> + Send + 'static>>;
+
+#[async_trait]
+pub trait OpenAiCompatibleTransport: Send + Sync {
+    async fn create_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChatResponse>;
+
+    async fn stream_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChunkStream>;
+}
+
+#[derive(Clone)]
+pub struct MockOpenAiTransport {
+    response: Option<OpenAiChatResponse>,
+    chunks: Vec<OpenAiChatChunk>,
+}
+
+impl MockOpenAiTransport {
+    pub fn for_response(response: OpenAiChatResponse) -> Self {
+        Self {
+            response: Some(response),
+            chunks: Vec::new(),
+        }
+    }
+
+    pub fn for_chunks(chunks: Vec<OpenAiChatChunk>) -> Self {
+        Self {
+            response: None,
+            chunks,
+        }
+    }
+}
+
+#[async_trait]
+impl OpenAiCompatibleTransport for MockOpenAiTransport {
+    async fn create_chat_completion(
+        &self,
+        _config: &OpenAiCompatibleConfig,
+        _request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChatResponse> {
+        self.response
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("mock_openai_missing_response"))
+    }
+
+    async fn stream_chat_completion(
+        &self,
+        _config: &OpenAiCompatibleConfig,
+        _request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChunkStream> {
+        Ok(Box::pin(tokio_stream::iter(
+            self.chunks.clone().into_iter().map(Ok::<_, anyhow::Error>),
+        )))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ReqwestOpenAiTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestOpenAiTransport {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+
+    async fn send_request(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+        stream: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        send_openai_compatible_request(
+            &self.client,
+            &config.base_url,
+            config.api_key.as_deref(),
+            &request,
+            stream,
+            reqwest::header::HeaderMap::new(),
+            "openai_http_error",
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl OpenAiCompatibleTransport for ReqwestOpenAiTransport {
+    async fn create_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChatResponse> {
+        let response = self.send_request(config, request, false).await?;
+        Ok(response.json::<OpenAiChatResponse>().await?)
+    }
+
+    async fn stream_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChunkStream> {
+        let response = self.send_request(config, request, true).await?;
+        Ok(Box::pin(parse_sse_json_response(response)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiChatRequest {
+    pub model: String,
+    pub messages: Vec<OpenAiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<OpenAiTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<OpenAiToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<OpenAiResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<OpenAiMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum OpenAiMessageContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+impl From<String> for OpenAiMessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for OpenAiMessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<OpenAiImageUrl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+}
+
+impl OpenAiContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: Some(text.into()),
+            image_url: None,
+            refusal: None,
+        }
+    }
+
+    pub fn image_url(url: impl Into<String>) -> Self {
+        Self {
+            kind: "image_url".to_string(),
+            text: None,
+            image_url: Some(OpenAiImageUrl {
+                url: url.into(),
+                detail: None,
+            }),
+            refusal: None,
+        }
+    }
+
+    pub fn refusal(refusal: impl Into<String>) -> Self {
+        Self {
+            kind: "refusal".to_string(),
+            text: None,
+            image_url: None,
+            refusal: Some(refusal.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiImageUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OpenAiFunctionSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiFunctionSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum OpenAiToolChoice {
+    Mode(String),
+    Named {
+        #[serde(rename = "type")]
+        kind: String,
+        function: OpenAiToolChoiceFunction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiToolChoiceFunction {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub json_schema: OpenAiJsonSchemaResponseFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiJsonSchemaResponseFormat {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpenAiFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiChatResponse {
+    #[serde(default)]
+    pub choices: Vec<OpenAiChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiChoice {
+    pub message: OpenAiMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiChatChunk {
+    #[serde(default)]
+    pub choices: Vec<OpenAiChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiChunkChoice {
+    pub delta: OpenAiDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenAiDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<OpenAiMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiToolCallDelta {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAiFunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenAiFunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
 fn build_chat_request(
     model: &str,
-    req: &ProviderRequest,
+    req: &ChatRequest,
     tools_payload: &ToolsPayload,
     multimodal_input_roles: MultimodalInputRoles,
     stream: bool,
@@ -208,9 +549,7 @@ fn convert_openai_tool_choice(
     Ok(value)
 }
 
-fn convert_openai_response_format(
-    spec: &crate::provider::StructuredOutputSpec,
-) -> OpenAiResponseFormat {
+fn convert_openai_response_format(spec: &crate::llm::StructuredOutputSpec) -> OpenAiResponseFormat {
     OpenAiResponseFormat {
         kind: "json_schema".to_string(),
         json_schema: OpenAiJsonSchemaResponseFormat {
@@ -223,11 +562,11 @@ fn convert_openai_response_format(
 }
 
 fn convert_message(
-    message: &Message,
+    message: &ChatMessage,
     multimodal_input_roles: MultimodalInputRoles,
 ) -> OpenAiMessage {
     OpenAiMessage {
-        role: message.role.clone(),
+        role: message.role.as_str().to_string(),
         content: convert_openai_content(message, multimodal_input_roles),
         reasoning_content: message.reasoning_content.clone(),
         tool_calls: message.tool_calls.as_ref().map(|calls| {
@@ -249,7 +588,7 @@ fn convert_message(
 }
 
 fn convert_openai_content(
-    message: &Message,
+    message: &ChatMessage,
     multimodal_input_roles: MultimodalInputRoles,
 ) -> Option<OpenAiMessageContent> {
     let blocks = message.content_blocks.as_deref().unwrap_or(&[]);
@@ -285,7 +624,7 @@ fn convert_openai_content(
     }
 }
 
-fn fallback_openai_text_content(message: &Message) -> Option<OpenAiMessageContent> {
+fn fallback_openai_text_content(message: &ChatMessage) -> Option<OpenAiMessageContent> {
     if !message.content.is_empty() {
         return Some(OpenAiMessageContent::from(message.content.clone()));
     }
@@ -302,20 +641,25 @@ fn fallback_openai_text_content(message: &Message) -> Option<OpenAiMessageConten
     Some(OpenAiMessageContent::from(String::new()))
 }
 
-fn build_data_url(mime_type: &str, base64: &str) -> String {
-    format!("data:{mime_type};base64,{base64}")
-}
-
-pub fn parse_chat_response(response: OpenAiChatResponse) -> anyhow::Result<ProviderStepOutput> {
+pub fn parse_chat_response(response: OpenAiChatResponse) -> anyhow::Result<ChatResponse> {
+    let usage = response.usage.as_ref().map(|usage| TokenUsage {
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    });
     let Some(choice) = response.choices.into_iter().next() else {
         return Err(anyhow::anyhow!("openai_response_missing_choice"));
     };
-    parse_openai_message(choice.message)
+    let mut parsed = parse_openai_message(choice.message)?;
+    if let Some(usage) = usage {
+        parsed = parsed.with_usage(usage);
+    }
+    Ok(parsed)
 }
 
-fn parse_openai_message(message: OpenAiMessage) -> anyhow::Result<ProviderStepOutput> {
+fn parse_openai_message(message: OpenAiMessage) -> anyhow::Result<ChatResponse> {
     let parsed_content = parse_openai_message_content(message.content);
-    let text = finalized_assistant_text(
+    let text = finalize_assistant_text(
         parsed_content.text,
         &parsed_content.content_blocks,
         parsed_content.saw_multimodal_content,
@@ -333,26 +677,18 @@ fn parse_openai_message(message: OpenAiMessage) -> anyhow::Result<ProviderStepOu
             } else {
                 serde_json::from_str(&call.function.arguments)?
             };
-            calls.push(ProviderToolCall {
-                tool_name: call.function.name,
+            calls.push(LlmToolCall {
+                id: call.id,
+                name: call.function.name,
                 arguments,
-                call_id: Some(call.id),
             });
         }
-        if text.is_empty() {
-            return Ok(ProviderStepOutput::from(ProviderStep::ToolCalls { calls })
-                .with_assistant_metadata(metadata));
-        }
-        return Ok(
-            ProviderStepOutput::from(ProviderStep::AssistantMessageWithToolCalls { text, calls })
-                .with_assistant_metadata(metadata),
-        );
+        return Ok(ChatResponse::new(text)
+            .with_tool_calls(calls)
+            .with_assistant_metadata(metadata));
     }
 
-    Ok(
-        ProviderStepOutput::from(ProviderStep::FinalText { text })
-            .with_assistant_metadata(metadata),
-    )
+    Ok(ChatResponse::new(text).with_assistant_metadata(metadata))
 }
 
 fn stream_openai_chunks(
@@ -432,31 +768,14 @@ fn stream_openai_chunks(
             Err(anyhow::anyhow!("openai_stream_missing_finish"))?;
         }
 
-        let step = if state.tool_calls.is_empty() {
-            ProviderStep::FinalText {
-                text: finalized_assistant_text(
-                    state.text,
-                    &state.content_blocks,
-                    state.saw_multimodal_content,
-                ),
-            }
-        } else {
-            let calls = assemble_tool_calls(&state.tool_calls)?;
-            let text = finalized_assistant_text(
-                state.text,
-                &state.content_blocks,
-                state.saw_multimodal_content,
-            );
-            if text.is_empty() {
-                ProviderStep::ToolCalls { calls }
-            } else {
-                ProviderStep::AssistantMessageWithToolCalls {
-                    text,
-                    calls,
-                }
-            }
-        };
-        let output = ProviderStepOutput::from(step).with_assistant_metadata(AssistantMessageMetadata {
+        let calls = assemble_tool_calls(&state.tool_calls)?;
+        let response = ChatResponse::new(finalize_assistant_text(
+            state.text,
+            &state.content_blocks,
+            state.saw_multimodal_content,
+        ))
+        .with_tool_calls(calls)
+        .with_assistant_metadata(AssistantMessageMetadata {
             content_blocks: (!state.content_blocks.is_empty()).then_some(state.content_blocks),
             reasoning_content: if state.reasoning_content.is_empty() {
                 None
@@ -464,13 +783,13 @@ fn stream_openai_chunks(
                 Some(state.reasoning_content)
             },
         });
-        yield LlmEvent::FinalStep { output };
+        yield LlmEvent::FinalResponse { response };
     }
 }
 
 fn assemble_tool_calls(
     tool_calls: &BTreeMap<usize, PartialToolCall>,
-) -> anyhow::Result<Vec<ProviderToolCall>> {
+) -> anyhow::Result<Vec<LlmToolCall>> {
     let mut out = Vec::with_capacity(tool_calls.len());
     for partial in tool_calls.values() {
         let id = partial
@@ -486,10 +805,10 @@ fn assemble_tool_calls(
         } else {
             serde_json::from_str(&partial.arguments)?
         };
-        out.push(ProviderToolCall {
-            tool_name: name,
+        out.push(LlmToolCall {
+            id,
+            name,
             arguments,
-            call_id: Some(id),
         });
     }
     Ok(out)
@@ -554,7 +873,7 @@ fn parse_openai_message_content(content: Option<OpenAiMessageContent>) -> Parsed
                     "image_url" => {
                         saw_multimodal_content = true;
                         if let Some(image_url) = part.image_url {
-                            content_blocks.push(parse_openai_image_content_block(&image_url.url));
+                            content_blocks.push(parse_image_content_block(&image_url.url));
                         }
                     }
                     _ => {}
@@ -570,30 +889,49 @@ fn parse_openai_message_content(content: Option<OpenAiMessageContent>) -> Parsed
     }
 }
 
-fn parse_openai_image_content_block(url: &str) -> ContentBlock {
-    parse_data_url_content_block(url).unwrap_or_else(|| ContentBlock::image_url(url))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::common::parse_sse_json_bytes_stream;
+    use bytes::Bytes;
 
-fn parse_data_url_content_block(url: &str) -> Option<ContentBlock> {
-    let payload = url.strip_prefix("data:")?;
-    let (meta, base64) = payload.split_once(",")?;
-    let mime_type = meta.strip_suffix(";base64")?;
-    Some(ContentBlock::image_base64(mime_type, base64))
-}
+    #[tokio::test]
+    async fn parse_sse_json_bytes_stream_handles_utf8_split_across_chunks() {
+        let json = serde_json::json!({
+            "choices": [{
+                "delta": { "content": "你" },
+                "finish_reason": null
+            }]
+        });
+        let frame = format!("data: {}\n\n", json);
+        let bytes = frame.into_bytes();
 
-fn finalized_assistant_text(
-    text: String,
-    content_blocks: &[ContentBlock],
-    saw_multimodal_content: bool,
-) -> String {
-    if !text.is_empty() {
-        return text;
+        let needle = "你".as_bytes();
+        let pos = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("needle present");
+        let split = pos + 1;
+
+        let parts: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from(bytes[..split].to_vec())),
+            Ok(Bytes::from(bytes[split..].to_vec())),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let stream =
+            parse_sse_json_bytes_stream::<_, _, OpenAiChatChunk>(tokio_stream::iter(parts));
+        tokio::pin!(stream);
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.push(chunk.unwrap());
+        }
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].choices.len(), 1);
+        assert_eq!(
+            out[0].choices[0].delta.content,
+            Some(OpenAiMessageContent::from("你"))
+        );
     }
-    if let Some(fallback) = fallback_text_for_content_blocks(content_blocks) {
-        return fallback;
-    }
-    if saw_multimodal_content {
-        return "(assistant returned multimodal content)".to_string();
-    }
-    String::new()
 }

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use deepagents::approval::{
     redact_command, ApprovalDecision, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode,
@@ -953,22 +953,22 @@ fn resolve_execution_mode(flag: Option<&str>) -> ExecutionMode {
     }
 }
 
-fn resolve_tool_choice(flag: Option<&str>) -> Result<deepagents::provider::ToolChoice> {
+fn resolve_tool_choice(flag: Option<&str>) -> Result<deepagents::llm::ToolChoice> {
     let Some(flag) = flag.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(deepagents::provider::ToolChoice::Auto);
+        return Ok(deepagents::llm::ToolChoice::Auto);
     };
 
     match flag {
-        "auto" => Ok(deepagents::provider::ToolChoice::Auto),
-        "none" => Ok(deepagents::provider::ToolChoice::None),
-        "required" => Ok(deepagents::provider::ToolChoice::Required),
+        "auto" => Ok(deepagents::llm::ToolChoice::Auto),
+        "none" => Ok(deepagents::llm::ToolChoice::None),
+        "required" => Ok(deepagents::llm::ToolChoice::Required),
         _ => {
             if let Some(name) = flag.strip_prefix("named:") {
                 let name = name.trim();
                 if name.is_empty() {
                     anyhow::bail!("invalid --tool-choice: named tool cannot be empty");
                 }
-                return Ok(deepagents::provider::ToolChoice::Named {
+                return Ok(deepagents::llm::ToolChoice::Named {
                     name: name.to_string(),
                 });
             }
@@ -981,20 +981,20 @@ fn resolve_structured_output(
     schema_flag: Option<&str>,
     name_flag: Option<&str>,
     description_flag: Option<&str>,
-) -> Result<Option<deepagents::provider::StructuredOutputSpec>> {
+) -> Result<Option<deepagents::llm::StructuredOutputSpec>> {
     let Some(schema_flag) = schema_flag.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
 
     let schema_source = if let Some(path) = schema_flag.strip_prefix('@') {
         std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("invalid --structured-output-schema @file: {e}"))?
+            .with_context(|| format!("invalid --structured-output-schema @file: {path}"))?
     } else {
         schema_flag.to_string()
     };
     let schema = serde_json::from_str(&schema_source)
         .map_err(|e| anyhow!("invalid --structured-output-schema json: {e}"))?;
-    let spec = deepagents::provider::StructuredOutputSpec {
+    let spec = deepagents::llm::StructuredOutputSpec {
         name: name_flag
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1013,8 +1013,8 @@ fn resolve_structured_output(
 
 fn ensure_provider_request_supported(
     diagnostics: &deepagents::provider::ProviderDiagnostics,
-    tool_choice: &deepagents::provider::ToolChoice,
-    structured_output: Option<&deepagents::provider::StructuredOutputSpec>,
+    tool_choice: &deepagents::llm::ToolChoice,
+    structured_output: Option<&deepagents::llm::StructuredOutputSpec>,
 ) -> Result<()> {
     if structured_output.is_some() && !diagnostics.supports_structured_output() {
         anyhow::bail!(
@@ -1025,7 +1025,7 @@ fn ensure_provider_request_supported(
 
     if matches!(
         tool_choice,
-        deepagents::provider::ToolChoice::Required | deepagents::provider::ToolChoice::Named { .. }
+        deepagents::llm::ToolChoice::Required | deepagents::llm::ToolChoice::Named { .. }
     ) && !diagnostics.supports_tool_choice()
     {
         anyhow::bail!(
@@ -1067,7 +1067,8 @@ fn resolve_allow_list(args: &Args) -> Vec<String> {
 }
 
 fn read_allow_file(path: &str) -> Result<Vec<String>> {
-    let content = std::fs::read_to_string(path)?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read allow list: {path}"))?;
     let mut out = Vec::new();
     for line in content.lines() {
         let s = line.trim();
@@ -1152,7 +1153,7 @@ fn build_provider_bundle(
         "openai-compatible" | "openai_compatible" => {
             let model = model
                 .ok_or_else(|| anyhow!("--model is required for --provider openai-compatible"))?;
-            let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
+            let mut config = deepagents::llm::OpenAiCompatibleConfig::new(model);
             if let Some(base_url) = base_url {
                 config = config.with_base_url(base_url);
             }
@@ -1170,6 +1171,29 @@ fn build_provider_bundle(
             Ok(deepagents::provider::build_provider_bundle(
                 provider_id,
                 deepagents::provider::ProviderInitSpec::OpenAiCompatible { config },
+            ))
+        }
+        "openrouter" => {
+            let model =
+                model.ok_or_else(|| anyhow!("--model is required for --provider openrouter"))?;
+            let mut config = deepagents::llm::OpenRouterConfig::new(model);
+            if let Some(base_url) = base_url {
+                config = config.with_base_url(base_url);
+            }
+            let api_key = match (api_key, api_key_env) {
+                (Some(api_key), _) => Some(api_key),
+                (None, Some(env_name)) => Some(
+                    std::env::var(&env_name)
+                        .map_err(|_| anyhow!("missing env var for --api-key-env: {env_name}"))?,
+                ),
+                (None, None) => std::env::var("OPENROUTER_API_KEY").ok(),
+            };
+            if let Some(api_key) = api_key {
+                config = config.with_api_key(api_key);
+            }
+            Ok(deepagents::provider::build_provider_bundle(
+                provider_id,
+                deepagents::provider::ProviderInitSpec::OpenRouter { config },
             ))
         }
         other => Err(anyhow!("unknown --provider: {other}")),

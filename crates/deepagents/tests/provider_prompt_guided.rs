@@ -4,10 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use deepagents::approval::ExecutionMode;
+use deepagents::llm::{
+    ChatRequest, ChatResponse, ChatRole, LlmEventStream, LlmProvider, LlmProviderCapabilities,
+    ToolCall, ToolChoice, ToolSpec, ToolsPayload,
+};
 use deepagents::provider::{
-    LlmEventStream, LlmProvider, LlmProviderAdapter, LlmProviderCapabilities, Provider,
-    ProviderRequest, ProviderStep, ProviderStepOutput, ToolChoice, ToolsPayload,
-    VecProviderEventCollector,
+    AgentProvider, AgentProviderRequest, AgentStep, AgentToolCall, LlmProviderAdapter,
+    VecAgentProviderEventCollector,
 };
 use deepagents::runtime::{
     ResumableRunner, ResumableRunnerOptions, RunEvent, RunStatus, RuntimeConfig, VecRunEventSink,
@@ -15,8 +18,8 @@ use deepagents::runtime::{
 
 #[derive(Clone)]
 struct PromptGuidedTestProvider {
-    responses: Arc<Mutex<VecDeque<ProviderStep>>>,
-    last_request: Arc<Mutex<Option<ProviderRequest>>>,
+    responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+    last_request: Arc<Mutex<Option<ChatRequest>>>,
     chat_calls: Arc<AtomicUsize>,
     stream_calls: Arc<AtomicUsize>,
     capabilities: LlmProviderCapabilities,
@@ -24,9 +27,14 @@ struct PromptGuidedTestProvider {
 }
 
 impl PromptGuidedTestProvider {
-    fn new(responses: Vec<ProviderStep>) -> Self {
+    fn new(responses: Vec<AgentStep>) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+            responses: Arc::new(Mutex::new(VecDeque::from(
+                responses
+                    .into_iter()
+                    .map(response_from_step)
+                    .collect::<Vec<_>>(),
+            ))),
             last_request: Arc::new(Mutex::new(None)),
             chat_calls: Arc::new(AtomicUsize::new(0)),
             stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -47,7 +55,7 @@ impl PromptGuidedTestProvider {
         self
     }
 
-    fn last_request(&self) -> ProviderRequest {
+    fn last_request(&self) -> ChatRequest {
         self.last_request
             .lock()
             .unwrap()
@@ -62,10 +70,7 @@ impl LlmProvider for PromptGuidedTestProvider {
         self.capabilities
     }
 
-    fn convert_tools(
-        &self,
-        tool_specs: &[deepagents::runtime::ToolSpec],
-    ) -> anyhow::Result<ToolsPayload> {
+    fn convert_tools(&self, tool_specs: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
         if tool_specs.is_empty() {
             return Ok(ToolsPayload::None);
         }
@@ -74,25 +79,48 @@ impl LlmProvider for PromptGuidedTestProvider {
         })
     }
 
-    async fn chat(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.chat_calls.fetch_add(1, Ordering::SeqCst);
         *self.last_request.lock().unwrap() = Some(req);
         self.responses
             .lock()
             .unwrap()
             .pop_front()
-            .map(ProviderStepOutput::from)
             .ok_or_else(|| anyhow::anyhow!("missing test response"))
     }
 
-    async fn stream_chat(&self, _req: ProviderRequest) -> anyhow::Result<LlmEventStream> {
+    async fn stream_chat(&self, _req: ChatRequest) -> anyhow::Result<LlmEventStream> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(tokio_stream::empty()))
     }
 }
 
-fn sample_request(tool_choice: ToolChoice) -> ProviderRequest {
-    ProviderRequest {
+fn response_from_step(step: AgentStep) -> ChatResponse {
+    match step {
+        AgentStep::AssistantMessage { text } | AgentStep::FinalText { text } => {
+            ChatResponse::new(text)
+        }
+        AgentStep::AssistantMessageWithToolCalls { text, calls } => ChatResponse::new(text)
+            .with_tool_calls(calls.into_iter().map(convert_tool_call).collect()),
+        AgentStep::ToolCalls { calls } => ChatResponse::new("")
+            .with_tool_calls(calls.into_iter().map(convert_tool_call).collect()),
+        AgentStep::SkillCall { .. } => panic!("skill calls are not valid llm responses"),
+        AgentStep::Error { error } => {
+            panic!("unexpected provider error in test fixture: {error:?}")
+        }
+    }
+}
+
+fn convert_tool_call(call: AgentToolCall) -> ToolCall {
+    ToolCall {
+        id: call.call_id.unwrap_or_default(),
+        name: call.tool_name,
+        arguments: call.arguments,
+    }
+}
+
+fn sample_request(tool_choice: ToolChoice) -> AgentProviderRequest {
+    AgentProviderRequest {
         messages: vec![
             deepagents::types::Message {
                 role: "system".to_string(),
@@ -135,7 +163,7 @@ fn sample_request(tool_choice: ToolChoice) -> ProviderRequest {
     }
 }
 
-fn build_runner(root: &std::path::Path, provider: Arc<dyn Provider>) -> ResumableRunner {
+fn build_runner(root: &std::path::Path, provider: Arc<dyn AgentProvider>) -> ResumableRunner {
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
 
@@ -159,7 +187,7 @@ fn build_runner(root: &std::path::Path, provider: Arc<dyn Provider>) -> Resumabl
 
 #[tokio::test]
 async fn prompt_guided_adapter_injects_contract_and_parses_tool_calls() {
-    let provider = PromptGuidedTestProvider::new(vec![ProviderStep::FinalText {
+    let provider = PromptGuidedTestProvider::new(vec![AgentStep::FinalText {
         text: "<tool_call>\n{\"content\":\"Let me check.\",\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"file_path\":\"README.md\"},\"id\":\"call_9\"}]}\n</tool_call>".to_string(),
     }]);
     let adapter = LlmProviderAdapter::new(Arc::new(provider.clone()));
@@ -170,7 +198,7 @@ async fn prompt_guided_adapter_injects_contract_and_parses_tool_calls() {
         .unwrap();
     assert!(matches!(
         step,
-        ProviderStep::AssistantMessageWithToolCalls { text, calls }
+        AgentStep::AssistantMessageWithToolCalls { text, calls }
             if text == "Let me check."
                 && calls.len() == 1
                 && calls[0].tool_name == "read_file"
@@ -179,7 +207,7 @@ async fn prompt_guided_adapter_injects_contract_and_parses_tool_calls() {
 
     let request = provider.last_request();
     assert_eq!(request.messages.len(), 3);
-    assert_eq!(request.messages[1].role, "system");
+    assert_eq!(request.messages[1].role, ChatRole::System);
     assert!(request.messages[1]
         .content
         .contains("Tool calling fallback contract:"));
@@ -189,7 +217,7 @@ async fn prompt_guided_adapter_injects_contract_and_parses_tool_calls() {
 
 #[tokio::test]
 async fn prompt_guided_adapter_rejects_unknown_named_tool_choice_before_chat() {
-    let provider = PromptGuidedTestProvider::new(vec![ProviderStep::FinalText {
+    let provider = PromptGuidedTestProvider::new(vec![AgentStep::FinalText {
         text: "unused".to_string(),
     }]);
     let adapter = LlmProviderAdapter::new(Arc::new(provider.clone()));
@@ -210,7 +238,7 @@ async fn prompt_guided_adapter_rejects_unknown_named_tool_choice_before_chat() {
 
 #[tokio::test]
 async fn prompt_guided_adapter_required_choice_rejects_plain_text_response() {
-    let provider = PromptGuidedTestProvider::new(vec![ProviderStep::FinalText {
+    let provider = PromptGuidedTestProvider::new(vec![AgentStep::FinalText {
         text: "I can answer without tools.".to_string(),
     }]);
     let adapter = LlmProviderAdapter::new(Arc::new(provider));
@@ -224,7 +252,7 @@ async fn prompt_guided_adapter_required_choice_rejects_plain_text_response() {
 
 #[tokio::test]
 async fn prompt_guided_collector_path_uses_chat_instead_of_streaming() {
-    let provider = PromptGuidedTestProvider::new(vec![ProviderStep::FinalText {
+    let provider = PromptGuidedTestProvider::new(vec![AgentStep::FinalText {
         text: "<tool_call>\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"file_path\":\"README.md\"}}]}\n</tool_call>".to_string(),
     }])
     .with_capabilities(LlmProviderCapabilities {
@@ -236,14 +264,14 @@ async fn prompt_guided_collector_path_uses_chat_instead_of_streaming() {
         ..Default::default()
     });
     let adapter = LlmProviderAdapter::new(Arc::new(provider.clone()));
-    let mut collector = VecProviderEventCollector::new();
+    let mut collector = VecAgentProviderEventCollector::new();
 
     let step = adapter
         .step_with_collector(sample_request(ToolChoice::Auto), &mut collector)
         .await
         .unwrap();
 
-    assert!(matches!(step, ProviderStep::ToolCalls { calls } if calls.len() == 1));
+    assert!(matches!(step, AgentStep::ToolCalls { calls } if calls.len() == 1));
     assert!(collector.into_events().is_empty());
     assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
@@ -252,10 +280,10 @@ async fn prompt_guided_collector_path_uses_chat_instead_of_streaming() {
 #[tokio::test]
 async fn prompt_guided_runner_executes_tool_calls_end_to_end() {
     let provider = PromptGuidedTestProvider::new(vec![
-        ProviderStep::FinalText {
+        AgentStep::FinalText {
             text: "<tool_call>\n{\"content\":\"Writing the file.\",\"tool_calls\":[{\"name\":\"write_file\",\"arguments\":{\"file_path\":\"note.txt\",\"content\":\"hello\\n\"},\"id\":\"call_1\"}]}\n</tool_call>".to_string(),
         },
-        ProviderStep::FinalText {
+        AgentStep::FinalText {
             text: "All done.".to_string(),
         },
     ])
@@ -267,7 +295,8 @@ async fn prompt_guided_runner_executes_tool_calls_end_to_end() {
         supports_reasoning_content: false,
         ..Default::default()
     });
-    let provider: Arc<dyn Provider> = Arc::new(LlmProviderAdapter::new(Arc::new(provider.clone())));
+    let provider: Arc<dyn AgentProvider> =
+        Arc::new(LlmProviderAdapter::new(Arc::new(provider.clone())));
     let dir = tempfile::tempdir().unwrap();
     let mut runner = build_runner(dir.path(), provider);
     runner.push_user_input("create note.txt".to_string());

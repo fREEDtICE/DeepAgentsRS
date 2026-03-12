@@ -6,17 +6,21 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::{Json, Router};
 use deepagents::llm::openai_compatible::{
-    OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, OpenAiDelta, OpenAiFunctionCall, OpenAiFunctionCallDelta,
-    OpenAiMessage, OpenAiMessageContent, OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
-    ReqwestOpenAiTransport,
+    OpenAiChatChunk, OpenAiChatResponse, OpenAiChoice, OpenAiChunkChoice, OpenAiDelta,
+    OpenAiFunctionCall, OpenAiFunctionCallDelta, OpenAiMessage, OpenAiMessageContent,
+    OpenAiToolCall, OpenAiToolCallDelta, OpenAiUsage,
 };
-use deepagents::llm::{ChatMessage, ChatRequest, LlmEvent, LlmProvider, ToolChoice, ToolSpec};
+use deepagents::llm::{
+    ChatMessage, ChatRequest, LlmEvent, LlmProvider, OpenRouterConfig, OpenRouterProvider,
+    ToolChoice, ToolSpec,
+};
 use tokio_stream::StreamExt;
 
 #[derive(Clone, Default)]
 struct CaptureState {
     auth_header: Arc<tokio::sync::Mutex<Option<String>>>,
+    referer_header: Arc<tokio::sync::Mutex<Option<String>>>,
+    title_header: Arc<tokio::sync::Mutex<Option<String>>>,
     last_body: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
 }
 
@@ -41,7 +45,7 @@ fn sample_request() -> ChatRequest {
 }
 
 #[tokio::test]
-async fn reqwest_transport_posts_json_and_parses_chat_response() {
+async fn openrouter_posts_headers_and_parses_chat_response() {
     let state = CaptureState::default();
     let app = Router::new()
         .route("/chat/completions", post(chat_handler))
@@ -52,45 +56,54 @@ async fn reqwest_transport_posts_json_and_parses_chat_response() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let provider = OpenAiCompatibleProvider::new(
-        OpenAiCompatibleConfig::new("gpt-4o-mini")
+    let provider = OpenRouterProvider::new(
+        OpenRouterConfig::new("openai/gpt-4o-mini")
             .with_base_url(format!("http://{}", addr))
-            .with_api_key("test-key"),
-        Arc::new(ReqwestOpenAiTransport::new()),
+            .with_api_key("test-key")
+            .with_site_url("https://example.com/app")
+            .with_app_name("deepagents-test"),
     );
 
-    let step = provider.chat(sample_request()).await.unwrap();
+    let response = provider.chat(sample_request()).await.unwrap();
     assert!(matches!(
-        step.tool_calls.as_slice(),
+        response.tool_calls.as_slice(),
         [call] if call.name == "read_file"
     ));
 
-    let auth = state.auth_header.lock().await.clone();
-    assert_eq!(auth.as_deref(), Some("Bearer test-key"));
-    let body = state.last_body.lock().await.clone().unwrap();
-    assert_eq!(body["model"], "gpt-4o-mini");
-    assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(
-        body["tools"][0]["function"]["parameters"]["required"][0],
-        "file_path"
+        state.auth_header.lock().await.as_deref(),
+        Some("Bearer test-key")
     );
+    assert_eq!(
+        state.referer_header.lock().await.as_deref(),
+        Some("https://example.com/app")
+    );
+    assert_eq!(
+        state.title_header.lock().await.as_deref(),
+        Some("deepagents-test")
+    );
+    let body = state.last_body.lock().await.clone().unwrap();
+    assert_eq!(body["model"], "openai/gpt-4o-mini");
 }
 
 #[tokio::test]
-async fn reqwest_transport_parses_streaming_sse_chunks() {
+async fn openrouter_stream_chat_parses_sse_chunks() {
     let state = CaptureState::default();
     let app = Router::new()
         .route("/chat/completions", post(stream_handler))
-        .with_state(state);
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let provider = OpenAiCompatibleProvider::new(
-        OpenAiCompatibleConfig::new("gpt-4o-mini").with_base_url(format!("http://{}", addr)),
-        Arc::new(ReqwestOpenAiTransport::new()),
+    let provider = OpenRouterProvider::new(
+        OpenRouterConfig::new("anthropic/claude-3.5-sonnet")
+            .with_base_url(format!("http://{}", addr))
+            .with_api_key("test-key")
+            .with_site_url("https://example.com/stream")
+            .with_app_name("deepagents-stream-test"),
     );
 
     let mut stream = provider.stream_chat(sample_request()).await.unwrap();
@@ -114,6 +127,15 @@ async fn reqwest_transport_parses_streaming_sse_chunks() {
             ..
         }
     )));
+
+    assert_eq!(
+        state.referer_header.lock().await.as_deref(),
+        Some("https://example.com/stream")
+    );
+    assert_eq!(
+        state.title_header.lock().await.as_deref(),
+        Some("deepagents-stream-test")
+    );
 }
 
 async fn chat_handler(
@@ -123,6 +145,14 @@ async fn chat_handler(
 ) -> (StatusCode, Json<OpenAiChatResponse>) {
     *state.auth_header.lock().await = headers
         .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    *state.referer_header.lock().await = headers
+        .get("http-referer")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    *state.title_header.lock().await = headers
+        .get("x-title")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     *state.last_body.lock().await = Some(body);
@@ -154,8 +184,17 @@ async fn chat_handler(
 
 async fn stream_handler(
     State(state): State<CaptureState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    *state.referer_header.lock().await = headers
+        .get("http-referer")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    *state.title_header.lock().await = headers
+        .get("x-title")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     *state.last_body.lock().await = Some(body);
 
     let chunks = vec![

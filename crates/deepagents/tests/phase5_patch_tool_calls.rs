@@ -1,4 +1,4 @@
-use deepagents::provider::ProviderToolCall;
+use deepagents::provider::AgentToolCall;
 use deepagents::runtime::patch_tool_calls::{patch_dangling_tool_calls, sanitize_tool_call_id};
 use deepagents::runtime::tool_compat::{
     normalize_messages, normalize_tool_call_for_execution, tool_results_from_messages,
@@ -190,7 +190,7 @@ fn provider_tool_call_deserializes_field_aliases() {
         "input": { "file_path": "README.md" },
         "id": "c1"
     });
-    let c: ProviderToolCall = serde_json::from_value(v).unwrap();
+    let c: AgentToolCall = serde_json::from_value(v).unwrap();
     assert_eq!(c.tool_name, "read_file");
     assert_eq!(c.call_id.as_deref().unwrap(), "c1");
     assert!(c.arguments.is_object());
@@ -199,7 +199,7 @@ fn provider_tool_call_deserializes_field_aliases() {
 #[test]
 fn normalize_tool_call_for_execution_rejects_invalid_json_string_arguments() {
     let mut next = 1u64;
-    let call = ProviderToolCall {
+    let call = AgentToolCall {
         tool_name: "read_file".to_string(),
         arguments: serde_json::Value::String("not json".to_string()),
         call_id: None,

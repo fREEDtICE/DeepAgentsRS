@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::provider::mock::{MockProvider, MockScript, MockStep};
-use crate::provider::ProviderToolCall;
+use crate::provider::AgentToolCall;
 use crate::runtime::simple::SimpleRuntime;
 use crate::runtime::{RunStatus, Runtime, RuntimeConfig};
 use crate::subagents::protocol::{CompiledSubAgent, SubAgentRunOutput, SubAgentRunRequest};
@@ -35,7 +35,7 @@ pub fn default_registry() -> anyhow::Result<Arc<dyn SubAgentRegistry>> {
         MockScript {
             steps: vec![
                 MockStep::ToolCalls {
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "write_file".to_string(),
                         arguments: serde_json::json!({ "file_path": "child.txt", "content": "hi\n" }),
                         call_id: Some("w1".to_string()),
@@ -70,7 +70,7 @@ pub fn default_registry() -> anyhow::Result<Arc<dyn SubAgentRegistry>> {
         MockScript {
             steps: vec![
                 MockStep::ToolCalls {
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "task".to_string(),
                         arguments: serde_json::json!({ "description": "inner", "subagent_type": "general-purpose" }),
                         call_id: Some("inner-task".to_string()),
@@ -85,7 +85,7 @@ pub fn default_registry() -> anyhow::Result<Arc<dyn SubAgentRegistry>> {
         "Tries reading outside root and reports error",
         MockScript {
             steps: vec![MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "read_file".to_string(),
                     arguments: serde_json::json!({ "file_path": "../secret.txt", "limit": 1 }),
                     call_id: Some("r1".to_string()),
@@ -98,7 +98,7 @@ pub fn default_registry() -> anyhow::Result<Arc<dyn SubAgentRegistry>> {
         "Tries execute and reports policy error",
         MockScript {
             steps: vec![MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "execute".to_string(),
                     arguments: serde_json::json!({ "command": "echo hi" }),
                     call_id: Some("e1".to_string()),
@@ -321,7 +321,7 @@ impl CompiledSubAgent for RuntimeMockSubAgent {
     }
 
     async fn run(&self, req: SubAgentRunRequest) -> anyhow::Result<SubAgentRunOutput> {
-        let provider: Arc<dyn crate::provider::Provider> =
+        let provider: Arc<dyn crate::provider::AgentProvider> =
             Arc::new(MockProvider::from_script((*self.script).clone()));
         let runtime = SimpleRuntime::new(
             req.agent,

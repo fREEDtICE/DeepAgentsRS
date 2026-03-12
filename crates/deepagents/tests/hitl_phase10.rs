@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use deepagents::approval::{DefaultApprovalPolicy, ExecutionMode};
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
-use deepagents::provider::ProviderToolCall;
+use deepagents::provider::AgentToolCall;
 use deepagents::runtime::{HitlDecision, ResumableRunner, ResumableRunnerOptions, RunStatus};
 
 fn interrupt_on(keys: &[&str]) -> BTreeMap<String, bool> {
@@ -23,7 +23,7 @@ async fn h01_approve_executes_tool() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "edit_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "a.txt",
@@ -38,7 +38,7 @@ async fn h01_approve_executes_tool() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -86,7 +86,7 @@ async fn h02_reject_cancels_without_side_effect() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "deny.txt",
@@ -100,7 +100,7 @@ async fn h02_reject_cancels_without_side_effect() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -151,7 +151,7 @@ async fn h03_edit_changes_args_and_keeps_call_id() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "a.txt",
@@ -165,7 +165,7 @@ async fn h03_edit_changes_args_and_keeps_call_id() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script_without_call_ids(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -223,7 +223,7 @@ async fn h04_multiple_interrupts_in_one_batch() {
         steps: vec![
             MockStep::ToolCalls {
                 calls: vec![
-                    ProviderToolCall {
+                    AgentToolCall {
                         tool_name: "write_file".to_string(),
                         arguments: serde_json::json!({
                             "file_path": "a.txt",
@@ -231,7 +231,7 @@ async fn h04_multiple_interrupts_in_one_batch() {
                         }),
                         call_id: Some("a1".to_string()),
                     },
-                    ProviderToolCall {
+                    AgentToolCall {
                         tool_name: "edit_file".to_string(),
                         arguments: serde_json::json!({
                             "file_path": "b.txt",
@@ -247,7 +247,7 @@ async fn h04_multiple_interrupts_in_one_batch() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -295,7 +295,7 @@ async fn h05_invalid_resume_keeps_pending_and_allows_retry() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "a.txt",
@@ -309,7 +309,7 @@ async fn h05_invalid_resume_keeps_pending_and_allows_retry() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -373,7 +373,7 @@ async fn h06_interactive_execute_resume_approve_runs_when_policy_requires_approv
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "execute".to_string(),
                     arguments: serde_json::json!({
                         "command": "echo hi",
@@ -387,7 +387,7 @@ async fn h06_interactive_execute_resume_approve_runs_when_policy_requires_approv
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -442,7 +442,7 @@ async fn h07_interactive_execute_resume_edit_runs_when_policy_requires_approval(
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "execute".to_string(),
                     arguments: serde_json::json!({
                         "command": "echo blocked",
@@ -456,7 +456,7 @@ async fn h07_interactive_execute_resume_edit_runs_when_policy_requires_approval(
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);

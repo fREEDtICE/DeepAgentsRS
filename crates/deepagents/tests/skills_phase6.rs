@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use deepagents::approval::ExecutionMode;
-use deepagents::provider::protocol::{Provider, ProviderRequest, ProviderStep};
-use deepagents::provider::ProviderToolCall;
+use deepagents::provider::protocol::{AgentProvider, AgentProviderRequest, AgentStep};
+use deepagents::provider::AgentToolCall;
 use deepagents::runtime::simple::SimpleRuntime;
 use deepagents::runtime::skills_middleware::SkillsMiddleware;
 use deepagents::runtime::{Runtime, RuntimeConfig};
@@ -91,7 +91,7 @@ async fn skills_tool_executes_steps() {
         deepagents::provider::mock::MockScript {
             steps: vec![
                 deepagents::provider::mock::MockStep::ToolCalls {
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "read-readme".to_string(),
                         arguments: serde_json::json!({}),
                         call_id: Some("c1".to_string()),
@@ -170,7 +170,7 @@ async fn skills_tools_are_injected_into_tool_specs() {
     let skills_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> =
         Arc::new(SkillsMiddleware::new(sources, options));
 
-    let captured: Arc<Mutex<Option<ProviderRequest>>> = Arc::new(Mutex::new(None));
+    let captured: Arc<Mutex<Option<AgentProviderRequest>>> = Arc::new(Mutex::new(None));
     let provider = Arc::new(CaptureProvider {
         captured: captured.clone(),
     });
@@ -216,14 +216,14 @@ async fn skills_tools_are_injected_into_tool_specs() {
 }
 
 struct CaptureProvider {
-    captured: Arc<Mutex<Option<ProviderRequest>>>,
+    captured: Arc<Mutex<Option<AgentProviderRequest>>>,
 }
 
 #[async_trait::async_trait]
-impl Provider for CaptureProvider {
-    async fn step(&self, req: ProviderRequest) -> Result<ProviderStep, anyhow::Error> {
+impl AgentProvider for CaptureProvider {
+    async fn step(&self, req: AgentProviderRequest) -> Result<AgentStep, anyhow::Error> {
         *self.captured.lock().unwrap() = Some(req);
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "ok".to_string(),
         })
     }

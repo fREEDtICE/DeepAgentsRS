@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::ProviderToolCall;
+use crate::provider::AgentToolCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSpec {
@@ -27,5 +27,5 @@ pub struct SkillError {
 #[async_trait]
 pub trait SkillPlugin: Send + Sync {
     fn list_skills(&self) -> Vec<SkillSpec>;
-    async fn call(&self, call: SkillCall) -> Result<Vec<ProviderToolCall>, SkillError>;
+    async fn call(&self, call: SkillCall) -> Result<Vec<AgentToolCall>, SkillError>;
 }

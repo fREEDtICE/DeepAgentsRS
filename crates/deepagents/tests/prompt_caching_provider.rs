@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use deepagents::approval::ExecutionMode;
 use deepagents::provider::{
-    Provider, ProviderEventCollector, ProviderRequest, ProviderStep, ProviderStepOutput,
+    AgentProvider, AgentProviderEventCollector, AgentProviderRequest, AgentStep, AgentStepOutput,
 };
 use deepagents::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use deepagents::runtime::{
@@ -18,9 +18,9 @@ use deepagents::types::Message;
 struct StaticProvider;
 
 #[async_trait]
-impl Provider for StaticProvider {
-    async fn step(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
-        Ok(ProviderStep::FinalText {
+impl AgentProvider for StaticProvider {
+    async fn step(&self, _req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
+        Ok(AgentStep::FinalText {
             text: "OK".to_string(),
         })
     }
@@ -43,13 +43,13 @@ impl SingleCallProvider {
 }
 
 #[async_trait]
-impl Provider for SingleCallProvider {
-    async fn step(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for SingleCallProvider {
+    async fn step(&self, _req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         let idx = self.calls.fetch_add(1, Ordering::SeqCst);
         if idx >= 1 {
             anyhow::bail!("provider should not be called on cache hit");
         }
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "OK".to_string(),
         })
     }
@@ -62,52 +62,54 @@ struct StreamingSingleCallProvider {
 }
 
 #[async_trait]
-impl Provider for StreamingSingleCallProvider {
-    async fn step(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for StreamingSingleCallProvider {
+    async fn step(&self, _req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         self.step_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "OK".to_string(),
         })
     }
 
     async fn step_with_collector(
         &self,
-        _req: ProviderRequest,
-        collector: &mut dyn ProviderEventCollector,
-    ) -> anyhow::Result<ProviderStep> {
+        _req: AgentProviderRequest,
+        collector: &mut dyn AgentProviderEventCollector,
+    ) -> anyhow::Result<AgentStep> {
         let idx = self.collector_calls.fetch_add(1, Ordering::SeqCst);
         if idx >= 1 {
             anyhow::bail!("provider should not be called on cache hit");
         }
         collector
-            .emit(deepagents::provider::ProviderEvent::AssistantTextDelta {
-                text: "OK".to_string(),
-            })
+            .emit(
+                deepagents::provider::AgentProviderEvent::AssistantTextDelta {
+                    text: "OK".to_string(),
+                },
+            )
             .await?;
         collector
-            .emit(deepagents::provider::ProviderEvent::Usage {
+            .emit(deepagents::provider::AgentProviderEvent::Usage {
                 input_tokens: Some(2),
                 output_tokens: Some(1),
                 total_tokens: Some(3),
             })
             .await?;
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "OK".to_string(),
         })
     }
 
     async fn step_output_with_collector(
         &self,
-        req: ProviderRequest,
-        collector: &mut dyn ProviderEventCollector,
-    ) -> anyhow::Result<ProviderStepOutput> {
+        req: AgentProviderRequest,
+        collector: &mut dyn AgentProviderEventCollector,
+    ) -> anyhow::Result<AgentStepOutput> {
         Ok(self.step_with_collector(req, collector).await?.into())
     }
 }
 
 fn build_runtime(
     root: &str,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn AgentProvider>,
     cache_options: PromptCacheOptions,
 ) -> SimpleRuntime {
     let agent = deepagents::create_deep_agent(root).unwrap();
@@ -138,7 +140,7 @@ fn build_runtime(
 
 fn build_runtime_with_state(
     root: &str,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn AgentProvider>,
     cache_options: PromptCacheOptions,
     state: deepagents::state::AgentState,
 ) -> SimpleRuntime {
@@ -168,7 +170,7 @@ fn first_cache_event_of_level(
 async fn pc_01_off_produces_no_cache_events() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
-    let provider: Arc<dyn Provider> = Arc::new(StaticProvider);
+    let provider: Arc<dyn AgentProvider> = Arc::new(StaticProvider);
     let rt = build_runtime(
         &root,
         provider,
@@ -207,7 +209,7 @@ async fn pc_02_l2_hit_short_circuits_provider_on_second_run() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
     let provider = Arc::new(SingleCallProvider::new());
-    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let provider_dyn: Arc<dyn AgentProvider> = provider.clone();
     let rt = build_runtime(
         &root,
         provider_dyn,
@@ -260,7 +262,7 @@ async fn pc_02_l2_hit_short_circuits_provider_on_second_run() {
 async fn pk_01_l1_hits_when_only_user_message_changes() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
-    let provider: Arc<dyn Provider> = Arc::new(StaticProvider);
+    let provider: Arc<dyn AgentProvider> = Arc::new(StaticProvider);
     let rt = build_runtime(
         &root,
         provider,
@@ -357,7 +359,7 @@ async fn pc_03_tools_change_causes_l1_miss() {
         partition: "t".to_string(),
     };
 
-    let provider: Arc<dyn Provider> = Arc::new(StaticProvider);
+    let provider: Arc<dyn AgentProvider> = Arc::new(StaticProvider);
     let rt1 = build_runtime(&root, provider.clone(), options.clone());
 
     let mut state2 = deepagents::state::AgentState::default();
@@ -419,7 +421,7 @@ async fn pc_03_tools_change_causes_l1_miss() {
 async fn pk_03_system_change_causes_l1_miss() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
-    let provider: Arc<dyn Provider> = Arc::new(StaticProvider);
+    let provider: Arc<dyn AgentProvider> = Arc::new(StaticProvider);
     let rt = build_runtime(
         &root,
         provider,
@@ -500,7 +502,7 @@ async fn pk_03_system_change_causes_l1_miss() {
 async fn pc_07_secret_never_appears_in_cache_events() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
-    let provider: Arc<dyn Provider> = Arc::new(StaticProvider);
+    let provider: Arc<dyn AgentProvider> = Arc::new(StaticProvider);
     let rt = build_runtime(
         &root,
         provider,
@@ -549,7 +551,7 @@ async fn pc_08_l2_hit_in_streaming_runtime_skips_delta_replay() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
     let provider = Arc::new(StreamingSingleCallProvider::default());
-    let provider_dyn: Arc<dyn Provider> = provider.clone();
+    let provider_dyn: Arc<dyn AgentProvider> = provider.clone();
     let rt = build_runtime(
         &root,
         provider_dyn,

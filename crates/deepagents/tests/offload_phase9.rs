@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use deepagents::backends::{CompositeBackend, LocalSandbox, SandboxBackend};
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
-use deepagents::provider::protocol::ProviderToolCall;
+use deepagents::provider::protocol::AgentToolCall;
 use deepagents::runtime::{
     FilesystemRuntimeMiddleware, FilesystemRuntimeOptions, Runtime, RuntimeMiddleware,
 };
@@ -21,6 +21,20 @@ impl Tool for EmitBigTool {
 
     fn description(&self) -> &'static str {
         "Emits a large text blob."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "description": "Number of characters to generate (default: 0)."
+                }
+            },
+            "required": [],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -52,7 +66,7 @@ async fn phase9_offload_writes_to_large_backend_and_replaces_tool_output() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "emit_big".to_string(),
                     arguments: serde_json::json!({ "n": 5000 }),
                     call_id: Some("a:b/c".to_string()),
@@ -63,7 +77,7 @@ async fn phase9_offload_writes_to_large_backend_and_replaces_tool_output() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
 
     let fs_opts = FilesystemRuntimeOptions {
@@ -141,7 +155,7 @@ async fn phase9_offload_creates_large_tool_results_dir_in_workspace_backend() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "emit_big".to_string(),
                     arguments: serde_json::json!({ "n": 5000 }),
                     call_id: Some("a:b/c".to_string()),
@@ -152,7 +166,7 @@ async fn phase9_offload_creates_large_tool_results_dir_in_workspace_backend() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
 
     let fs_opts = FilesystemRuntimeOptions {

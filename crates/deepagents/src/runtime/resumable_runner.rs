@@ -8,9 +8,10 @@ use crate::approval::{
     redact_command, ApprovalDecision, ApprovalPolicy, ApprovalRequest, ExecutionMode,
 };
 use crate::audit::{AuditEvent, AuditSink};
+use crate::llm::{AssistantMessageMetadata, StructuredOutputSpec, ToolChoice};
 use crate::provider::{
-    AssistantMessageMetadata, Provider, ProviderEvent, ProviderEventCollector, ProviderRequest,
-    ProviderStep, ProviderStepOutput, ProviderToolCall, StructuredOutputSpec,
+    AgentProvider, AgentProviderEvent, AgentProviderEventCollector, AgentProviderRequest,
+    AgentStep, AgentStepOutput, AgentToolCall,
 };
 use crate::runtime::attach_provider_cache_events_to_trace;
 use crate::runtime::events::{
@@ -207,13 +208,13 @@ pub struct ResumableRunnerOptions {
 #[derive(Clone)]
 struct PendingInterrupt {
     interrupt: HitlInterrupt,
-    call: ProviderToolCall,
-    remaining_calls: Vec<ProviderToolCall>,
+    call: AgentToolCall,
+    remaining_calls: Vec<AgentToolCall>,
 }
 
 pub struct ResumableRunner {
     agent: DeepAgent,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn AgentProvider>,
     skills: Vec<Arc<dyn SkillPlugin>>,
     config: crate::runtime::RuntimeConfig,
     approval: Option<Arc<dyn ApprovalPolicy>>,
@@ -222,7 +223,7 @@ pub struct ResumableRunner {
     mode: ExecutionMode,
     interrupt_on: BTreeMap<String, bool>,
     runtime_middlewares: Vec<Arc<dyn RuntimeMiddleware>>,
-    tool_choice: crate::provider::ToolChoice,
+    tool_choice: ToolChoice,
     structured_output: Option<StructuredOutputSpec>,
     initialized: bool,
     messages: Vec<Message>,
@@ -241,14 +242,14 @@ struct RunEventForwardingCollector<'a> {
 }
 
 #[async_trait]
-impl ProviderEventCollector for RunEventForwardingCollector<'_> {
-    async fn emit(&mut self, event: ProviderEvent) -> anyhow::Result<()> {
+impl AgentProviderEventCollector for RunEventForwardingCollector<'_> {
+    async fn emit(&mut self, event: AgentProviderEvent) -> anyhow::Result<()> {
         let event = match event {
-            ProviderEvent::AssistantTextDelta { text } => RunEvent::AssistantTextDelta {
+            AgentProviderEvent::AssistantTextDelta { text } => RunEvent::AssistantTextDelta {
                 step_index: self.step_index,
                 text,
             },
-            ProviderEvent::ToolCallArgsDelta {
+            AgentProviderEvent::ToolCallArgsDelta {
                 tool_call_id,
                 delta,
             } => RunEvent::ToolCallArgsDelta {
@@ -256,7 +257,7 @@ impl ProviderEventCollector for RunEventForwardingCollector<'_> {
                 tool_call_id,
                 delta,
             },
-            ProviderEvent::Usage {
+            AgentProviderEvent::Usage {
                 input_tokens,
                 output_tokens,
                 total_tokens,
@@ -274,7 +275,7 @@ impl ProviderEventCollector for RunEventForwardingCollector<'_> {
 impl ResumableRunner {
     pub fn new(
         agent: DeepAgent,
-        provider: Arc<dyn Provider>,
+        provider: Arc<dyn AgentProvider>,
         skills: Vec<Arc<dyn SkillPlugin>>,
         options: ResumableRunnerOptions,
     ) -> Self {
@@ -289,7 +290,7 @@ impl ResumableRunner {
             mode: options.mode,
             interrupt_on: options.interrupt_on,
             runtime_middlewares: Vec::new(),
-            tool_choice: crate::provider::ToolChoice::Auto,
+            tool_choice: ToolChoice::Auto,
             structured_output: None,
             initialized: false,
             messages: Vec::new(),
@@ -326,7 +327,7 @@ impl ResumableRunner {
         self
     }
 
-    pub fn with_tool_choice(mut self, tool_choice: crate::provider::ToolChoice) -> Self {
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
         self
     }
@@ -375,11 +376,11 @@ impl ResumableRunner {
 
     async fn call_provider(
         &mut self,
-        req: ProviderRequest,
+        req: AgentProviderRequest,
         sink: &mut dyn RunEventSink,
         step_index: usize,
         stream_provider_events: bool,
-    ) -> Result<ProviderStepOutput, CachedProviderError> {
+    ) -> Result<AgentStepOutput, CachedProviderError> {
         if stream_provider_events {
             let mut collector = RunEventForwardingCollector { step_index, sink };
             step_with_prompt_cache_and_collector(
@@ -513,6 +514,8 @@ impl ResumableRunner {
         call_id: String,
         output: serde_json::Value,
         error: Option<String>,
+        error_code: Option<String>,
+        error_message: Option<String>,
         status: String,
         content: String,
         content_blocks: Option<Vec<crate::types::ContentBlock>>,
@@ -524,6 +527,8 @@ impl ResumableRunner {
             call_id: Some(call_id.clone()),
             output: output.clone(),
             error: error.clone(),
+            error_code: error_code.clone(),
+            error_message: error_message.clone(),
             status: Some(status.clone()),
         });
         self.emit_event(
@@ -540,12 +545,19 @@ impl ResumableRunner {
         .await;
 
         let content_json = custom_message.unwrap_or_else(|| {
+            let error_json = match (error_code.clone(), error_message.clone(), error.clone()) {
+                (Some(code), Some(message), _) => {
+                    serde_json::json!({ "code": code, "message": message })
+                }
+                (_, _, Some(s)) => serde_json::Value::String(s),
+                _ => serde_json::Value::Null,
+            };
             serde_json::json!({
                 "tool_call_id": call_id.clone(),
                 "tool_name": tool_name.clone(),
                 "status": status.clone(),
                 "output": if error.is_some() { serde_json::Value::Null } else { output },
-                "error": error.clone(),
+                "error": error_json,
                 "content": content.clone(),
             })
         });
@@ -729,7 +741,7 @@ impl ResumableRunner {
             )
             .await;
 
-            let req = ProviderRequest {
+            let req = AgentProviderRequest {
                 messages: provider_messages.clone(),
                 tool_specs,
                 tool_choice: self.tool_choice.clone(),
@@ -799,12 +811,12 @@ impl ResumableRunner {
                         .await;
                 }
             };
-            let ProviderStepOutput {
+            let AgentStepOutput {
                 step: mut provider_step,
                 mut assistant_metadata,
             } = provider_output;
 
-            if let ProviderStep::Error { error } = &provider_step {
+            if let AgentStep::Error { error } = &provider_step {
                 if error.code == "context_overflow" {
                     self.state.extra.insert(
                         "_summarization_force".to_string(),
@@ -855,7 +867,7 @@ impl ResumableRunner {
                         }
                     }
                     self.state.extra.remove("_summarization_force");
-                    let retry_req = ProviderRequest {
+                    let retry_req = AgentProviderRequest {
                         messages: overflow_messages,
                         tool_specs: self.agent_tools(&self.state),
                         tool_choice: self.tool_choice.clone(),
@@ -987,7 +999,7 @@ impl ResumableRunner {
             .await;
 
             match provider_step {
-                ProviderStep::AssistantMessage { text } => {
+                AgentStep::AssistantMessage { text } => {
                     let message =
                         self.build_assistant_message(text, None, assistant_metadata.as_ref());
                     self.messages.push(message.clone());
@@ -1000,7 +1012,7 @@ impl ResumableRunner {
                     )
                     .await;
                 }
-                ProviderStep::AssistantMessageWithToolCalls { text, calls } => {
+                AgentStep::AssistantMessageWithToolCalls { text, calls } => {
                     let message = self.build_assistant_message(
                         text,
                         Some(tool_calls_from_provider_calls(&calls)),
@@ -1032,7 +1044,7 @@ impl ResumableRunner {
                         return out;
                     }
                 }
-                ProviderStep::FinalText { text } => {
+                AgentStep::FinalText { text } => {
                     let message = self.build_assistant_message(
                         text.clone(),
                         None,
@@ -1109,7 +1121,7 @@ impl ResumableRunner {
                     .await;
                     return out;
                 }
-                ProviderStep::Error { error } => {
+                AgentStep::Error { error } => {
                     let out = finalize_run_output(RunOutput {
                         status: RunStatus::Error,
                         interrupts: Vec::new(),
@@ -1142,7 +1154,7 @@ impl ResumableRunner {
                     .await;
                     return out;
                 }
-                ProviderStep::SkillCall {
+                AgentStep::SkillCall {
                     name,
                     input,
                     call_id,
@@ -1199,7 +1211,7 @@ impl ResumableRunner {
                         return out;
                     }
                 }
-                ProviderStep::ToolCalls { calls } => {
+                AgentStep::ToolCalls { calls } => {
                     let calls = crate::runtime::patch_tool_calls::normalize_provider_tool_calls(
                         calls,
                         &mut self.next_call_id,
@@ -1582,7 +1594,7 @@ impl ResumableRunner {
     async fn expand_skill(
         &self,
         call: SkillCall,
-    ) -> Result<Vec<ProviderToolCall>, crate::skills::SkillError> {
+    ) -> Result<Vec<AgentToolCall>, crate::skills::SkillError> {
         for p in &self.skills {
             let names: Vec<String> = p.list_skills().into_iter().map(|s| s.name).collect();
             if names.iter().any(|n| n == &call.name) {
@@ -1598,10 +1610,10 @@ impl ResumableRunner {
     async fn execute_calls(
         &mut self,
         step_index: usize,
-        calls: Vec<ProviderToolCall>,
+        calls: Vec<AgentToolCall>,
         sink: &mut dyn RunEventSink,
     ) -> Option<HitlInterrupt> {
-        let mut queue: std::collections::VecDeque<ProviderToolCall> =
+        let mut queue: std::collections::VecDeque<AgentToolCall> =
             std::collections::VecDeque::from(calls);
         let write_todos_count = queue
             .iter()
@@ -1619,6 +1631,7 @@ impl ResumableRunner {
             let tool_name = call.tool_name.clone();
 
             if let Some(err) = error {
+                let (err_code, err_message) = parse_tool_error_string(&err);
                 self.tool_calls.push(ToolCallRecord {
                     tool_name: tool_name.clone(),
                     arguments: call.arguments.clone(),
@@ -1642,6 +1655,8 @@ impl ResumableRunner {
                     call_id,
                     serde_json::Value::Null,
                     Some(err.clone()),
+                    Some(err_code),
+                    Some(err_message),
                     "error".to_string(),
                     err,
                     None,
@@ -1660,6 +1675,7 @@ impl ResumableRunner {
 
             if write_todos_count > 1 && call.tool_name == "write_todos" {
                 let err = "Error: The `write_todos` tool should never be called multiple times in parallel. Please call it only once per model invocation to update the todo list.".to_string();
+                let (err_code, err_message) = parse_tool_error_string(&err);
                 self.emit_event(
                     sink,
                     RunEvent::ToolCallStarted {
@@ -1678,6 +1694,8 @@ impl ResumableRunner {
                     call_id,
                     serde_json::Value::Null,
                     Some(err.clone()),
+                    Some(err_code),
+                    Some(err_message),
                     "error".to_string(),
                     err,
                     None,
@@ -1725,6 +1743,8 @@ impl ResumableRunner {
                                 call_id: Some(call_id.clone()),
                                 output: serde_json::Value::Null,
                                 error: Some(err.clone()),
+                                error_code: Some(code.clone()),
+                                error_message: Some(reason.clone()),
                                 status: Some("error".to_string()),
                             });
                             self.messages.push(Message {
@@ -1733,7 +1753,7 @@ impl ResumableRunner {
                                     "tool_call_id": call_id.clone(),
                                     "tool_name": tool_name.clone(),
                                     "status": "error",
-                                    "error": err.clone(),
+                                    "error": { "code": code, "message": reason },
                                     "content": err,
                                 }))
                                 .unwrap_or_default(),
@@ -1768,6 +1788,8 @@ impl ResumableRunner {
                                     call_id: Some(call_id.clone()),
                                     output: serde_json::Value::Null,
                                     error: Some(err.clone()),
+                                    error_code: Some(code.clone()),
+                                    error_message: Some(reason.clone()),
                                     status: Some("error".to_string()),
                                 });
                                 self.messages.push(Message {
@@ -1776,7 +1798,7 @@ impl ResumableRunner {
                                         "tool_call_id": call_id.clone(),
                                         "tool_name": tool_name.clone(),
                                         "status": "error",
-                                        "error": err.clone(),
+                                        "error": { "code": code, "message": reason },
                                         "content": err,
                                     }))
                                     .unwrap_or_default(),
@@ -1890,6 +1912,11 @@ impl ResumableRunner {
                     let status = if error.is_some() { "error" } else { "success" }.to_string();
                     let tool_name = tool_name.clone();
                     let cid = call_id.clone();
+                    let (error_code, error_message) = error
+                        .as_deref()
+                        .map(parse_tool_error_string)
+                        .map(|(c, m)| (Some(c), Some(m)))
+                        .unwrap_or((None, None));
                     let (output, content) = if let Some(e) = &error {
                         (output, e.clone())
                     } else {
@@ -1909,6 +1936,8 @@ impl ResumableRunner {
                         cid,
                         output,
                         error,
+                        error_code,
+                        error_message,
                         status,
                         content,
                         None,
@@ -1989,6 +2018,8 @@ impl ResumableRunner {
                                         call_id.clone(),
                                         out,
                                         None,
+                                        None,
+                                        None,
                                         "success".to_string(),
                                         content,
                                         content_blocks,
@@ -2013,7 +2044,8 @@ impl ResumableRunner {
                                             duration_ms: Some(duration_ms),
                                         });
                                     }
-                                    let err = e.to_string();
+                                    let (code, message) = classify_anyhow_tool_error(&e);
+                                    let err = format!("{code}: {message}");
                                     let before_state = self.state.clone();
                                     self.push_tool_result_and_message(
                                         step_index,
@@ -2022,6 +2054,8 @@ impl ResumableRunner {
                                         call_id.clone(),
                                         serde_json::Value::Null,
                                         Some(err.clone()),
+                                        Some(code),
+                                        Some(message),
                                         "error".to_string(),
                                         err,
                                         None,
@@ -2063,6 +2097,8 @@ impl ResumableRunner {
                                 call_id.clone(),
                                 serde_json::Value::Null,
                                 Some(err.clone()),
+                                Some(code),
+                                Some(reason),
                                 "error".to_string(),
                                 err,
                                 None,
@@ -2103,6 +2139,8 @@ impl ResumableRunner {
                                     call_id.clone(),
                                     serde_json::Value::Null,
                                     Some(err.clone()),
+                                    Some(code),
+                                    Some(reason),
                                     "error".to_string(),
                                     err,
                                     None,
@@ -2166,6 +2204,8 @@ impl ResumableRunner {
                         call_id.clone(),
                         out,
                         None,
+                        None,
+                        None,
                         "success".to_string(),
                         content,
                         content_blocks,
@@ -2175,7 +2215,8 @@ impl ResumableRunner {
                     .await;
                 }
                 Err(e) => {
-                    let err = e.to_string();
+                    let (code, message) = classify_anyhow_tool_error(&e);
+                    let err = format!("{code}: {message}");
                     let before_state = self.state.clone();
                     self.push_tool_result_and_message(
                         step_index,
@@ -2184,6 +2225,8 @@ impl ResumableRunner {
                         call_id.clone(),
                         serde_json::Value::Null,
                         Some(err.clone()),
+                        Some(code),
+                        Some(message),
                         "error".to_string(),
                         err,
                         None,
@@ -2200,7 +2243,7 @@ impl ResumableRunner {
     async fn execute_pending_call(
         &mut self,
         step_index: usize,
-        call: ProviderToolCall,
+        call: AgentToolCall,
         edited_args: Option<serde_json::Value>,
         original_args: Option<serde_json::Value>,
         approved_by_user: bool,
@@ -2316,6 +2359,8 @@ impl ResumableRunner {
                                     call_id.clone(),
                                     output,
                                     None,
+                                    None,
+                                    None,
                                     status.to_string(),
                                     content,
                                     content_blocks,
@@ -2339,7 +2384,8 @@ impl ResumableRunner {
                                         duration_ms: Some(duration_ms),
                                     });
                                 }
-                                let err = e.to_string();
+                                let (code, message) = classify_anyhow_tool_error(&e);
+                                let err = format!("{code}: {message}");
                                 self.push_tool_result_and_message(
                                     step_index,
                                     &before_state,
@@ -2347,6 +2393,8 @@ impl ResumableRunner {
                                     call_id.clone(),
                                     serde_json::Value::Null,
                                     Some(err.clone()),
+                                    Some(code),
+                                    Some(message),
                                     "error".to_string(),
                                     err,
                                     None,
@@ -2382,6 +2430,8 @@ impl ResumableRunner {
                             call_id.clone(),
                             serde_json::Value::Null,
                             Some(err.clone()),
+                            Some(code),
+                            Some(reason),
                             "error".to_string(),
                             err,
                             None,
@@ -2415,6 +2465,8 @@ impl ResumableRunner {
                             call_id.clone(),
                             serde_json::Value::Null,
                             Some(err.clone()),
+                            Some(code),
+                            Some(reason),
                             "error".to_string(),
                             err,
                             None,
@@ -2476,6 +2528,8 @@ impl ResumableRunner {
                     call_id.clone(),
                     output,
                     None,
+                    None,
+                    None,
                     status.to_string(),
                     content,
                     content_blocks,
@@ -2485,7 +2539,8 @@ impl ResumableRunner {
                 .await;
             }
             Err(e) => {
-                let err = e.to_string();
+                let (code, message) = classify_anyhow_tool_error(&e);
+                let err = format!("{code}: {message}");
                 self.push_tool_result_and_message(
                     step_index,
                     &before_state,
@@ -2493,6 +2548,8 @@ impl ResumableRunner {
                     call_id.clone(),
                     serde_json::Value::Null,
                     Some(err.clone()),
+                    Some(code),
+                    Some(message),
                     "error".to_string(),
                     err,
                     None,
@@ -2507,7 +2564,7 @@ impl ResumableRunner {
     async fn inject_rejected_tool_message(
         &mut self,
         step_index: usize,
-        call: &ProviderToolCall,
+        call: &AgentToolCall,
         reason: Option<String>,
         sink: &mut dyn RunEventSink,
     ) {
@@ -2533,6 +2590,8 @@ impl ResumableRunner {
             call_id,
             serde_json::Value::Null,
             Some(err.clone()),
+            Some("tool_call_rejected".to_string()),
+            Some(reason2),
             "rejected".to_string(),
             err,
             None,
@@ -2541,6 +2600,39 @@ impl ResumableRunner {
         )
         .await;
     }
+}
+
+fn parse_tool_error_string(s: &str) -> (String, String) {
+    if let Some(rest) = s.strip_prefix("command_not_allowed: ") {
+        if let Some((code, reason)) = rest.split_once(':') {
+            return (code.trim().to_string(), reason.trim().to_string());
+        }
+        return ("command_not_allowed".to_string(), rest.trim().to_string());
+    }
+
+    let is_code = |c: &str| {
+        let c = c.trim();
+        !c.is_empty()
+            && c.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    };
+
+    if let Some((code, rest)) = s.split_once(':') {
+        if is_code(code) {
+            return (code.trim().to_string(), rest.trim().to_string());
+        }
+    }
+    ("unknown".to_string(), s.to_string())
+}
+
+fn classify_anyhow_tool_error(e: &anyhow::Error) -> (String, String) {
+    if let Some(be) = e.downcast_ref::<crate::backends::protocol::BackendError>() {
+        return (be.code_str().to_string(), be.message.clone());
+    }
+    if let Some(me) = e.downcast_ref::<crate::memory::protocol::MemoryError>() {
+        return (me.code.to_string(), me.message.clone());
+    }
+    ("unknown".to_string(), e.to_string())
 }
 
 fn validate_edit_args(tool_name: &str, args: &serde_json::Value) -> Result<(), String> {

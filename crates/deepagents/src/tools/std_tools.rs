@@ -57,6 +57,20 @@ impl Tool for LsTool {
         "Lists files and directories in a given path."
     }
 
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to list. Relative paths resolve from workspace; outside paths require policy allowlist."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })
+    }
+
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
         let input: LsInput = serde_json::from_value(input)?;
         let infos = self.backend.ls_info(&input.path).await?;
@@ -125,7 +139,38 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Reads a file from the local filesystem and returns cat -n formatted output."
+        "Reads a file from the local filesystem and returns cat -n formatted output. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting line offset (0-based, default: 0)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default: 100)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "text", "image"],
+                    "description": "Read mode: auto detects images by extension; text forces text; image forces image."
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum bytes to read when mode is auto/image (default: 4000000)."
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -213,7 +258,25 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Writes a new file to the filesystem."
+        "Writes a new file to the filesystem. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to write. Relative paths resolve from workspace; outside paths require policy allowlist."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full file contents to write."
+                }
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -246,7 +309,21 @@ impl Tool for DeleteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Deletes a file from the filesystem."
+        "Deletes a file from the filesystem. Use when: file is no longer needed, or to clean up after a failed operation, or user explicitly requests deletion. Don't use when: file is required for the agent to function, or command is destructive without approval."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to delete. Relative paths resolve from workspace; outside paths require policy allowlist."
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -281,6 +358,28 @@ impl Tool for EditFileTool {
         "Performs exact string replacements in files."
     }
 
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to edit. Relative paths resolve from workspace; outside paths require policy allowlist."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact literal string to replace (all occurrences)."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement string."
+                }
+            },
+            "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": false
+        })
+    }
+
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
         let input: EditFileInput = serde_json::from_value(input)?;
         let res = self
@@ -312,6 +411,20 @@ impl Tool for GlobTool {
 
     fn description(&self) -> &'static str {
         "Find files matching a glob pattern."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match file paths."
+                }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -358,6 +471,37 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &'static str {
         "Search for a literal text pattern across files."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Text pattern to search for."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional base directory to search within."
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional glob filter for file paths (e.g. \"*.rs\")."
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["files_with_matches", "content", "count"],
+                    "description": "Output format: matching files, matching lines, or per-file match counts (default: files_with_matches)."
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default: 100)."
+                }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -426,7 +570,26 @@ impl Tool for ExecuteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Executes a shell command in an isolated sandbox environment."
+        "Executes a shell command in an isolated sandbox environment. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Timeout in seconds (default: backend-defined)."
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        })
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<ToolResult> {

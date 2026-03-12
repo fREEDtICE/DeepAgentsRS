@@ -5,10 +5,11 @@ use std::sync::Arc;
 use crate::approval::{ApprovalPolicy, ExecutionMode};
 use crate::audit::AuditSink;
 use crate::backends::{LocalSandbox, SandboxBackend};
+use crate::llm::{StructuredOutputSpec, ToolChoice};
 use crate::middleware::filesystem::FilesystemMiddleware;
-use crate::middleware::protocol::{MiddlewareContext, ToolExecution};
-use crate::middleware::Middleware;
-use crate::provider::{Provider, StructuredOutputSpec, ToolChoice};
+use crate::middleware::protocol::{MiddlewareContext, ToolError, ToolExecution};
+use crate::middleware::ToolExecutionMiddleware;
+use crate::provider::AgentProvider;
 use crate::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use crate::runtime::{RuntimeConfig, RuntimeMiddleware};
 use crate::skills::SkillPlugin;
@@ -39,7 +40,7 @@ struct AgentRuntimeBuilderState {
 
 pub struct AgentRuntimeBuilder<State> {
     agent: DeepAgent,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn AgentProvider>,
     state: AgentRuntimeBuilderState,
     marker: PhantomData<State>,
 }
@@ -48,14 +49,15 @@ pub struct AgentRuntimeBuilder<State> {
 pub struct DeepAgent {
     backend: Arc<dyn SandboxBackend>,
     tools: HashMap<&'static str, Arc<dyn Tool>>,
-    middlewares: Vec<Arc<dyn Middleware>>,
+    middlewares: Vec<Arc<dyn ToolExecutionMiddleware>>,
 }
 
 impl DeepAgent {
     pub fn with_backend(backend: Arc<dyn SandboxBackend>) -> Self {
         let tools_vec = default_tools(backend.clone());
         let tools = tools_vec.into_iter().map(|t| (t.name(), t)).collect();
-        let middlewares: Vec<Arc<dyn Middleware>> = vec![Arc::new(FilesystemMiddleware::new())];
+        let middlewares: Vec<Arc<dyn ToolExecutionMiddleware>> =
+            vec![Arc::new(FilesystemMiddleware::new())];
         Self {
             backend,
             tools,
@@ -68,7 +70,8 @@ impl DeepAgent {
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
         let tools = tools.into_iter().map(|t| (t.name(), t)).collect();
-        let middlewares: Vec<Arc<dyn Middleware>> = vec![Arc::new(FilesystemMiddleware::new())];
+        let middlewares: Vec<Arc<dyn ToolExecutionMiddleware>> =
+            vec![Arc::new(FilesystemMiddleware::new())];
         Self {
             backend,
             tools,
@@ -80,7 +83,7 @@ impl DeepAgent {
         self.backend.clone()
     }
 
-    pub fn runtime(self, provider: Arc<dyn Provider>) -> AgentRuntimeBuilder<NeedsRoot> {
+    pub fn runtime(self, provider: Arc<dyn AgentProvider>) -> AgentRuntimeBuilder<NeedsRoot> {
         AgentRuntimeBuilder {
             agent: self,
             provider,
@@ -130,7 +133,7 @@ impl DeepAgent {
 
         let result = tool.call(input).await;
         let mut tool_result: Option<ToolResult> = None;
-        let exec = match result {
+        let mut exec = match result {
             Ok(res) => {
                 tool_result = Some(res.clone());
                 ToolExecution {
@@ -140,12 +143,19 @@ impl DeepAgent {
                     error: None,
                 }
             }
-            Err(e) => ToolExecution {
-                tool_name: name.to_string(),
-                input: exec.input,
-                output: None,
-                error: Some(e.to_string()),
-            },
+            Err(e) => {
+                let (code, message) = classify_tool_anyhow_error(&e);
+                ToolExecution {
+                    tool_name: name.to_string(),
+                    input: exec.input,
+                    output: None,
+                    error: Some(ToolError {
+                        code,
+                        message,
+                        source: e,
+                    }),
+                }
+            }
         };
 
         let filesystem_delta = {
@@ -161,8 +171,8 @@ impl DeepAgent {
             ctx.filesystem_delta
         };
 
-        match exec.error {
-            Some(err) => Err(anyhow::anyhow!(err)),
+        match exec.error.take() {
+            Some(err) => Err(err.source),
             None => Ok((
                 tool_result.unwrap_or(ToolResult {
                     output: serde_json::Value::Null,
@@ -172,6 +182,16 @@ impl DeepAgent {
             )),
         }
     }
+}
+
+fn classify_tool_anyhow_error(e: &anyhow::Error) -> (String, String) {
+    if let Some(be) = e.downcast_ref::<crate::backends::protocol::BackendError>() {
+        return (be.code_str().to_string(), be.message.clone());
+    }
+    if let Some(me) = e.downcast_ref::<crate::memory::protocol::MemoryError>() {
+        return (me.code.to_string(), me.message.clone());
+    }
+    ("unknown".to_string(), e.to_string())
 }
 
 pub fn create_deep_agent(root: impl Into<std::path::PathBuf>) -> anyhow::Result<DeepAgent> {

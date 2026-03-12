@@ -1,19 +1,29 @@
-use crate::provider::protocol::ProviderToolCall;
+use crate::provider::protocol::AgentToolCall;
 use crate::runtime::ToolResultRecord;
 use crate::types::{Message, ToolCall};
 
-fn stringify_error(v: &serde_json::Value) -> String {
+fn extract_error_fields(v: &serde_json::Value) -> (String, Option<String>, Option<String>) {
     match v {
-        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::String(s) => (s.clone(), None, Some(s.clone())),
         serde_json::Value::Object(m) => {
-            let code = m.get("code").and_then(|v| v.as_str());
-            let msg = m.get("message").and_then(|v| v.as_str());
-            match (code, msg) {
+            let code = m
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let msg = m
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let combined = match (&code, &msg) {
                 (Some(c), Some(m)) => format!("{c}: {m}"),
                 _ => v.to_string(),
-            }
+            };
+            (combined, code, msg)
         }
-        _ => v.to_string(),
+        _ => {
+            let s = v.to_string();
+            (s.clone(), None, Some(s))
+        }
     }
 }
 
@@ -106,7 +116,7 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
         };
 
         let parsed = serde_json::from_str::<serde_json::Value>(&msg.content).ok();
-        let (tool_name, output, error, status) = match parsed {
+        let (tool_name, output, error, error_code, error_message, status) = match parsed {
             Some(serde_json::Value::Object(map)) => {
                 let tool_name = msg
                     .name
@@ -117,17 +127,19 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
                     .get("output")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let error = map
+                let (error, error_code, error_message) = map
                     .get("error")
                     .filter(|e| !e.is_null())
-                    .map(stringify_error)
-                    .or_else(|| {
-                        if msg.status.as_deref() == Some("error") {
-                            Some(msg.content.clone())
-                        } else {
-                            None
-                        }
-                    });
+                    .map(extract_error_fields)
+                    .map(|(e, c, m)| (Some(e), c, m))
+                    .unwrap_or_else(|| (None, None, None));
+                let error = error.or_else(|| {
+                    if msg.status.as_deref() == Some("error") {
+                        Some(msg.content.clone())
+                    } else {
+                        None
+                    }
+                });
                 let status = msg
                     .status
                     .clone()
@@ -139,7 +151,7 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
                             Some("success".to_string())
                         }
                     });
-                (tool_name, output, error, status)
+                (tool_name, output, error, error_code, error_message, status)
             }
             _ => {
                 let tool_name = msg.name.clone().unwrap_or_else(|| "unknown".to_string());
@@ -149,7 +161,14 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
                 } else {
                     None
                 };
-                (tool_name, serde_json::Value::Null, error, status)
+                (
+                    tool_name,
+                    serde_json::Value::Null,
+                    error,
+                    None,
+                    None,
+                    status,
+                )
             }
         };
 
@@ -158,6 +177,8 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
             call_id: Some(call_id),
             output,
             error,
+            error_code,
+            error_message,
             status,
         });
     }
@@ -165,15 +186,12 @@ pub fn tool_results_from_messages(messages: &[Message]) -> Vec<ToolResultRecord>
 }
 
 pub enum NormalizedToolCall {
-    Valid(ProviderToolCall),
-    Invalid {
-        call: ProviderToolCall,
-        error: String,
-    },
+    Valid(AgentToolCall),
+    Invalid { call: AgentToolCall, error: String },
 }
 
 pub fn normalize_tool_call_for_execution(
-    mut call: ProviderToolCall,
+    mut call: AgentToolCall,
     next_call_id: &mut u64,
 ) -> NormalizedToolCall {
     if call.tool_name.trim().is_empty() {

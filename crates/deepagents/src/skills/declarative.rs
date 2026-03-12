@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::ProviderToolCall;
+use crate::provider::AgentToolCall;
 use crate::skills::protocol::{SkillCall, SkillError, SkillPlugin, SkillSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +55,7 @@ impl SkillPlugin for DeclarativeSkillPlugin {
             .collect()
     }
 
-    async fn call(&self, call: SkillCall) -> Result<Vec<ProviderToolCall>, SkillError> {
+    async fn call(&self, call: SkillCall) -> Result<Vec<AgentToolCall>, SkillError> {
         let skill = self
             .manifest
             .skills
@@ -70,7 +70,7 @@ impl SkillPlugin for DeclarativeSkillPlugin {
         let mut out = Vec::new();
         for tc in skill.tool_calls {
             let args = merge_args(tc.arguments, &call.input);
-            out.push(ProviderToolCall {
+            out.push(AgentToolCall {
                 tool_name: tc.tool_name,
                 arguments: args,
                 call_id: call.call_id.clone(),

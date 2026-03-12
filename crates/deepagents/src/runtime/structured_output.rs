@@ -1,4 +1,4 @@
-use crate::provider::StructuredOutputSpec;
+use crate::llm::StructuredOutputSpec;
 
 pub fn parse_structured_output(
     spec: &StructuredOutputSpec,
@@ -152,7 +152,7 @@ fn matches_type(value: &serde_json::Value, typ: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::parse_structured_output;
-    use crate::provider::StructuredOutputSpec;
+    use crate::llm::StructuredOutputSpec;
 
     fn spec(schema: serde_json::Value) -> StructuredOutputSpec {
         StructuredOutputSpec {

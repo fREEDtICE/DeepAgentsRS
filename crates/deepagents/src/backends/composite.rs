@@ -1,3 +1,8 @@
+//! 组合后端：把多个沙箱后端按“路径前缀”拼成一个统一后端视图。
+//!
+//! 典型用途：把不同根目录（或不同实现）的后端“挂载”到不同路径前缀下，
+//! 对上层暴露一个统一的 `FilesystemBackend` / `SandboxBackend`。
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -5,6 +10,10 @@ use async_trait::async_trait;
 use crate::backends::protocol::{Backend, BackendError, FilesystemBackend, SandboxBackend};
 use crate::types::{EditResult, ExecResult, FileInfo, GrepMatch, WriteResult};
 
+/// 按路径前缀路由的组合后端。
+///
+/// - `default`：未命中任何路由时使用的后端。
+/// - `routes`：前缀到后端的映射；匹配时采用“最长前缀优先”，以支持嵌套挂载。
 #[derive(Clone)]
 pub struct CompositeBackend {
     default: Arc<dyn SandboxBackend>,
@@ -18,6 +27,7 @@ struct Route {
 }
 
 impl CompositeBackend {
+    /// 创建组合后端，并设置默认后端。
     pub fn new(default: Arc<dyn SandboxBackend>) -> Self {
         Self {
             default,
@@ -25,6 +35,10 @@ impl CompositeBackend {
         }
     }
 
+    /// 添加一条路由：把 `prefix` 下的路径交给指定后端处理。
+    ///
+    /// 约定：
+    /// - `prefix` 会被规范化为以 `/` 开头、以 `/` 结尾，避免边界匹配歧义。
     pub fn with_route(
         mut self,
         prefix: impl Into<String>,
@@ -51,6 +65,7 @@ impl CompositeBackend {
             format!("/{path}")
         };
 
+        // 在所有匹配的路由里选“最长前缀”，以支持更精细的挂载覆盖更粗的挂载。
         let mut best: Option<(&Arc<dyn SandboxBackend>, &str)> = None;
         for r in &self.routes {
             if matches_prefix(&p, &r.prefix) {
@@ -77,6 +92,8 @@ impl CompositeBackend {
         &'a self,
         pattern: &'a str,
     ) -> (&'a Arc<dyn SandboxBackend>, String) {
+        // 对 glob/grep 这类模式字符串：只有以 `/` 开头时才参与路由，
+        // 否则视为后端内部相对模式，由默认后端处理。
         if !pattern.starts_with('/') {
             return (&self.default, pattern.to_string());
         }
@@ -84,6 +101,10 @@ impl CompositeBackend {
     }
 }
 
+/// 判断 `path` 是否命中 `prefix`。
+///
+/// 兼容两种场景：
+/// - `prefix` 既可表示目录（以 `/` 结尾），也可表示精确路径（去掉末尾 `/`）。
 fn matches_prefix(path: &str, prefix: &str) -> bool {
     if path == prefix.trim_end_matches('/') {
         return true;
@@ -91,6 +112,11 @@ fn matches_prefix(path: &str, prefix: &str) -> bool {
     path.starts_with(prefix)
 }
 
+/// 把全局路径去掉挂载前缀，返回“后端视角”的路径。
+///
+/// 例如：
+/// - path: `/mnt/a.txt`, prefix: `/mnt/` => `/a.txt`
+/// - path: `/mnt`, prefix: `/mnt/` => `/`
 fn strip_prefix_compat(path: &str, prefix: &str) -> String {
     let pfx = prefix.trim_end_matches('/');
     if path == pfx || path == prefix {
@@ -195,6 +221,8 @@ impl SandboxBackend for CompositeBackend {
         command: &str,
         timeout_secs: Option<u64>,
     ) -> Result<ExecResult, BackendError> {
+        // 组合后端目前不对“命令执行”做路由：统一交给默认后端执行，
+        // 以避免跨后端的工作目录/环境差异带来的语义不一致。
         self.default.execute(command, timeout_secs).await
     }
 }

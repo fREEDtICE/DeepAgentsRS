@@ -87,9 +87,9 @@ struct RunRequest {
     #[serde(default)]
     api_key_env: Option<String>,
     #[serde(default)]
-    tool_choice: Option<deepagents::provider::ToolChoice>,
+    tool_choice: Option<deepagents::llm::ToolChoice>,
     #[serde(default)]
-    structured_output: Option<deepagents::provider::StructuredOutputSpec>,
+    structured_output: Option<deepagents::llm::StructuredOutputSpec>,
     #[serde(default)]
     mock_script: Option<Value>,
     input: String,
@@ -413,7 +413,7 @@ async fn call_tool(
             )
         }
         Err(e) => {
-            let (code, msg) = classify_tool_error(e.to_string().as_str());
+            let (code, msg) = classify_anyhow_tool_error(&e);
             if req.tool_name == "execute" {
                 let cmd = req
                     .input
@@ -633,27 +633,34 @@ fn parse_execution_mode(s: Option<&str>) -> Option<ExecutionMode> {
     }
 }
 
-fn classify_tool_error(s: &str) -> (String, String) {
+fn classify_anyhow_tool_error(e: &anyhow::Error) -> (String, String) {
+    if let Some(be) = e.downcast_ref::<deepagents::backends::protocol::BackendError>() {
+        return (be.code_str().to_string(), be.message.clone());
+    }
+    if let Some(me) = e.downcast_ref::<deepagents::memory::protocol::MemoryError>() {
+        return (me.code.to_string(), me.message.clone());
+    }
+    let s = e.to_string();
+    if s.chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+    {
+        return (s.clone(), s);
+    }
     if let Some(rest) = s.strip_prefix("command_not_allowed: ") {
         if let Some((code, _)) = rest.split_once(':') {
-            return (code.trim().to_string(), s.to_string());
+            return (code.trim().to_string(), s);
         }
-        return ("command_not_allowed".to_string(), s.to_string());
+        return ("command_not_allowed".to_string(), s);
     }
-    for code in [
-        "file_not_found",
-        "is_directory",
-        "permission_denied",
-        "no_match",
-        "timeout",
-        "invalid_input",
-        "schema_validation_failed",
-    ] {
-        if s.contains(code) {
-            return (code.to_string(), s.to_string());
+    if let Some((code, _)) = s.split_once(':') {
+        if code
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+        {
+            return (code.trim().to_string(), s);
         }
     }
-    ("unknown".to_string(), s.to_string())
+    ("unknown".to_string(), s)
 }
 
 fn record_audit(
@@ -1056,7 +1063,7 @@ fn build_provider_bundle(
                     ),
                 )
             })?;
-            let mut config = deepagents::provider::OpenAiCompatibleConfig::new(model);
+            let mut config = deepagents::llm::OpenAiCompatibleConfig::new(model);
             if let Some(base_url) = &req.base_url {
                 config = config.with_base_url(base_url.clone());
             }
@@ -1082,6 +1089,43 @@ fn build_provider_bundle(
                 deepagents::provider::ProviderInitSpec::OpenAiCompatible { config },
             ))
         }
+        "openrouter" => {
+            let model = req.model.clone().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "missing model for openrouter provider",
+                        None,
+                    ),
+                )
+            })?;
+            let mut config = deepagents::llm::OpenRouterConfig::new(model);
+            if let Some(base_url) = &req.base_url {
+                config = config.with_base_url(base_url.clone());
+            }
+            let api_key = match (&req.api_key, &req.api_key_env) {
+                (Some(api_key), _) => Some(api_key.clone()),
+                (None, Some(env_name)) => Some(std::env::var(env_name).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        resp_err(
+                            "invalid_request",
+                            "missing env var for api_key_env",
+                            Some(json!({ "env": env_name })),
+                        ),
+                    )
+                })?),
+                (None, None) => std::env::var("OPENROUTER_API_KEY").ok(),
+            };
+            if let Some(api_key) = api_key {
+                config = config.with_api_key(api_key);
+            }
+            Ok(deepagents::provider::build_provider_bundle(
+                req.provider.clone(),
+                deepagents::provider::ProviderInitSpec::OpenRouter { config },
+            ))
+        }
         other => Err((
             StatusCode::BAD_REQUEST,
             resp_err(
@@ -1095,8 +1139,8 @@ fn build_provider_bundle(
 
 fn ensure_provider_request_supported(
     diagnostics: &deepagents::provider::ProviderDiagnostics,
-    tool_choice: &deepagents::provider::ToolChoice,
-    structured_output: Option<&deepagents::provider::StructuredOutputSpec>,
+    tool_choice: &deepagents::llm::ToolChoice,
+    structured_output: Option<&deepagents::llm::StructuredOutputSpec>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     if structured_output.is_some() && !diagnostics.supports_structured_output() {
         return Err((
@@ -1111,7 +1155,7 @@ fn ensure_provider_request_supported(
 
     if matches!(
         tool_choice,
-        deepagents::provider::ToolChoice::Required | deepagents::provider::ToolChoice::Named { .. }
+        deepagents::llm::ToolChoice::Required | deepagents::llm::ToolChoice::Named { .. }
     ) && !diagnostics.supports_tool_choice()
     {
         return Err((

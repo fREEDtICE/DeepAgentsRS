@@ -1,3 +1,5 @@
+# DEPRECATED! DO NOT READ!
+
 # DeepAgentsRS + ZeroClaw Platform Integration Plan
 
 ## Purpose

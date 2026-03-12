@@ -5,7 +5,8 @@ use async_trait::async_trait;
 
 use crate::approval::{ApprovalPolicy, ExecutionMode};
 use crate::audit::AuditSink;
-use crate::provider::{Provider, StructuredOutputSpec, ToolChoice};
+use crate::llm::{StructuredOutputSpec, ToolChoice};
+use crate::provider::AgentProvider;
 use crate::runtime::events::RunEventSink;
 use crate::runtime::protocol::{
     RunOutput, Runtime, RuntimeConfig, RuntimeMiddleware, StreamingRuntime,
@@ -18,7 +19,7 @@ use crate::DeepAgent;
 
 pub struct SimpleRuntime {
     agent: DeepAgent,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn AgentProvider>,
     skills: Vec<Arc<dyn SkillPlugin>>,
     config: RuntimeConfig,
     approval: Option<Arc<dyn ApprovalPolicy>>,
@@ -43,7 +44,7 @@ pub struct SimpleRuntimeOptions {
 impl SimpleRuntime {
     pub fn new(
         agent: DeepAgent,
-        provider: Arc<dyn Provider>,
+        provider: Arc<dyn AgentProvider>,
         skills: Vec<Arc<dyn SkillPlugin>>,
         options: SimpleRuntimeOptions,
     ) -> Self {

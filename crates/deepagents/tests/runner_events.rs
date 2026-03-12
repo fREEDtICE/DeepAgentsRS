@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use deepagents::approval::{DefaultApprovalPolicy, ExecutionMode};
+use deepagents::llm::{
+    final_text_step, AssistantMessageMetadata, ChatRequest, ChatResponse, LlmEvent, LlmEventStream,
+    LlmProvider, LlmProviderCapabilities, MockLlmProvider, ToolChoice,
+};
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
 use deepagents::provider::{
-    final_text_step, AssistantMessageMetadata, LlmEvent, LlmEventStream, LlmProvider,
-    LlmProviderAdapter, LlmProviderCapabilities, MockLlmProvider,
-};
-use deepagents::provider::{
-    Provider, ProviderRequest, ProviderStep, ProviderStepOutput, ProviderToolCall, ToolChoice,
+    AgentProvider, AgentProviderRequest, AgentStep, AgentStepOutput, AgentToolCall,
+    LlmProviderAdapter,
 };
 use deepagents::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use deepagents::runtime::{
@@ -32,7 +33,7 @@ fn build_runner(
     script: MockScript,
     interrupt_on_tools: &[&str],
 ) -> ResumableRunner {
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -57,7 +58,7 @@ fn build_runner(
 
 fn build_runner_from_provider(
     root: &std::path::Path,
-    provider: Arc<dyn deepagents::provider::Provider>,
+    provider: Arc<dyn deepagents::provider::AgentProvider>,
     interrupt_on_tools: &[&str],
 ) -> ResumableRunner {
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
@@ -82,7 +83,7 @@ fn build_runner_from_provider(
 }
 
 fn build_simple_runtime(root: &std::path::Path, script: MockScript) -> SimpleRuntime {
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
     let agent = deepagents::create_deep_agent_with_backend(backend);
@@ -124,11 +125,11 @@ struct CaptureToolChoiceProvider {
 #[derive(Default)]
 struct ReasoningRoundTripProvider {
     step_idx: AtomicUsize,
-    requests: std::sync::Mutex<Vec<ProviderRequest>>,
+    requests: std::sync::Mutex<Vec<AgentProviderRequest>>,
 }
 
 impl ReasoningRoundTripProvider {
-    fn requests(&self) -> Vec<ProviderRequest> {
+    fn requests(&self) -> Vec<AgentProviderRequest> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -136,11 +137,11 @@ impl ReasoningRoundTripProvider {
 #[derive(Default)]
 struct MultimodalRoundTripProvider {
     step_idx: AtomicUsize,
-    requests: std::sync::Mutex<Vec<ProviderRequest>>,
+    requests: std::sync::Mutex<Vec<AgentProviderRequest>>,
 }
 
 impl MultimodalRoundTripProvider {
-    fn requests(&self) -> Vec<ProviderRequest> {
+    fn requests(&self) -> Vec<AgentProviderRequest> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -158,33 +159,31 @@ impl LlmProvider for ChatOnlyLlmProvider {
         }
     }
 
-    async fn chat(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn chat(&self, _req: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.chat_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ProviderStepOutput::from(ProviderStep::FinalText {
-            text: "chat-only".to_string(),
-        }))
+        Ok(ChatResponse::new("chat-only"))
     }
 
-    async fn stream_chat(&self, _req: ProviderRequest) -> anyhow::Result<LlmEventStream> {
+    async fn stream_chat(&self, _req: ChatRequest) -> anyhow::Result<LlmEventStream> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         Err(anyhow::anyhow!("streaming unsupported"))
     }
 }
 
 #[async_trait]
-impl Provider for CountingProvider {
-    async fn step(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for CountingProvider {
+    async fn step(&self, _req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         self.step_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "DONE".to_string(),
         })
     }
 
     async fn step_with_collector(
         &self,
-        _req: ProviderRequest,
-        _collector: &mut dyn deepagents::provider::ProviderEventCollector,
-    ) -> anyhow::Result<ProviderStep> {
+        _req: AgentProviderRequest,
+        _collector: &mut dyn deepagents::provider::AgentProviderEventCollector,
+    ) -> anyhow::Result<AgentStep> {
         self.collector_calls.fetch_add(1, Ordering::SeqCst);
         Err(anyhow::anyhow!(
             "step_with_collector should not be used by run()"
@@ -193,26 +192,26 @@ impl Provider for CountingProvider {
 }
 
 #[async_trait]
-impl Provider for CaptureToolChoiceProvider {
-    async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for CaptureToolChoiceProvider {
+    async fn step(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         self.seen.lock().unwrap().push(req.tool_choice);
-        Ok(ProviderStep::FinalText {
+        Ok(AgentStep::FinalText {
             text: "ok".to_string(),
         })
     }
 }
 
 #[async_trait]
-impl Provider for ReasoningRoundTripProvider {
-    async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for ReasoningRoundTripProvider {
+    async fn step(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         Ok(self.step_output(req).await?.step)
     }
 
-    async fn step_output(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn step_output(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStepOutput> {
         self.requests.lock().unwrap().push(req);
         let output = match self.step_idx.fetch_add(1, Ordering::SeqCst) {
-            0 => ProviderStepOutput::from(ProviderStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+            0 => AgentStepOutput::from(AgentStep::ToolCalls {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "reasoning.txt",
@@ -225,7 +224,7 @@ impl Provider for ReasoningRoundTripProvider {
                 content_blocks: None,
                 reasoning_content: Some("Need to preserve this reasoning.".to_string()),
             }),
-            _ => ProviderStepOutput::from(ProviderStep::FinalText {
+            _ => AgentStepOutput::from(AgentStep::FinalText {
                 text: "done".to_string(),
             }),
         };
@@ -234,17 +233,17 @@ impl Provider for ReasoningRoundTripProvider {
 }
 
 #[async_trait]
-impl Provider for MultimodalRoundTripProvider {
-    async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for MultimodalRoundTripProvider {
+    async fn step(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         Ok(self.step_output(req).await?.step)
     }
 
-    async fn step_output(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn step_output(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStepOutput> {
         self.requests.lock().unwrap().push(req);
         let output = match self.step_idx.fetch_add(1, Ordering::SeqCst) {
-            0 => ProviderStepOutput::from(ProviderStep::AssistantMessageWithToolCalls {
+            0 => AgentStepOutput::from(AgentStep::AssistantMessageWithToolCalls {
                 text: "Reviewing the image.".to_string(),
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "multimodal.txt",
@@ -257,7 +256,7 @@ impl Provider for MultimodalRoundTripProvider {
                 content_blocks: Some(vec![ContentBlock::image_base64("image/png", "AAEC")]),
                 reasoning_content: None,
             }),
-            _ => ProviderStepOutput::from(ProviderStep::FinalText {
+            _ => AgentStepOutput::from(AgentStep::FinalText {
                 text: "done".to_string(),
             }),
         };
@@ -330,7 +329,7 @@ async fn re02_tool_run_emits_tool_events_in_order() {
         MockScript {
             steps: vec![
                 MockStep::ToolCalls {
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "write_file".to_string(),
                         arguments: serde_json::json!({
                             "file_path": "a.txt",
@@ -426,7 +425,7 @@ async fn re03_interrupt_emits_interrupt_without_tool_started() {
         dir.path(),
         MockScript {
             steps: vec![MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_file".to_string(),
                     arguments: serde_json::json!({
                         "file_path": "blocked.txt",
@@ -536,7 +535,7 @@ async fn re05_provider_error_still_emits_run_finished() {
 #[tokio::test]
 async fn re06_llm_adapter_streams_delta_events_before_provider_step() {
     let dir = tempfile::tempdir().unwrap();
-    let provider: Arc<dyn deepagents::provider::Provider> = Arc::new(LlmProviderAdapter::new(
+    let provider: Arc<dyn deepagents::provider::AgentProvider> = Arc::new(LlmProviderAdapter::new(
         Arc::new(MockLlmProvider::new(vec![
             LlmEvent::AssistantTextDelta {
                 text: "Hel".to_string(),
@@ -628,7 +627,7 @@ async fn re06_llm_adapter_streams_delta_events_before_provider_step() {
 async fn re07_run_uses_non_stream_provider_path() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(CountingProvider::default());
-    let provider_obj: Arc<dyn Provider> = provider.clone();
+    let provider_obj: Arc<dyn AgentProvider> = provider.clone();
     let mut runner = build_runner_from_provider(dir.path(), provider_obj, &[]);
     runner.push_user_input("go".to_string());
 
@@ -682,7 +681,7 @@ async fn re08_simple_runtime_implements_streaming_runtime_trait() {
 async fn re09_llm_adapter_falls_back_to_chat_when_streaming_not_supported() {
     let dir = tempfile::tempdir().unwrap();
     let inner = Arc::new(ChatOnlyLlmProvider::default());
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(LlmProviderAdapter::new(inner.clone()));
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]);
     runner.push_user_input("go".to_string());
@@ -703,7 +702,7 @@ async fn re09_llm_adapter_falls_back_to_chat_when_streaming_not_supported() {
 #[tokio::test]
 async fn re10_llm_adapter_rejects_explicit_tool_binding_when_tool_calling_is_unsupported() {
     let provider = LlmProviderAdapter::new(Arc::new(ChatOnlyLlmProvider::default()));
-    let req = ProviderRequest {
+    let req = AgentProviderRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: "go".to_string(),
@@ -724,7 +723,7 @@ async fn re10_llm_adapter_rejects_explicit_tool_binding_when_tool_calling_is_uns
                 }
             }),
         }],
-        tool_choice: deepagents::provider::ToolChoice::Required,
+        tool_choice: deepagents::llm::ToolChoice::Required,
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
@@ -743,12 +742,10 @@ async fn re10a_llm_adapter_rejects_required_tool_choice_without_tools_even_if_to
     capabilities.supports_streaming = false;
 
     let provider = LlmProviderAdapter::new(Arc::new(
-        deepagents::provider::MockLlmProvider::new(vec![deepagents::provider::final_text_step(
-            "ok",
-        )])
-        .with_capabilities(capabilities),
+        deepagents::llm::MockLlmProvider::new(vec![deepagents::llm::final_text_step("ok")])
+            .with_capabilities(capabilities),
     ));
-    let req = ProviderRequest {
+    let req = AgentProviderRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: "go".to_string(),
@@ -760,7 +757,7 @@ async fn re10a_llm_adapter_rejects_required_tool_choice_without_tools_even_if_to
             status: None,
         }],
         tool_specs: Vec::new(),
-        tool_choice: deepagents::provider::ToolChoice::Required,
+        tool_choice: deepagents::llm::ToolChoice::Required,
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
@@ -774,7 +771,7 @@ async fn re10a_llm_adapter_rejects_required_tool_choice_without_tools_even_if_to
 #[tokio::test]
 async fn re10b_llm_adapter_rejects_structured_output_when_provider_does_not_support_it() {
     let provider = LlmProviderAdapter::new(Arc::new(ChatOnlyLlmProvider::default()));
-    let req = ProviderRequest {
+    let req = AgentProviderRequest {
         messages: vec![Message {
             role: "user".to_string(),
             content: "go".to_string(),
@@ -786,11 +783,11 @@ async fn re10b_llm_adapter_rejects_structured_output_when_provider_does_not_supp
             status: None,
         }],
         tool_specs: Vec::new(),
-        tool_choice: deepagents::provider::ToolChoice::Auto,
+        tool_choice: deepagents::llm::ToolChoice::Auto,
         skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
-        structured_output: Some(deepagents::provider::StructuredOutputSpec {
+        structured_output: Some(deepagents::llm::StructuredOutputSpec {
             name: "final_answer".to_string(),
             schema: serde_json::json!({
                 "type": "object",
@@ -818,7 +815,7 @@ async fn re11_runner_preserves_assistant_text_when_step_also_contains_tool_calls
             steps: vec![
                 MockStep::AssistantMessageWithToolCalls {
                     text: "Checking the file".to_string(),
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "write_file".to_string(),
                         arguments: serde_json::json!({
                             "file_path": "note.txt",
@@ -864,7 +861,7 @@ async fn re11_runner_preserves_assistant_text_when_step_also_contains_tool_calls
 async fn re11a_runner_round_trips_reasoning_content_in_provider_history() {
     let dir = tempfile::tempdir().unwrap();
     let inner = Arc::new(ReasoningRoundTripProvider::default());
-    let provider: Arc<dyn deepagents::provider::Provider> = inner.clone();
+    let provider: Arc<dyn deepagents::provider::AgentProvider> = inner.clone();
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]);
     runner.push_user_input("go".to_string());
 
@@ -905,7 +902,7 @@ async fn re11a_runner_round_trips_reasoning_content_in_provider_history() {
 async fn re11aa_runner_round_trips_multimodal_content_blocks_in_provider_history() {
     let dir = tempfile::tempdir().unwrap();
     let inner = Arc::new(MultimodalRoundTripProvider::default());
-    let provider: Arc<dyn deepagents::provider::Provider> = inner.clone();
+    let provider: Arc<dyn deepagents::provider::AgentProvider> = inner.clone();
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]);
     runner.push_user_input("go".to_string());
 
@@ -947,14 +944,14 @@ async fn re11aa_runner_round_trips_multimodal_content_blocks_in_provider_history
 #[tokio::test]
 async fn re11b_runner_parses_structured_output_into_run_output() {
     let dir = tempfile::tempdir().unwrap();
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(MockScript {
             steps: vec![MockStep::FinalText {
                 text: "{\"answer\":\"done\",\"confidence\":0.9}".to_string(),
             }],
         }));
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]).with_structured_output(
-        deepagents::provider::StructuredOutputSpec {
+        deepagents::llm::StructuredOutputSpec {
             name: "final_answer".to_string(),
             schema: serde_json::json!({
                 "type": "object",
@@ -987,14 +984,14 @@ async fn re11b_runner_parses_structured_output_into_run_output() {
 #[tokio::test]
 async fn re11c_runner_returns_error_when_structured_output_is_invalid_json() {
     let dir = tempfile::tempdir().unwrap();
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(MockScript {
             steps: vec![MockStep::FinalText {
                 text: "not json".to_string(),
             }],
         }));
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]).with_structured_output(
-        deepagents::provider::StructuredOutputSpec {
+        deepagents::llm::StructuredOutputSpec {
             name: "final_answer".to_string(),
             schema: serde_json::json!({
                 "type": "object",
@@ -1025,7 +1022,7 @@ async fn re11c_runner_returns_error_when_structured_output_is_invalid_json() {
 async fn re12_runner_passes_configured_tool_choice_into_provider_requests() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(CaptureToolChoiceProvider::default());
-    let provider_dyn: Arc<dyn deepagents::provider::Provider> = provider.clone();
+    let provider_dyn: Arc<dyn deepagents::provider::AgentProvider> = provider.clone();
     let mut runner = build_runner_from_provider(dir.path(), provider_dyn, &[])
         .with_tool_choice(ToolChoice::Required);
     runner.push_user_input("go".to_string());
@@ -1042,11 +1039,11 @@ async fn re12_runner_passes_configured_tool_choice_into_provider_requests() {
 #[tokio::test]
 async fn re13_non_interactive_execute_require_approval_is_reported_as_tool_error_not_interrupt() {
     let dir = tempfile::tempdir().unwrap();
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(MockScript {
             steps: vec![
                 MockStep::ToolCalls {
-                    calls: vec![ProviderToolCall {
+                    calls: vec![AgentToolCall {
                         tool_name: "execute".to_string(),
                         arguments: serde_json::json!({
                             "command": "echo hi",
@@ -1098,14 +1095,14 @@ async fn re13_non_interactive_execute_require_approval_is_reported_as_tool_error
 #[tokio::test]
 async fn re14_runner_returns_error_when_structured_output_violates_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(MockScript {
             steps: vec![MockStep::FinalText {
                 text: "{\"confidence\":0.9}".to_string(),
             }],
         }));
     let mut runner = build_runner_from_provider(dir.path(), provider, &[]).with_structured_output(
-        deepagents::provider::StructuredOutputSpec {
+        deepagents::llm::StructuredOutputSpec {
             name: "final_answer".to_string(),
             schema: serde_json::json!({
                 "type": "object",

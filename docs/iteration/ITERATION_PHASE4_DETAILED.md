@@ -168,7 +168,7 @@ child → parent（回传）：
   - `ProviderStep` 增加 `assistant_message`（或等价）以表达“非终止 assistant 输出”
   - `RunOutput`（如需要）补齐 child/parent 对“最后一条消息”的可回归表达（优先通过 tests 断言，不强制对外暴露更复杂结构）
 - middleware 协议增量：
-  - `Middleware` 新增可短路 hook（例如 `handle_tool_call`），用于接管 `task` 的执行路径
+  - `RuntimeMiddleware` 新增可短路 hook（例如 `handle_tool_call`），用于接管 `task` 的执行路径
 - state 模型增量：
   - `AgentState` 扩展 `extra`（用于承载可过滤键），并提供稳定的过滤/合并策略入口
 - tools 列表增量：
@@ -187,9 +187,9 @@ child → parent（回传）：
 - SubAgentRegistry：负责子代理的注册与解析
 - StateTransfer/StateMerge：负责 state 过滤、隔离与合并策略（可测试、可替换）
 
-### 4.2 `Middleware` 协议的最小扩展（让 task 可“接管执行”）
+### 4.2 `RuntimeMiddleware` 协议的最小扩展（让 task 可“接管执行”）
 
-现有 middleware 只能 before/after，无法阻止底层工具执行。为实现 `task` 的“系统级工具”，需要增加一个“可短路”的 hook（保持向后兼容）：
+现有工具执行中间件只能 before/after，无法阻止底层工具执行。为实现 `task` 的“系统级工具”，需要在 runtime 层增加一个“可短路”的 hook（保持向后兼容）：
 
 - 新增 `handle_tool_call(...) -> Option<ToolResultOverride>`
   - 默认返回 `None`（不接管）

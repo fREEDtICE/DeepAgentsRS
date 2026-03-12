@@ -1,3 +1,14 @@
+//! 基于本地文件的 memory 存储实现。
+//!
+//! 这个实现把所有条目缓存在进程内（InMemory），并将其持久化为一个 JSON 文件（MemoryFileV1）。
+//! 关键设计点：
+//! - 惰性加载：首次读写前 ensure_loaded() 从磁盘加载一次，避免启动时 I/O。
+//! - 原子写入：flush()/render_agents_md() 使用 write_atomic()，先写 tmp 再 rename。
+//! - 配额与淘汰：put() 后调用 evict_if_needed()，按策略把超限条目移除。
+//! - 额外输出：render_agents_md() 会把条目渲染到 AGENTS.md，供外部工具消费。
+//!
+//! 注意：这里用 Mutex 保护内部状态，定位是“简单可靠”的本地存储，不追求极致并发吞吐。
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +21,11 @@ use crate::memory::protocol::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+/// 持久化文件的 v1 版本格式。
+///
+/// - version：用于向前/向后兼容（目前仅支持 1）
+/// - policy：与文件绑定的策略快照
+/// - entries：条目列表
 struct MemoryFileV1 {
     version: u32,
     policy: MemoryPolicy,
@@ -18,6 +34,9 @@ struct MemoryFileV1 {
 }
 
 #[derive(Debug, Default)]
+/// 进程内缓存状态。
+///
+/// loaded 用于保证“只加载一次”，避免并发场景重复 I/O 与反序列化。
 struct InMemory {
     loaded: bool,
     policy: MemoryPolicy,
@@ -25,6 +44,12 @@ struct InMemory {
 }
 
 #[derive(Clone)]
+/// 文件后端的 MemoryStore 实现。
+///
+/// - path：memory_store.json（或同类文件）位置
+/// - agents_md_path：额外导出的 AGENTS.md 路径
+/// - default_policy：文件不存在时的初始策略
+/// - state：共享状态（允许克隆 store 在多处使用）
 pub struct FileMemoryStore {
     name: String,
     path: PathBuf,
@@ -34,6 +59,9 @@ pub struct FileMemoryStore {
 }
 
 impl FileMemoryStore {
+    /// 创建一个文件后端的 memory store。
+    ///
+    /// 默认会把 agents_md_path 设为与存储文件同目录下的 AGENTS.md。
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let agents_md_path = path
@@ -59,14 +87,17 @@ impl FileMemoryStore {
         self
     }
 
+    /// 持久化文件路径（通常是 memory_store.json）。
     pub fn store_path(&self) -> &Path {
         &self.path
     }
 
+    /// AGENTS.md 输出路径。
     pub fn agents_md_path(&self) -> &Path {
         &self.agents_md_path
     }
 
+    /// 把当前条目渲染为 AGENTS.md（会触发惰性加载）。
     pub async fn render_agents_md(&self) -> Result<(), MemoryError> {
         self.ensure_loaded().await?;
         let entries = {
@@ -125,10 +156,12 @@ impl FileMemoryStore {
         Ok(())
     }
 
+    /// 当前时间（RFC3339，秒级精度，带 Z）。
     fn now_rfc3339() -> String {
         Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
+    /// 粗略估算一个条目的“占用字节数”，用于配额判断。
     fn entry_size_bytes(e: &MemoryEntry) -> usize {
         e.key.len()
             + e.value.len()
@@ -143,12 +176,14 @@ impl FileMemoryStore {
         entries.iter().map(Self::entry_size_bytes).sum()
     }
 
+    /// 解析 RFC3339 时间戳；解析失败返回 None（上层可用兜底策略）。
     fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     }
 
+    /// 查询匹配：prefix 与 tag 同时存在时必须都满足。
     fn matches_query(e: &MemoryEntry, q: &MemoryQuery) -> bool {
         if let Some(prefix) = &q.prefix {
             if !e.key.starts_with(prefix) {
@@ -174,10 +209,12 @@ impl MemoryStore for FileMemoryStore {
         self.default_policy.clone()
     }
 
+    /// 显式触发加载（通常也会在首次读写时自动触发）。
     async fn load(&self) -> Result<(), MemoryError> {
         self.ensure_loaded().await
     }
 
+    /// 将当前状态刷盘为 JSON。
     async fn flush(&self) -> Result<(), MemoryError> {
         self.ensure_loaded().await?;
         let (policy, entries) = {
@@ -207,6 +244,10 @@ impl MemoryStore for FileMemoryStore {
         Ok(())
     }
 
+    /// 写入/更新条目。
+    ///
+    /// - 对同 key 的条目执行覆盖更新，并更新时间/访问统计字段
+    /// - 写入后会按策略执行淘汰，确保不超过配额
     async fn put(&self, mut entry: MemoryEntry) -> Result<(), MemoryError> {
         self.ensure_loaded().await?;
         {
@@ -239,6 +280,7 @@ impl MemoryStore for FileMemoryStore {
         Ok(())
     }
 
+    /// 获取条目（命中则更新 last_accessed_at 与 access_count）。
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>, MemoryError> {
         self.ensure_loaded().await?;
         let mut guard = self.state.lock().unwrap();
@@ -251,6 +293,9 @@ impl MemoryStore for FileMemoryStore {
         Ok(None)
     }
 
+    /// 查询条目：
+    /// - 先过滤，再按 last_accessed_at 倒序（更“新”的优先返回）
+    /// - 对返回集合中的条目同步更新访问统计
     async fn query(&self, q: MemoryQuery) -> Result<Vec<MemoryEntry>, MemoryError> {
         self.ensure_loaded().await?;
         let mut guard = self.state.lock().unwrap();
@@ -279,6 +324,10 @@ impl MemoryStore for FileMemoryStore {
         Ok(out)
     }
 
+    /// 按策略淘汰直到满足 max_entries 与 max_bytes_total。
+    ///
+    /// 这里的实现刻意选择“简单循环”：每次移除 1 条最应该淘汰的记录，
+    /// 直到配额满足或条目为空。对小规模条目（默认 200）可读性更重要。
     async fn evict_if_needed(&self) -> Result<MemoryEvictionReport, MemoryError> {
         self.ensure_loaded().await?;
         let mut guard = self.state.lock().unwrap();
@@ -346,6 +395,7 @@ impl MemoryStore for FileMemoryStore {
     }
 }
 
+/// 把 memory entries 渲染为 AGENTS.md 的 v1 片段。
 fn render_agents_md_v1(entries: &[MemoryEntry]) -> String {
     let mut buf = String::new();
     buf.push_str("<auto_generated_memory_v1>\n");
@@ -361,6 +411,7 @@ fn render_agents_md_v1(entries: &[MemoryEntry]) -> String {
     buf
 }
 
+/// 读取文件为字节；如果文件不存在则返回 Ok(None)。
 async fn read_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, anyhow::Error> {
     match tokio::fs::read(path).await {
         Ok(b) => Ok(Some(b)),
@@ -369,6 +420,7 @@ async fn read_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, anyhow::Error> 
     }
 }
 
+/// 原子写入：写入临时文件后 rename 覆盖目标文件。
 async fn write_atomic(path: &Path, content: &[u8]) -> Result<(), anyhow::Error> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     tokio::fs::create_dir_all(parent).await?;

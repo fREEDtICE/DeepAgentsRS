@@ -1,105 +1,23 @@
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
+use crate::llm::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, LlmEvent, LlmProvider,
+    LlmProviderCapabilities, ToolCall as LlmToolCall, ToolChoice, ToolSpec as LlmToolSpec,
+    ToolsPayload,
+};
 use crate::provider::prompt_guided::{validate_prompt_guided_tool_choice, PromptGuidedConfig};
 use crate::provider::protocol::{
-    Provider, ProviderEvent, ProviderEventCollector, ProviderRequest, ProviderStep,
-    ProviderStepOutput, ProviderToolCall, ToolChoice,
+    AgentProvider, AgentProviderEvent, AgentProviderEventCollector, AgentProviderRequest,
+    AgentStep, AgentStepOutput, AgentToolCall,
 };
-use crate::runtime::ToolSpec;
+use crate::types::{Message, ToolCall};
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MultimodalInputRoles {
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub user: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub assistant: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub tool: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub system: bool,
-}
-
-impl MultimodalInputRoles {
-    pub const fn user_only() -> Self {
-        Self {
-            user: true,
-            assistant: false,
-            tool: false,
-            system: false,
-        }
-    }
-
-    pub const fn user_and_tool() -> Self {
-        Self {
-            user: true,
-            assistant: false,
-            tool: true,
-            system: false,
-        }
-    }
-
-    pub fn supports_role(&self, role: &str) -> bool {
-        match role {
-            "user" => self.user,
-            "assistant" => self.assistant,
-            "tool" => self.tool,
-            "system" => self.system,
-            _ => false,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        !(self.user || self.assistant || self.tool || self.system)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MultimodalCapabilities {
-    #[serde(default, skip_serializing_if = "MultimodalInputRoles::is_empty")]
-    pub input_image_roles: MultimodalInputRoles,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub supports_output_image_blocks: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub supports_remote_image_urls: bool,
-}
-
-impl MultimodalCapabilities {
-    pub const fn image_input_output(input_image_roles: MultimodalInputRoles) -> Self {
-        Self {
-            input_image_roles,
-            supports_output_image_blocks: true,
-            supports_remote_image_urls: true,
-        }
-    }
-
-    pub fn is_disabled(&self) -> bool {
-        self.input_image_roles.is_empty()
-            && !self.supports_output_image_blocks
-            && !self.supports_remote_image_urls
-    }
-}
-
-pub type LlmEventStream = Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send + 'static>>;
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LlmProviderCapabilities {
-    pub supports_streaming: bool,
-    pub supports_tool_calling: bool,
-    pub reports_usage: bool,
-    pub supports_structured_output: bool,
-    pub supports_reasoning_content: bool,
-    #[serde(default, skip_serializing_if = "MultimodalCapabilities::is_disabled")]
-    pub multimodal: MultimodalCapabilities,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,72 +83,7 @@ impl ProviderDiagnostics {
     }
 }
 
-/// Typed function-style tool metadata shared by provider adapters.
-///
-/// This keeps the stable tool contract strongly typed within Rust while
-/// allowing each provider to map it to its own wire format.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FunctionTool {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
-}
-
-/// Provider-layer result of converting canonical `ToolSpec` values.
-///
-/// This type is intentionally provider-layer only. Runtime, CLI, and ACP
-/// should only work with the unified `ToolChoice` plus canonical `ToolSpec`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolsPayload {
-    #[default]
-    None,
-    FunctionTools {
-        tools: Vec<FunctionTool>,
-    },
-    PromptGuided {
-        instructions: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum LlmEvent {
-    AssistantTextDelta {
-        text: String,
-    },
-    ToolCallArgsDelta {
-        tool_call_id: String,
-        delta: String,
-    },
-    Usage {
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        total_tokens: Option<u64>,
-    },
-    FinalStep {
-        output: ProviderStepOutput,
-    },
-}
-
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    fn capabilities(&self) -> LlmProviderCapabilities {
-        LlmProviderCapabilities::default()
-    }
-
-    /// Convert canonical tool specs into provider-native tool payloads.
-    ///
-    /// This is intended to be the primary extension point for provider-native
-    /// tool binding behavior.
-    fn convert_tools(&self, tool_specs: &[ToolSpec]) -> anyhow::Result<ToolsPayload> {
-        let _ = tool_specs;
-        Ok(ToolsPayload::None)
-    }
-
-    async fn chat(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput>;
-
-    async fn stream_chat(&self, req: ProviderRequest) -> anyhow::Result<LlmEventStream>;
-}
+pub type AgentProviderFromLlm = LlmProviderAdapter;
 
 pub struct LlmProviderAdapter {
     inner: Arc<dyn LlmProvider>,
@@ -243,17 +96,17 @@ impl LlmProviderAdapter {
 }
 
 struct AdaptedRequest {
-    request: ProviderRequest,
+    request: ChatRequest,
     prompt_guided: Option<PromptGuidedConfig>,
 }
 
 #[async_trait]
-impl Provider for LlmProviderAdapter {
-    async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for LlmProviderAdapter {
+    async fn step(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         Ok(self.step_output(req).await?.step)
     }
 
-    async fn step_output(&self, req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
+    async fn step_output(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStepOutput> {
         let AdaptedRequest {
             request,
             prompt_guided,
@@ -264,17 +117,17 @@ impl Provider for LlmProviderAdapter {
 
     async fn step_with_collector(
         &self,
-        req: ProviderRequest,
-        collector: &mut dyn ProviderEventCollector,
-    ) -> anyhow::Result<ProviderStep> {
+        req: AgentProviderRequest,
+        collector: &mut dyn AgentProviderEventCollector,
+    ) -> anyhow::Result<AgentStep> {
         Ok(self.step_output_with_collector(req, collector).await?.step)
     }
 
     async fn step_output_with_collector(
         &self,
-        req: ProviderRequest,
-        collector: &mut dyn ProviderEventCollector,
-    ) -> anyhow::Result<ProviderStepOutput> {
+        req: AgentProviderRequest,
+        collector: &mut dyn AgentProviderEventCollector,
+    ) -> anyhow::Result<AgentStepOutput> {
         let AdaptedRequest {
             request,
             prompt_guided,
@@ -291,7 +144,7 @@ impl Provider for LlmProviderAdapter {
             match event? {
                 LlmEvent::AssistantTextDelta { text } => {
                     collector
-                        .emit(ProviderEvent::AssistantTextDelta { text })
+                        .emit(AgentProviderEvent::AssistantTextDelta { text })
                         .await?;
                 }
                 LlmEvent::ToolCallArgsDelta {
@@ -299,7 +152,7 @@ impl Provider for LlmProviderAdapter {
                     delta,
                 } => {
                     collector
-                        .emit(ProviderEvent::ToolCallArgsDelta {
+                        .emit(AgentProviderEvent::ToolCallArgsDelta {
                             tool_call_id,
                             delta,
                         })
@@ -311,54 +164,75 @@ impl Provider for LlmProviderAdapter {
                     total_tokens,
                 } => {
                     collector
-                        .emit(ProviderEvent::Usage {
+                        .emit(AgentProviderEvent::Usage {
                             input_tokens,
                             output_tokens,
                             total_tokens,
                         })
                         .await?;
                 }
-                LlmEvent::FinalStep { output } => {
-                    final_output = Some(parse_adapted_output(prompt_guided.as_ref(), output)?);
+                LlmEvent::FinalResponse { response } => {
+                    final_output = Some(parse_adapted_output(prompt_guided.as_ref(), response)?);
                 }
             }
         }
 
-        final_output.ok_or_else(|| anyhow::anyhow!("llm_stream_missing_final_step"))
+        final_output.ok_or_else(|| anyhow::anyhow!("llm_stream_missing_final_response"))
     }
 }
 
 fn prepare_request(
     provider: &dyn LlmProvider,
-    req: ProviderRequest,
+    req: AgentProviderRequest,
 ) -> anyhow::Result<AdaptedRequest> {
-    if let Some(spec) = req.structured_output.as_ref() {
+    let AgentProviderRequest {
+        messages,
+        tool_specs,
+        tool_choice,
+        skills: _,
+        state: _,
+        last_tool_results: _,
+        structured_output,
+    } = req;
+
+    if let Some(spec) = structured_output.as_ref() {
         spec.validate()?;
         if !provider.capabilities().supports_structured_output {
             anyhow::bail!("provider_unsupported_structured_output");
         }
     }
 
-    let tools_payload = provider.convert_tools(&req.tool_specs)?;
-    validate_tool_choice_support(provider, &req, &tools_payload)?;
+    let tool_specs = tool_specs
+        .into_iter()
+        .map(convert_tool_spec)
+        .collect::<Vec<_>>();
+    let tools_payload = provider.convert_tools(&tool_specs)?;
+    validate_tool_choice_support(provider, &tool_specs, &tool_choice, &tools_payload)?;
 
     let prompt_guided = match &tools_payload {
         ToolsPayload::PromptGuided { .. }
-            if !req.tool_specs.is_empty() && !matches!(req.tool_choice, ToolChoice::None) =>
+            if !tool_specs.is_empty() && !matches!(tool_choice, ToolChoice::None) =>
         {
             Some(PromptGuidedConfig::new(
-                req.tool_choice.clone(),
-                req.tool_specs.clone(),
+                tool_choice.clone(),
+                tool_specs.clone(),
             ))
         }
         _ => None,
     };
-    let request = match (prompt_guided.as_ref(), tools_payload) {
-        (Some(config), ToolsPayload::PromptGuided { instructions }) => {
-            config.prepare_request(req, &instructions)
-        }
-        _ => req,
+
+    let mut request = ChatRequest {
+        messages: messages.into_iter().map(convert_message).collect(),
+        tool_specs,
+        tool_choice,
+        structured_output,
     };
+
+    if let (Some(config), ToolsPayload::PromptGuided { instructions }) =
+        (prompt_guided.as_ref(), &tools_payload)
+    {
+        request = config.prepare_request(request, instructions);
+    }
 
     Ok(AdaptedRequest {
         request,
@@ -368,38 +242,51 @@ fn prepare_request(
 
 fn parse_adapted_output(
     prompt_guided: Option<&PromptGuidedConfig>,
-    output: ProviderStepOutput,
-) -> anyhow::Result<ProviderStepOutput> {
-    let ProviderStepOutput {
-        step,
+    output: ChatResponse,
+) -> anyhow::Result<AgentStepOutput> {
+    let ChatResponse {
+        text,
+        tool_calls,
+        usage: _,
         assistant_metadata,
     } = output;
-    let step = match prompt_guided {
-        Some(config) => config.parse_step(step)?,
-        None => step,
+
+    let calls = tool_calls
+        .into_iter()
+        .map(convert_llm_tool_call)
+        .collect::<Vec<_>>();
+    let mut step = if calls.is_empty() {
+        AgentStep::FinalText { text }
+    } else if text.is_empty() {
+        AgentStep::ToolCalls { calls }
+    } else {
+        AgentStep::AssistantMessageWithToolCalls { text, calls }
     };
-    Ok(ProviderStepOutput {
+
+    if let Some(config) = prompt_guided {
+        step = config.parse_step(step)?;
+    }
+
+    Ok(AgentStepOutput {
         step,
-        assistant_metadata,
+        assistant_metadata: assistant_metadata.filter(|metadata| !metadata.is_empty()),
     })
 }
 
 fn validate_tool_choice_support(
     provider: &dyn LlmProvider,
-    req: &ProviderRequest,
+    tool_specs: &[LlmToolSpec],
+    tool_choice: &ToolChoice,
     tools_payload: &ToolsPayload,
 ) -> anyhow::Result<()> {
-    let requires_tools = matches!(
-        req.tool_choice,
-        ToolChoice::Required | ToolChoice::Named { .. }
-    );
+    let requires_tools = matches!(tool_choice, ToolChoice::Required | ToolChoice::Named { .. });
 
     if !provider.capabilities().supports_tool_calling {
         return match tools_payload {
             ToolsPayload::PromptGuided { .. } => {
-                validate_prompt_guided_tool_choice(&req.tool_choice, &req.tool_specs)
+                validate_prompt_guided_tool_choice(tool_choice, tool_specs)
             }
-            _ => match req.tool_choice {
+            _ => match tool_choice {
                 ToolChoice::Auto | ToolChoice::None => Ok(()),
                 ToolChoice::Required | ToolChoice::Named { .. } => {
                     Err(anyhow::anyhow!("provider_unsupported_tool_calling"))
@@ -408,7 +295,7 @@ fn validate_tool_choice_support(
         };
     }
 
-    if requires_tools && req.tool_specs.is_empty() {
+    if requires_tools && tool_specs.is_empty() {
         anyhow::bail!("tool_choice_requires_tools");
     }
 
@@ -429,78 +316,43 @@ fn validate_tool_choice_support(
     }
 }
 
-#[derive(Clone)]
-pub struct MockLlmProvider {
-    events: Arc<Vec<LlmEvent>>,
-    capabilities: LlmProviderCapabilities,
-}
-
-impl MockLlmProvider {
-    pub fn new(events: Vec<LlmEvent>) -> Self {
-        let mut capabilities = LlmProviderCapabilities::default();
-        capabilities.supports_streaming = true;
-        capabilities.reports_usage = events
-            .iter()
-            .any(|event| matches!(event, LlmEvent::Usage { .. }));
-        capabilities.supports_tool_calling = events.iter().any(|event| {
-            matches!(
-                event,
-                LlmEvent::ToolCallArgsDelta { .. }
-                    | LlmEvent::FinalStep {
-                        output: ProviderStepOutput {
-                            step: ProviderStep::ToolCalls { .. }
-                                | ProviderStep::AssistantMessageWithToolCalls { .. },
-                            ..
-                        }
-                    }
-            )
-        });
-        Self {
-            events: Arc::new(events),
-            capabilities,
-        }
-    }
-
-    pub fn with_capabilities(mut self, capabilities: LlmProviderCapabilities) -> Self {
-        self.capabilities = capabilities;
-        self
+fn convert_tool_spec(tool: crate::runtime::ToolSpec) -> LlmToolSpec {
+    LlmToolSpec {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
     }
 }
 
-#[async_trait]
-impl LlmProvider for MockLlmProvider {
-    fn capabilities(&self) -> LlmProviderCapabilities {
-        self.capabilities
-    }
-
-    async fn chat(&self, _req: ProviderRequest) -> anyhow::Result<ProviderStepOutput> {
-        self.events
-            .iter()
-            .find_map(|event| match event {
-                LlmEvent::FinalStep { output } => Some(output.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| anyhow::anyhow!("llm_stream_missing_final_step"))
-    }
-
-    async fn stream_chat(&self, _req: ProviderRequest) -> anyhow::Result<LlmEventStream> {
-        let events = self.events.as_ref().clone();
-        Ok(Box::pin(tokio_stream::iter(
-            events.into_iter().map(Ok::<_, anyhow::Error>),
-        )))
+fn convert_message(message: Message) -> ChatMessage {
+    ChatMessage {
+        role: ChatRole::from(message.role),
+        content: message.content,
+        content_blocks: message.content_blocks,
+        reasoning_content: message.reasoning_content,
+        tool_calls: message
+            .tool_calls
+            .map(|calls| calls.into_iter().map(convert_message_tool_call).collect()),
+        tool_call_id: message.tool_call_id,
+        name: message.name,
+        status: message.status,
     }
 }
 
-pub fn final_text_step(text: &str) -> LlmEvent {
-    LlmEvent::FinalStep {
-        output: ProviderStepOutput::from(ProviderStep::FinalText {
-            text: text.to_string(),
-        }),
+fn convert_message_tool_call(call: ToolCall) -> LlmToolCall {
+    LlmToolCall {
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
     }
 }
 
-pub fn tool_calls_step(calls: Vec<ProviderToolCall>) -> LlmEvent {
-    LlmEvent::FinalStep {
-        output: ProviderStepOutput::from(ProviderStep::ToolCalls { calls }),
+fn convert_llm_tool_call(call: LlmToolCall) -> AgentToolCall {
+    AgentToolCall {
+        tool_name: call.name,
+        arguments: call.arguments,
+        call_id: Some(call.id),
     }
 }
+
+pub use crate::llm::{final_text_step, tool_calls_step, LlmEventStream, MockLlmProvider};

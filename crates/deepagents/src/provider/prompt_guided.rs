@@ -2,9 +2,8 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-use crate::provider::protocol::{ProviderRequest, ProviderStep, ProviderToolCall, ToolChoice};
-use crate::runtime::ToolSpec;
-use crate::types::Message;
+use crate::llm::{ChatMessage, ChatRequest, ChatRole, ToolChoice, ToolSpec};
+use crate::provider::protocol::{AgentStep, AgentToolCall};
 
 const TOOL_CALL_TAG_OPEN: &str = "<tool_call>";
 const TOOL_CALL_TAG_CLOSE: &str = "</tool_call>";
@@ -20,7 +19,7 @@ struct PromptGuidedEnvelope {
     #[serde(default)]
     content: String,
     #[serde(default)]
-    tool_calls: Vec<ProviderToolCall>,
+    tool_calls: Vec<AgentToolCall>,
 }
 
 impl PromptGuidedConfig {
@@ -33,56 +32,45 @@ impl PromptGuidedConfig {
 
     pub(crate) fn prepare_request(
         &self,
-        mut req: ProviderRequest,
+        mut req: ChatRequest,
         extra_instructions: &str,
-    ) -> ProviderRequest {
+    ) -> ChatRequest {
         let system_message =
             render_system_message(&self.tool_choice, &self.tool_specs, extra_instructions);
         let idx = req
             .messages
             .iter()
-            .take_while(|message| message.role == "system")
+            .take_while(|message| message.role == ChatRole::System)
             .count();
-        req.messages.insert(
-            idx,
-            Message {
-                role: "system".to_string(),
-                content: system_message,
-                content_blocks: None,
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                status: None,
-            },
-        );
+        req.messages
+            .insert(idx, ChatMessage::system(system_message));
         req
     }
 
-    pub(crate) fn parse_step(&self, step: ProviderStep) -> anyhow::Result<ProviderStep> {
+    pub(crate) fn parse_step(&self, step: AgentStep) -> anyhow::Result<AgentStep> {
         match step {
-            ProviderStep::FinalText { text } => self.parse_text_step(text, true),
-            ProviderStep::AssistantMessage { text } => self.parse_text_step(text, false),
-            ProviderStep::AssistantMessageWithToolCalls { text, calls } => {
+            AgentStep::FinalText { text } => self.parse_text_step(text, true),
+            AgentStep::AssistantMessage { text } => self.parse_text_step(text, false),
+            AgentStep::AssistantMessageWithToolCalls { text, calls } => {
                 self.validate_tool_calls(&calls)?;
-                Ok(ProviderStep::AssistantMessageWithToolCalls { text, calls })
+                Ok(AgentStep::AssistantMessageWithToolCalls { text, calls })
             }
-            ProviderStep::ToolCalls { calls } => {
+            AgentStep::ToolCalls { calls } => {
                 self.validate_tool_calls(&calls)?;
-                Ok(ProviderStep::ToolCalls { calls })
+                Ok(AgentStep::ToolCalls { calls })
             }
             other => Ok(other),
         }
     }
 
-    fn parse_text_step(&self, text: String, final_text: bool) -> anyhow::Result<ProviderStep> {
+    fn parse_text_step(&self, text: String, final_text: bool) -> anyhow::Result<AgentStep> {
         let trimmed = text.trim();
         let Some(payload) = extract_tool_payload(trimmed) else {
             self.ensure_plain_text_allowed()?;
             return Ok(if final_text {
-                ProviderStep::FinalText { text }
+                AgentStep::FinalText { text }
             } else {
-                ProviderStep::AssistantMessage { text }
+                AgentStep::AssistantMessage { text }
             });
         };
 
@@ -96,23 +84,23 @@ impl PromptGuidedConfig {
         if envelope.tool_calls.is_empty() {
             self.ensure_plain_text_allowed()?;
             return Ok(if final_text {
-                ProviderStep::FinalText {
+                AgentStep::FinalText {
                     text: envelope.content,
                 }
             } else {
-                ProviderStep::AssistantMessage {
+                AgentStep::AssistantMessage {
                     text: envelope.content,
                 }
             });
         }
 
         if envelope.content.trim().is_empty() {
-            return Ok(ProviderStep::ToolCalls {
+            return Ok(AgentStep::ToolCalls {
                 calls: envelope.tool_calls,
             });
         }
 
-        Ok(ProviderStep::AssistantMessageWithToolCalls {
+        Ok(AgentStep::AssistantMessageWithToolCalls {
             text: envelope.content,
             calls: envelope.tool_calls,
         })
@@ -128,7 +116,7 @@ impl PromptGuidedConfig {
         }
     }
 
-    fn validate_tool_calls(&self, calls: &[ProviderToolCall]) -> anyhow::Result<()> {
+    fn validate_tool_calls(&self, calls: &[AgentToolCall]) -> anyhow::Result<()> {
         match &self.tool_choice {
             ToolChoice::Auto | ToolChoice::None => {}
             ToolChoice::Required => {

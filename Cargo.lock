@@ -250,6 +250,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -336,6 +337,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "futures-util",
  "globset",
  "hex",
  "regex",

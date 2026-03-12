@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
-use deepagents::provider::protocol::ProviderToolCall;
+use deepagents::provider::protocol::AgentToolCall;
 use deepagents::runtime::{Runtime, RuntimeMiddleware};
 use deepagents::state::{AgentState, TodoItem};
 use deepagents::{create_deep_agent_with_backend, create_local_sandbox_backend};
@@ -13,7 +13,7 @@ fn runtime_with_script(
 ) -> impl Runtime {
     let backend = create_local_sandbox_backend(root.to_string_lossy().to_string(), None).unwrap();
     let agent = create_deep_agent_with_backend(backend);
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
     let todo_mw: Arc<dyn RuntimeMiddleware> =
         Arc::new(deepagents::runtime::TodoListMiddleware::new());
@@ -44,7 +44,7 @@ async fn todo_tm01_merge_false_replaces() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_todos".to_string(),
                     arguments: serde_json::json!({
                         "merge": false,
@@ -106,7 +106,7 @@ async fn todo_tm02_merge_true_partial_update_preserves_fields() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_todos".to_string(),
                     arguments: serde_json::json!({
                         "merge": true,
@@ -162,7 +162,7 @@ async fn todo_tm04_duplicate_ids_is_error_and_does_not_mutate_state() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_todos".to_string(),
                     arguments: serde_json::json!({
                         "merge": false,
@@ -225,7 +225,7 @@ async fn todo_tm05_summary_gate_rejects_without_completion_transition() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "write_todos".to_string(),
                     arguments: serde_json::json!({
                         "merge": true,
@@ -289,7 +289,7 @@ async fn todo_tp03_parallel_guard_rejects_all_write_todos_but_allows_other_tools
         steps: vec![
             MockStep::ToolCalls {
                 calls: vec![
-                    ProviderToolCall {
+                    AgentToolCall {
                         tool_name: "write_todos".to_string(),
                         arguments: serde_json::json!({
                             "merge": false,
@@ -299,12 +299,12 @@ async fn todo_tp03_parallel_guard_rejects_all_write_todos_but_allows_other_tools
                         }),
                         call_id: Some("t1".to_string()),
                     },
-                    ProviderToolCall {
+                    AgentToolCall {
                         tool_name: "read_file".to_string(),
                         arguments: serde_json::json!({ "file_path": "README.md", "limit": 5 }),
                         call_id: Some("r1".to_string()),
                     },
-                    ProviderToolCall {
+                    AgentToolCall {
                         tool_name: "write_todos".to_string(),
                         arguments: serde_json::json!({
                             "merge": true,

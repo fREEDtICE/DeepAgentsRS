@@ -1,24 +1,25 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deepagents::provider::openai_compatible::{
+use deepagents::llm::openai_compatible::{
     MockOpenAiTransport, OpenAiChatChunk, OpenAiChatRequest, OpenAiChatResponse, OpenAiChoice,
     OpenAiChunkChoice, OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiCompatibleTransport,
     OpenAiContentPart, OpenAiDelta, OpenAiFunctionCall, OpenAiFunctionCallDelta,
     OpenAiJsonSchemaResponseFormat, OpenAiMessage, OpenAiMessageContent, OpenAiResponseFormat,
     OpenAiToolCall, OpenAiToolCallDelta, OpenAiToolChoice, OpenAiToolChoiceFunction, OpenAiUsage,
 };
-use deepagents::provider::{
-    LlmEvent, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities, MultimodalInputRoles,
-    ProviderRequest, ProviderStep, StructuredOutputSpec, ToolChoice,
+use deepagents::llm::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, LlmEvent, LlmProvider,
+    LlmProviderCapabilities, MultimodalCapabilities, MultimodalInputRoles, StructuredOutputSpec,
+    ToolCall, ToolChoice, ToolSpec,
 };
 use deepagents::types::ContentBlock;
 
-fn sample_request() -> ProviderRequest {
-    ProviderRequest {
+fn sample_request() -> ChatRequest {
+    ChatRequest {
         messages: vec![
-            deepagents::types::Message {
-                role: "system".to_string(),
+            ChatMessage {
+                role: ChatRole::System,
                 content: "You are helpful".to_string(),
                 content_blocks: None,
                 reasoning_content: None,
@@ -27,12 +28,12 @@ fn sample_request() -> ProviderRequest {
                 name: None,
                 status: None,
             },
-            deepagents::types::Message {
-                role: "assistant".to_string(),
+            ChatMessage {
+                role: ChatRole::Assistant,
                 content: String::new(),
                 content_blocks: None,
                 reasoning_content: Some("Need to inspect the file first.".to_string()),
-                tool_calls: Some(vec![deepagents::types::ToolCall {
+                tool_calls: Some(vec![ToolCall {
                     id: "call_1".to_string(),
                     name: "read_file".to_string(),
                     arguments: serde_json::json!({ "file_path": "README.md" }),
@@ -41,8 +42,8 @@ fn sample_request() -> ProviderRequest {
                 name: None,
                 status: None,
             },
-            deepagents::types::Message {
-                role: "tool".to_string(),
+            ChatMessage {
+                role: ChatRole::Tool,
                 content: "{\"ok\":true}".to_string(),
                 content_blocks: None,
                 reasoning_content: None,
@@ -52,7 +53,7 @@ fn sample_request() -> ProviderRequest {
                 status: Some("success".to_string()),
             },
         ],
-        tool_specs: vec![deepagents::runtime::ToolSpec {
+        tool_specs: vec![ToolSpec {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
             input_schema: serde_json::json!({
@@ -65,9 +66,6 @@ fn sample_request() -> ProviderRequest {
             }),
         }],
         tool_choice: ToolChoice::Auto,
-        skills: Vec::new(),
-        state: deepagents::state::AgentState::default(),
-        last_tool_results: Vec::new(),
         structured_output: None,
     }
 }
@@ -110,7 +108,7 @@ impl OpenAiCompatibleTransport for CaptureTransport {
         &self,
         _config: &OpenAiCompatibleConfig,
         _request: OpenAiChatRequest,
-    ) -> anyhow::Result<deepagents::provider::openai_compatible::OpenAiChunkStream> {
+    ) -> anyhow::Result<deepagents::llm::openai_compatible::OpenAiChunkStream> {
         Err(anyhow::anyhow!("streaming unsupported in CaptureTransport"))
     }
 }
@@ -183,9 +181,9 @@ async fn openai_build_chat_request_encodes_user_image_blocks_as_content_parts() 
         transport.clone(),
     );
 
-    let req = ProviderRequest {
-        messages: vec![deepagents::types::Message {
-            role: "user".to_string(),
+    let req = ChatRequest {
+        messages: vec![ChatMessage {
+            role: ChatRole::User,
             content: "Describe this image.".to_string(),
             content_blocks: Some(vec![ContentBlock::image_base64("image/png", "AAEC")]),
             reasoning_content: None,
@@ -196,9 +194,6 @@ async fn openai_build_chat_request_encodes_user_image_blocks_as_content_parts() 
         }],
         tool_specs: Vec::new(),
         tool_choice: ToolChoice::Auto,
-        skills: Vec::new(),
-        state: deepagents::state::AgentState::default(),
-        last_tool_results: Vec::new(),
         structured_output: None,
     };
 
@@ -233,9 +228,9 @@ async fn openai_build_chat_request_degrades_unsupported_role_blocks_to_text() {
         transport.clone(),
     );
 
-    let req = ProviderRequest {
-        messages: vec![deepagents::types::Message {
-            role: "tool".to_string(),
+    let req = ChatRequest {
+        messages: vec![ChatMessage {
+            role: ChatRole::Tool,
             content: "(image returned as content block)".to_string(),
             content_blocks: Some(vec![ContentBlock::image_base64("image/png", "AAEC")]),
             reasoning_content: None,
@@ -246,9 +241,6 @@ async fn openai_build_chat_request_degrades_unsupported_role_blocks_to_text() {
         }],
         tool_specs: Vec::new(),
         tool_choice: ToolChoice::Auto,
-        skills: Vec::new(),
-        state: deepagents::state::AgentState::default(),
-        last_tool_results: Vec::new(),
         structured_output: None,
     };
 
@@ -450,13 +442,9 @@ async fn openai_chat_response_with_tool_calls_parses_to_provider_step() {
     );
 
     let step = provider.chat(sample_request()).await.unwrap();
-    assert!(matches!(
-        step.step,
-        ProviderStep::ToolCalls { calls }
-            if calls.len() == 1
-                && calls[0].tool_name == "read_file"
-                && calls[0].call_id.as_deref() == Some("call_1")
-    ));
+    assert_eq!(step.tool_calls.len(), 1);
+    assert_eq!(step.tool_calls[0].name, "read_file");
+    assert_eq!(step.tool_calls[0].id, "call_1");
     assert_eq!(
         step.assistant_metadata
             .as_ref()
@@ -494,14 +482,10 @@ async fn openai_chat_response_with_text_and_tool_calls_preserves_both() {
     );
 
     let step = provider.chat(sample_request()).await.unwrap();
-    assert!(matches!(
-        step.step,
-        ProviderStep::AssistantMessageWithToolCalls { text, calls }
-            if text == "Let me check."
-                && calls.len() == 1
-                && calls[0].tool_name == "read_file"
-                && calls[0].call_id.as_deref() == Some("call_1")
-    ));
+    assert_eq!(step.text, "Let me check.");
+    assert_eq!(step.tool_calls.len(), 1);
+    assert_eq!(step.tool_calls[0].name, "read_file");
+    assert_eq!(step.tool_calls[0].id, "call_1");
     assert_eq!(
         step.assistant_metadata
             .as_ref()
@@ -533,10 +517,7 @@ async fn openai_chat_response_with_multimodal_parts_preserves_image_blocks() {
     );
 
     let step = provider.chat(sample_request()).await.unwrap();
-    assert!(matches!(
-        step.step,
-        ProviderStep::FinalText { ref text } if text == "This is the file preview."
-    ));
+    assert_eq!(step.text, "This is the file preview.");
     assert_eq!(
         step.assistant_metadata
             .as_ref()
@@ -568,10 +549,7 @@ async fn openai_chat_response_with_remote_image_url_preserves_url_block() {
     );
 
     let step = provider.chat(sample_request()).await.unwrap();
-    assert!(matches!(
-        step.step,
-        ProviderStep::FinalText { ref text } if text == "(image content)"
-    ));
+    assert_eq!(step.text, "(image content)");
     assert_eq!(
         step.assistant_metadata
             .as_ref()
@@ -605,10 +583,7 @@ async fn openai_chat_response_with_image_only_parts_synthesizes_fallback_text() 
     );
 
     let step = provider.chat(sample_request()).await.unwrap();
-    assert!(matches!(
-        step.step,
-        ProviderStep::FinalText { ref text } if text == "(image content: image/png)"
-    ));
+    assert_eq!(step.text, "(image content: image/png)");
     assert_eq!(
         step.assistant_metadata
             .as_ref()
@@ -689,22 +664,22 @@ async fn openai_stream_chat_aggregates_chunks_into_delta_and_final_step() {
     )));
     assert!(matches!(
         events.last(),
-        Some(LlmEvent::FinalStep {
-            output
+        Some(LlmEvent::FinalResponse {
+            response
         }) if matches!(
-                &output.assistant_metadata,
+                &response.assistant_metadata,
                 Some(metadata)
                     if metadata.reasoning_content.as_deref()
                         == Some("Need to finish the sentence.The file answer is ready.")
             )
             && matches!(
-                output.step,
-                ProviderStep::AssistantMessageWithToolCalls { ref text, ref calls }
-                    if calls.len() == 1
-                        && text == "Hello"
-                        && calls[0].tool_name == "read_file"
-                        && calls[0].call_id.as_deref() == Some("call_1")
-                        && calls[0].arguments == serde_json::json!({ "file_path": "README.md" })
+                response,
+                ChatResponse { text, tool_calls, .. }
+                    if text == "Hello"
+                        && tool_calls.len() == 1
+                        && tool_calls[0].name == "read_file"
+                        && tool_calls[0].id == "call_1"
+                        && tool_calls[0].arguments == serde_json::json!({ "file_path": "README.md" })
             )
     ));
 }
@@ -737,12 +712,12 @@ async fn openai_stream_chat_preserves_multimodal_content_in_final_step() {
 
     assert!(matches!(
         events.last(),
-        Some(LlmEvent::FinalStep { output })
+        Some(LlmEvent::FinalResponse { response })
             if matches!(
-                output.step,
-                ProviderStep::FinalText { ref text } if text == "(image content: image/png)"
+                response,
+                ChatResponse { ref text, .. } if text == "(image content: image/png)"
             ) && matches!(
-                output.assistant_metadata.as_ref().and_then(|metadata| metadata.content_blocks.as_ref()),
+                response.assistant_metadata.as_ref().and_then(|metadata| metadata.content_blocks.as_ref()),
                 Some(blocks)
                     if blocks == &vec![ContentBlock::image_base64("image/png", "AAEC")]
             )
@@ -770,9 +745,9 @@ async fn openai_build_chat_request_uses_configured_multimodal_role_policy() {
         transport.clone(),
     );
 
-    let req = ProviderRequest {
-        messages: vec![deepagents::types::Message {
-            role: "tool".to_string(),
+    let req = ChatRequest {
+        messages: vec![ChatMessage {
+            role: ChatRole::Tool,
             content: "(image returned as content block)".to_string(),
             content_blocks: Some(vec![ContentBlock::image_url(
                 "https://cdn.example.com/tool.png",
@@ -785,9 +760,6 @@ async fn openai_build_chat_request_uses_configured_multimodal_role_policy() {
         }],
         tool_specs: Vec::new(),
         tool_choice: ToolChoice::Auto,
-        skills: Vec::new(),
-        state: deepagents::state::AgentState::default(),
-        last_tool_results: Vec::new(),
         structured_output: None,
     };
 

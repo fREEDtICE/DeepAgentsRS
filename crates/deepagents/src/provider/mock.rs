@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::protocol::{
-    Provider, ProviderError, ProviderRequest, ProviderStep, ProviderToolCall,
+    AgentProvider, AgentProviderError, AgentProviderRequest, AgentStep, AgentToolCall,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,7 +16,7 @@ pub enum MockStep {
     },
     AssistantMessageWithToolCalls {
         text: String,
-        calls: Vec<ProviderToolCall>,
+        calls: Vec<AgentToolCall>,
     },
     FinalText {
         text: String,
@@ -25,7 +25,7 @@ pub enum MockStep {
         prefix: Option<String>,
     },
     ToolCalls {
-        calls: Vec<ProviderToolCall>,
+        calls: Vec<AgentToolCall>,
     },
     SkillCall {
         name: String,
@@ -80,8 +80,8 @@ impl MockProvider {
 }
 
 #[async_trait]
-impl Provider for MockProvider {
-    async fn step(&self, req: ProviderRequest) -> anyhow::Result<ProviderStep> {
+impl AgentProvider for MockProvider {
+    async fn step(&self, req: AgentProviderRequest) -> anyhow::Result<AgentStep> {
         let idx = self.next_idx.fetch_add(1, Ordering::SeqCst);
         let step = self
             .script
@@ -95,15 +95,15 @@ impl Provider for MockProvider {
         match step {
             MockStep::DelayMs { ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                Ok(ProviderStep::FinalText {
+                Ok(AgentStep::FinalText {
                     text: String::new(),
                 })
             }
-            MockStep::AssistantMessage { text } => Ok(ProviderStep::AssistantMessage { text }),
+            MockStep::AssistantMessage { text } => Ok(AgentStep::AssistantMessage { text }),
             MockStep::AssistantMessageWithToolCalls { text, calls } => {
-                Ok(ProviderStep::AssistantMessageWithToolCalls { text, calls })
+                Ok(AgentStep::AssistantMessageWithToolCalls { text, calls })
             }
-            MockStep::FinalText { text } => Ok(ProviderStep::FinalText { text }),
+            MockStep::FinalText { text } => Ok(AgentStep::FinalText { text }),
             MockStep::FinalFromLastToolFirstLine { prefix } => {
                 let mut out = prefix.unwrap_or_default();
                 if let Some(last) = req.last_tool_results.last() {
@@ -111,7 +111,7 @@ impl Provider for MockProvider {
                         out.push_str(&line);
                     }
                 }
-                Ok(ProviderStep::FinalText { text: out })
+                Ok(AgentStep::FinalText { text: out })
             }
             MockStep::ToolCalls { mut calls } => {
                 if self.omit_call_ids {
@@ -119,19 +119,19 @@ impl Provider for MockProvider {
                         c.call_id = None;
                     }
                 }
-                Ok(ProviderStep::ToolCalls { calls })
+                Ok(AgentStep::ToolCalls { calls })
             }
             MockStep::SkillCall {
                 name,
                 input,
                 call_id,
-            } => Ok(ProviderStep::SkillCall {
+            } => Ok(AgentStep::SkillCall {
                 name,
                 input,
                 call_id,
             }),
-            MockStep::Error { code, message } => Ok(ProviderStep::Error {
-                error: ProviderError { code, message },
+            MockStep::Error { code, message } => Ok(AgentStep::Error {
+                error: AgentProviderError { code, message },
             }),
         }
     }

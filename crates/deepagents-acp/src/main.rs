@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::serve;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -18,8 +18,10 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
+    let listener = tokio::net::TcpListener::bind(&args.bind)
+        .await
+        .with_context(|| format!("failed to bind {}", args.bind))?;
     let app = deepagents_acp::server::router();
-    serve(listener, app).await?;
+    serve(listener, app).await.context("axum server error")?;
     Ok(())
 }

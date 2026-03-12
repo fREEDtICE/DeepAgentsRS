@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
-use deepagents::provider::protocol::ProviderToolCall;
+use deepagents::provider::protocol::AgentToolCall;
 use deepagents::runtime::{
     HandledToolCall, Runtime, RuntimeMiddleware, RuntimeMiddlewareAssembler, RuntimeMiddlewareSlot,
     ToolCallContext,
@@ -56,9 +56,9 @@ impl RuntimeMiddleware for RecordingMiddleware {
 
     async fn patch_provider_step(
         &self,
-        step: deepagents::provider::ProviderStep,
+        step: deepagents::provider::AgentStep,
         _next_call_id: &mut u64,
-    ) -> anyhow::Result<deepagents::provider::ProviderStep> {
+    ) -> anyhow::Result<deepagents::provider::AgentStep> {
         self.push("patch_provider_step");
         Ok(step)
     }
@@ -102,7 +102,7 @@ async fn phase8_5_hook_order_follows_slot_order() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "dummy".to_string(),
                     arguments: serde_json::json!({}),
                     call_id: Some("c1".to_string()),
@@ -113,7 +113,7 @@ async fn phase8_5_hook_order_follows_slot_order() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
 
     let runtime = deepagents::runtime::simple::SimpleRuntime::new(

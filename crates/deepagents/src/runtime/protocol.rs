@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::approval::{ApprovalPolicy, ExecutionMode};
 use crate::audit::AuditSink;
-use crate::provider::ProviderToolCall;
+use crate::provider::{AgentStep, AgentToolCall};
 use crate::state::AgentState;
 use crate::types::Message;
 use crate::DeepAgent;
@@ -41,6 +41,10 @@ pub struct ToolResultRecord {
     pub output: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
@@ -178,7 +182,7 @@ pub trait StreamingRuntime: Send + Sync {
 
 pub struct ToolCallContext<'a> {
     pub agent: &'a DeepAgent,
-    pub tool_call: &'a ProviderToolCall,
+    pub tool_call: &'a AgentToolCall,
     pub call_id: &'a str,
     pub messages: &'a mut Vec<Message>,
     pub state: &'a mut AgentState,
@@ -215,9 +219,9 @@ pub trait RuntimeMiddleware: Send + Sync {
 
     async fn patch_provider_step(
         &self,
-        step: crate::provider::ProviderStep,
+        step: AgentStep,
         _next_call_id: &mut u64,
-    ) -> anyhow::Result<crate::provider::ProviderStep> {
+    ) -> anyhow::Result<AgentStep> {
         Ok(step)
     }
 

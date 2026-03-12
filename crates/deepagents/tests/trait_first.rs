@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use deepagents::backends::protocol::{BackendError, FilesystemBackend, SandboxBackend};
+use deepagents::backends::protocol::{
+    BackendError, BackendErrorCode, FilesystemBackend, SandboxBackend,
+};
 use deepagents::types::{EditResult, ExecResult, FileInfo, GrepMatch, WriteResult};
 
 #[derive(Clone)]
@@ -37,7 +39,7 @@ impl FilesystemBackend for MockBackend {
         max_bytes: usize,
     ) -> Result<Vec<u8>, BackendError> {
         if max_bytes == 0 {
-            return Err(BackendError::Other("too_large".to_string()));
+            return Err(BackendError::new(BackendErrorCode::TooLarge, "too_large"));
         }
         Ok(vec![0u8; 1])
     }

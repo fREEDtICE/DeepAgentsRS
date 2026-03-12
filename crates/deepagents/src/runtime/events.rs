@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::provider::ProviderStep;
+use crate::provider::AgentStep;
 use crate::runtime::{HitlInterrupt, RunStatus};
 use crate::state::AgentState;
 use crate::types::Message;
@@ -149,16 +149,16 @@ impl RunEventSink for VecRunEventSink {
     }
 }
 
-pub fn provider_step_kind(step: &ProviderStep) -> ProviderStepKind {
+pub fn provider_step_kind(step: &AgentStep) -> ProviderStepKind {
     match step {
-        ProviderStep::AssistantMessage { .. } => ProviderStepKind::AssistantMessage,
-        ProviderStep::AssistantMessageWithToolCalls { .. } => {
+        AgentStep::AssistantMessage { .. } => ProviderStepKind::AssistantMessage,
+        AgentStep::AssistantMessageWithToolCalls { .. } => {
             ProviderStepKind::AssistantMessageWithToolCalls
         }
-        ProviderStep::FinalText { .. } => ProviderStepKind::FinalText,
-        ProviderStep::ToolCalls { .. } => ProviderStepKind::ToolCalls,
-        ProviderStep::SkillCall { .. } => ProviderStepKind::SkillCall,
-        ProviderStep::Error { .. } => ProviderStepKind::Error,
+        AgentStep::FinalText { .. } => ProviderStepKind::FinalText,
+        AgentStep::ToolCalls { .. } => ProviderStepKind::ToolCalls,
+        AgentStep::SkillCall { .. } => ProviderStepKind::SkillCall,
+        AgentStep::Error { .. } => ProviderStepKind::Error,
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use deepagents::approval::ExecutionMode;
 use deepagents::provider::mock::{MockProvider, MockScript, MockStep};
-use deepagents::provider::ProviderToolCall;
+use deepagents::provider::AgentToolCall;
 use deepagents::runtime::patch_tool_calls::patch_dangling_tool_calls;
 use deepagents::runtime::patch_tool_calls::PatchToolCallsMiddleware;
 use deepagents::runtime::simple::SimpleRuntime;
@@ -158,7 +158,7 @@ async fn normalize_accepts_string_json_arguments_for_tool_calls() {
     let script = MockScript {
         steps: vec![
             MockStep::ToolCalls {
-                calls: vec![ProviderToolCall {
+                calls: vec![AgentToolCall {
                     tool_name: "read_file".to_string(),
                     arguments: serde_json::Value::String(
                         serde_json::json!({"file_path":"README.md","limit":20}).to_string(),
@@ -171,7 +171,7 @@ async fn normalize_accepts_string_json_arguments_for_tool_calls() {
             },
         ],
     };
-    let provider: Arc<dyn deepagents::provider::Provider> =
+    let provider: Arc<dyn deepagents::provider::AgentProvider> =
         Arc::new(MockProvider::from_script(script));
 
     let backend = deepagents::create_local_sandbox_backend(root, None).unwrap();
