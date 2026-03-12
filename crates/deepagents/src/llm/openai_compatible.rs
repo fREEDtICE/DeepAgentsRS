@@ -4,26 +4,37 @@ use std::sync::Arc;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
 use crate::llm::common::{
-    build_data_url, finalize_assistant_text, parse_image_content_block, parse_sse_json_response,
-    send_openai_compatible_request,
+    build_data_url, finalize_assistant_text, openai_chat_completions_url, parse_image_content_block,
+    parse_sse_json_response, send_openai_compatible_request,
 };
 use crate::llm::{
     AssistantMessageMetadata, ChatMessage, ChatRequest, ChatResponse, FunctionTool, LlmEvent,
-    LlmEventStream, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities,
+    LlmEventStream, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities, ChatRole,
     MultimodalInputRoles, TokenUsage, ToolCall as LlmToolCall, ToolChoice, ToolSpec, ToolsPayload,
 };
 use crate::types::{fallback_text_for_content_blocks, ContentBlock};
+
+#[derive(Debug, Clone)]
+pub enum OpenAiAuthStyle {
+    Bearer,
+    XApiKey,
+    Custom(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleConfig {
     pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    pub auth_style: OpenAiAuthStyle,
+    pub user_agent: Option<String>,
+    pub merge_system_into_user: bool,
     pub multimodal_input_roles: MultimodalInputRoles,
 }
 
@@ -33,6 +44,9 @@ impl OpenAiCompatibleConfig {
             model: model.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: None,
+            auth_style: OpenAiAuthStyle::Bearer,
+            user_agent: None,
+            merge_system_into_user: false,
             multimodal_input_roles: MultimodalInputRoles::user_only(),
         }
     }
@@ -47,9 +61,52 @@ impl OpenAiCompatibleConfig {
         self
     }
 
+    pub fn with_auth_style(mut self, auth_style: OpenAiAuthStyle) -> Self {
+        self.auth_style = auth_style;
+        self
+    }
+
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    pub fn with_merge_system_into_user(mut self, enabled: bool) -> Self {
+        self.merge_system_into_user = enabled;
+        self
+    }
+
     pub fn with_multimodal_input_roles(mut self, roles: MultimodalInputRoles) -> Self {
         self.multimodal_input_roles = roles;
         self
+    }
+
+    pub(crate) fn chat_completions_url(&self) -> String {
+        openai_chat_completions_url(&self.base_url)
+    }
+
+    pub(crate) fn request_headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        if let Some(api_key) = self.api_key.as_deref() {
+            let (name, value) = match &self.auth_style {
+                OpenAiAuthStyle::Bearer => {
+                    (AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {api_key}"))?)
+                }
+                OpenAiAuthStyle::XApiKey => (
+                    HeaderName::from_static("x-api-key"),
+                    HeaderValue::from_str(api_key)?,
+                ),
+                OpenAiAuthStyle::Custom(header) => (
+                    HeaderName::from_bytes(header.as_bytes())?,
+                    HeaderValue::from_str(api_key)?,
+                ),
+            };
+            headers.insert(name, value);
+        }
+        if let Some(user_agent) = self.user_agent.as_deref() {
+            headers.insert(USER_AGENT, HeaderValue::from_str(user_agent)?);
+        }
+        Ok(headers)
     }
 }
 
@@ -78,6 +135,13 @@ impl OpenAiCompatibleProvider {
             ),
         }
     }
+
+    fn prepare_request(&self, mut req: ChatRequest) -> ChatRequest {
+        if self.config.merge_system_into_user {
+            req.messages = flatten_system_messages(&req.messages);
+        }
+        req
+    }
 }
 
 #[async_trait]
@@ -103,6 +167,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let req = self.prepare_request(req);
         let tools_payload = self.convert_tools(&req.tool_specs)?;
         let request = build_chat_request(
             &self.config.model,
@@ -119,6 +184,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     async fn stream_chat(&self, req: ChatRequest) -> anyhow::Result<LlmEventStream> {
+        let req = self.prepare_request(req);
         let tools_payload = self.convert_tools(&req.tool_specs)?;
         let request = build_chat_request(
             &self.config.model,
@@ -220,13 +286,13 @@ impl ReqwestOpenAiTransport {
         request: OpenAiChatRequest,
         stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
+        let request_url = config.chat_completions_url();
         send_openai_compatible_request(
             &self.client,
-            &config.base_url,
-            config.api_key.as_deref(),
+            &request_url,
             &request,
             stream,
-            reqwest::header::HeaderMap::new(),
+            config.request_headers()?,
             "openai_http_error",
         )
         .await
@@ -561,6 +627,33 @@ fn convert_openai_response_format(spec: &crate::llm::StructuredOutputSpec) -> Op
     }
 }
 
+fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let system_content = messages
+        .iter()
+        .filter(|message| message.role == ChatRole::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if system_content.is_empty() {
+        return messages.to_vec();
+    }
+    let mut result = messages
+        .iter()
+        .filter(|message| message.role != ChatRole::System)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(first_user) = result.iter_mut().find(|message| message.role == ChatRole::User) {
+        first_user.content = if first_user.content.is_empty() {
+            system_content
+        } else {
+            format!("{system_content}\n\n{}", first_user.content)
+        };
+    } else {
+        result.insert(0, ChatMessage::user(system_content));
+    }
+    result
+}
+
 fn convert_message(
     message: &ChatMessage,
     multimodal_input_roles: MultimodalInputRoles,
@@ -659,15 +752,25 @@ pub fn parse_chat_response(response: OpenAiChatResponse) -> anyhow::Result<ChatR
 
 fn parse_openai_message(message: OpenAiMessage) -> anyhow::Result<ChatResponse> {
     let parsed_content = parse_openai_message_content(message.content);
-    let text = finalize_assistant_text(
+    let mut text = strip_think_tags(&finalize_assistant_text(
         parsed_content.text,
         &parsed_content.content_blocks,
         parsed_content.saw_multimodal_content,
-    );
+    ));
+    let reasoning_content = message
+        .reasoning_content
+        .as_deref()
+        .map(strip_think_tags)
+        .filter(|value| !value.is_empty());
+    if text.is_empty() {
+        if let Some(reasoning) = reasoning_content.as_deref() {
+            text = reasoning.to_string();
+        }
+    }
     let metadata = AssistantMessageMetadata {
         content_blocks: (!parsed_content.content_blocks.is_empty())
             .then_some(parsed_content.content_blocks.clone()),
-        reasoning_content: message.reasoning_content.clone(),
+        reasoning_content: reasoning_content.clone(),
     };
     if let Some(tool_calls) = message.tool_calls {
         let mut calls = Vec::with_capacity(tool_calls.len());
@@ -769,18 +872,23 @@ fn stream_openai_chunks(
         }
 
         let calls = assemble_tool_calls(&state.tool_calls)?;
-        let response = ChatResponse::new(finalize_assistant_text(
+        let reasoning_content = strip_think_tags(&state.reasoning_content);
+        let mut text = strip_think_tags(&finalize_assistant_text(
             state.text,
             &state.content_blocks,
             state.saw_multimodal_content,
-        ))
+        ));
+        if text.is_empty() && !reasoning_content.is_empty() {
+            text = reasoning_content.clone();
+        }
+        let response = ChatResponse::new(text)
         .with_tool_calls(calls)
         .with_assistant_metadata(AssistantMessageMetadata {
             content_blocks: (!state.content_blocks.is_empty()).then_some(state.content_blocks),
-            reasoning_content: if state.reasoning_content.is_empty() {
+            reasoning_content: if reasoning_content.is_empty() {
                 None
             } else {
-                Some(state.reasoning_content)
+                Some(reasoning_content)
             },
         });
         yield LlmEvent::FinalResponse { response };
@@ -836,6 +944,25 @@ struct ParsedOpenAiContent {
     text: String,
     content_blocks: Vec<ContentBlock>,
     saw_multimodal_content: bool,
+}
+
+fn strip_think_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        if let Some(start) = rest.find("<think>") {
+            result.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find("</think>") {
+                rest = &rest[start + end + "</think>".len()..];
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.trim().to_string()
 }
 
 fn parse_openai_message_content(content: Option<OpenAiMessageContent>) -> ParsedOpenAiContent {
@@ -932,6 +1059,72 @@ mod tests {
         assert_eq!(
             out[0].choices[0].delta.content,
             Some(OpenAiMessageContent::from("你"))
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_uses_full_endpoint_when_provided() {
+        let config = OpenAiCompatibleConfig::new("test")
+            .with_base_url("https://my-api.example.com/v2/chat/completions");
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://my-api.example.com/v2/chat/completions"
+        );
+    }
+
+    #[test]
+    fn request_headers_support_x_api_key_and_user_agent() {
+        let config = OpenAiCompatibleConfig::new("test")
+            .with_api_key("k")
+            .with_auth_style(OpenAiAuthStyle::XApiKey)
+            .with_user_agent("deepagents-test/1.0");
+        let headers = config.request_headers().expect("headers should be valid");
+        assert_eq!(
+            headers.get("x-api-key").and_then(|value| value.to_str().ok()),
+            Some("k")
+        );
+        assert_eq!(
+            headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("deepagents-test/1.0")
+        );
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn flatten_system_messages_merges_into_first_user_turn() {
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::assistant("ack"),
+            ChatMessage::system("constraints"),
+            ChatMessage::user("hello"),
+        ];
+        let flattened = flatten_system_messages(&messages);
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].role, ChatRole::Assistant);
+        assert_eq!(flattened[1].role, ChatRole::User);
+        assert_eq!(flattened[1].content, "policy\n\nconstraints\n\nhello");
+    }
+
+    #[test]
+    fn parse_openai_message_uses_reasoning_when_content_is_think_only() {
+        let message = OpenAiMessage {
+            role: "assistant".to_string(),
+            content: Some(OpenAiMessageContent::Text(
+                "<think>internal chain</think>".to_string(),
+            )),
+            reasoning_content: Some("final answer".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let response = parse_openai_message(message).expect("should parse");
+        assert_eq!(response.text, "final answer");
+        assert_eq!(
+            response
+                .assistant_metadata
+                .and_then(|metadata| metadata.reasoning_content),
+            Some("final answer".to_string())
         );
     }
 }

@@ -1,6 +1,6 @@
 use async_stream::try_stream;
 use bytes::Bytes;
-use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio_stream::Stream;
@@ -40,10 +40,25 @@ pub(crate) fn finalize_assistant_text(
     String::new()
 }
 
+pub(crate) fn openai_chat_completions_url(base_url: &str) -> String {
+    let normalized_base = base_url.trim_end_matches('/');
+    let has_full_endpoint = reqwest::Url::parse(normalized_base)
+        .map(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .ends_with("/chat/completions")
+        })
+        .unwrap_or_else(|_| normalized_base.ends_with("/chat/completions"));
+    if has_full_endpoint {
+        normalized_base.to_string()
+    } else {
+        format!("{normalized_base}/chat/completions")
+    }
+}
+
 pub(crate) async fn send_openai_compatible_request<T>(
     client: &reqwest::Client,
-    base_url: &str,
-    api_key: Option<&str>,
+    request_url: &str,
     request: &T,
     stream: bool,
     extra_headers: HeaderMap,
@@ -52,9 +67,8 @@ pub(crate) async fn send_openai_compatible_request<T>(
 where
     T: Serialize + ?Sized,
 {
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let mut builder = client
-        .post(url)
+    let builder = client
+        .post(request_url)
         .header(CONTENT_TYPE, "application/json")
         .header(
             ACCEPT,
@@ -66,10 +80,6 @@ where
         )
         .headers(extra_headers)
         .json(request);
-
-    if let Some(api_key) = api_key {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {api_key}"));
-    }
 
     let response = builder.send().await?;
     let status = response.status();

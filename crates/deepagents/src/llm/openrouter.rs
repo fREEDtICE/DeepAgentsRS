@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::HeaderValue;
 
-use crate::llm::common::{parse_sse_json_response, send_openai_compatible_request};
+use crate::llm::common::{
+    openai_chat_completions_url, parse_sse_json_response, send_openai_compatible_request,
+};
 use crate::llm::openai_compatible::{
     MockOpenAiTransport, OpenAiChatRequest, OpenAiChatResponse, OpenAiChunkStream,
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiCompatibleTransport,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiCompatibleTransport, OpenAiToolChoice,
 };
 use crate::llm::{
     ChatRequest, ChatResponse, LlmEventStream, LlmProvider, LlmProviderCapabilities,
@@ -14,7 +16,6 @@ use crate::llm::{
 };
 
 const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
-
 #[derive(Debug, Clone)]
 pub struct OpenRouterConfig {
     pub model: String,
@@ -94,7 +95,10 @@ impl OpenRouterProvider {
         transport: Arc<dyn OpenAiCompatibleTransport>,
     ) -> Self {
         Self {
-            inner: OpenAiCompatibleProvider::new(config.to_openai_compatible_config(), transport),
+            inner: OpenAiCompatibleProvider::new(
+                config.to_openai_compatible_config(),
+                Arc::new(OpenRouterTransportAdapter::new(transport)),
+            ),
         }
     }
 }
@@ -120,7 +124,48 @@ impl LlmProvider for OpenRouterProvider {
 
 pub type MockOpenRouterTransport = MockOpenAiTransport;
 
-#[derive(Clone, Default)]
+struct OpenRouterTransportAdapter {
+    inner: Arc<dyn OpenAiCompatibleTransport>,
+}
+
+impl OpenRouterTransportAdapter {
+    fn new(inner: Arc<dyn OpenAiCompatibleTransport>) -> Self {
+        Self { inner }
+    }
+
+    fn prepare_request(mut request: OpenAiChatRequest, stream: bool) -> OpenAiChatRequest {
+        request.stream = Some(stream);
+        if !request.tools.is_empty() && request.tool_choice.is_none() {
+            request.tool_choice = Some(OpenAiToolChoice::Mode("auto".to_string()));
+        }
+        request
+    }
+}
+
+#[async_trait]
+impl OpenAiCompatibleTransport for OpenRouterTransportAdapter {
+    async fn create_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChatResponse> {
+        self.inner
+            .create_chat_completion(config, Self::prepare_request(request, false))
+            .await
+    }
+
+    async fn stream_chat_completion(
+        &self,
+        config: &OpenAiCompatibleConfig,
+        request: OpenAiChatRequest,
+    ) -> anyhow::Result<OpenAiChunkStream> {
+        self.inner
+            .stream_chat_completion(config, Self::prepare_request(request, true))
+            .await
+    }
+}
+
+#[derive(Clone)]
 pub struct ReqwestOpenRouterTransport {
     client: reqwest::Client,
     site_url: Option<String>,
@@ -160,23 +205,29 @@ impl ReqwestOpenRouterTransport {
         request: OpenAiChatRequest,
         stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
-        let mut headers = HeaderMap::new();
+        let mut headers = config.request_headers()?;
         if let Some(site_url) = &self.site_url {
             headers.insert("HTTP-Referer", HeaderValue::from_str(site_url)?);
         }
         if let Some(app_name) = &self.app_name {
             headers.insert("X-Title", HeaderValue::from_str(app_name)?);
         }
+        let request_url = openai_chat_completions_url(&config.base_url);
         send_openai_compatible_request(
             &self.client,
-            &config.base_url,
-            config.api_key.as_deref(),
+            &request_url,
             &request,
             stream,
             headers,
             "openrouter_http_error",
         )
         .await
+    }
+}
+
+impl Default for ReqwestOpenRouterTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
