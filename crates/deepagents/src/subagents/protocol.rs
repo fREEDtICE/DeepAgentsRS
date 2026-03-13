@@ -12,12 +12,16 @@ use crate::state::AgentState;
 use crate::types::Message;
 use crate::DeepAgent;
 
-pub const EXCLUDED_STATE_KEYS: [&str; 5] = [
+pub const EXCLUDED_STATE_KEYS: [&str; 9] = [
     "messages",
     "todos",
     "structured_response",
     "skills_metadata",
+    "skills_tools",
+    "skills_diagnostics",
     "memory_contents",
+    "_prompt_cache_options",
+    "_provider_cache_events",
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,4 +100,97 @@ pub fn state_extra_from_pairs(pairs: Vec<(&str, Value)>) -> BTreeMap<String, Val
         out.insert(k.to_string(), v);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_state_for_child, merge_child_state};
+    use crate::state::AgentState;
+
+    #[test]
+    fn child_state_filter_excludes_skill_and_prompt_cache_keys() {
+        let mut parent = AgentState::default();
+        for key in [
+            "messages",
+            "todos",
+            "structured_response",
+            "skills_metadata",
+            "skills_tools",
+            "skills_diagnostics",
+            "memory_contents",
+            "_prompt_cache_options",
+            "_provider_cache_events",
+        ] {
+            parent
+                .extra
+                .insert(key.to_string(), serde_json::json!({ "present": true }));
+        }
+        parent
+            .extra
+            .insert("allowed_key".to_string(), serde_json::json!(1));
+
+        let child = filter_state_for_child(&parent);
+
+        assert!(child.extra.contains_key("allowed_key"));
+        for key in [
+            "messages",
+            "todos",
+            "structured_response",
+            "skills_metadata",
+            "skills_tools",
+            "skills_diagnostics",
+            "memory_contents",
+            "_prompt_cache_options",
+            "_provider_cache_events",
+        ] {
+            assert!(
+                !child.extra.contains_key(key),
+                "unexpected inherited key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_child_state_ignores_filtered_keys() {
+        let mut parent = AgentState::default();
+        let mut child = AgentState::default();
+        child
+            .extra
+            .insert("allowed_key".to_string(), serde_json::json!(1));
+        for key in [
+            "messages",
+            "todos",
+            "structured_response",
+            "skills_metadata",
+            "skills_tools",
+            "skills_diagnostics",
+            "memory_contents",
+            "_prompt_cache_options",
+            "_provider_cache_events",
+        ] {
+            child
+                .extra
+                .insert(key.to_string(), serde_json::json!({ "present": true }));
+        }
+
+        merge_child_state(&mut parent, &child);
+
+        assert!(parent.extra.contains_key("allowed_key"));
+        for key in [
+            "messages",
+            "todos",
+            "structured_response",
+            "skills_metadata",
+            "skills_tools",
+            "skills_diagnostics",
+            "memory_contents",
+            "_prompt_cache_options",
+            "_provider_cache_events",
+        ] {
+            assert!(
+                !parent.extra.contains_key(key),
+                "unexpected merged key: {key}"
+            );
+        }
+    }
 }

@@ -1,13 +1,18 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use futures_util::FutureExt;
 use tokio::time::{timeout, Duration};
 
 use crate::approval::{redact_command, ApprovalDecision, ApprovalRequest, ExecutionMode};
 use crate::audit::{AuditEvent, AuditSink};
 use crate::runtime::{HandledToolCall, RuntimeMiddleware, ToolCallContext};
 use crate::skills::loader::{load_skills, SkillsLoadOptions};
-use crate::skills::{LoadedSkills, SkillToolSpec};
+use crate::skills::validator::{
+    classify_package_skill_step_tool, validate_package_skill_input, PackageSkillStepKind,
+};
+use crate::skills::{LoadedSkills, SkillMetadata, SkillToolSpec, SkillsDiagnostics};
 use crate::state::AgentState;
 use crate::types::Message;
 
@@ -38,74 +43,17 @@ impl RuntimeMiddleware for SkillsMiddleware {
         mut messages: Vec<Message>,
         state: &mut AgentState,
     ) -> Result<Vec<Message>> {
-        let mut should_load = true;
-        if let (Some(meta), Some(tools)) = (
-            state.extra.get("skills_metadata"),
-            state.extra.get("skills_tools"),
-        ) {
-            let meta_ok =
-                serde_json::from_value::<Vec<crate::skills::SkillMetadata>>(meta.clone()).is_ok();
-            let tools_ok = serde_json::from_value::<Vec<SkillToolSpec>>(tools.clone()).is_ok();
-            if meta_ok && tools_ok {
-                should_load = false;
-            }
-        }
-
-        if should_load {
-            let loaded = load_skills(&self.sources, self.options.clone())?;
-            state.extra.insert(
-                "skills_metadata".to_string(),
-                serde_json::to_value(&loaded.metadata)?,
-            );
-            state.extra.insert(
-                "skills_tools".to_string(),
-                serde_json::to_value(&loaded.tools)?,
-            );
-            state.extra.insert(
-                "skills_diagnostics".to_string(),
-                serde_json::to_value(&loaded.diagnostics)?,
-            );
-            *self.state.write().unwrap() = loaded;
+        let loaded = if let Some(loaded) = restore_loaded_skills(state)? {
+            loaded
         } else {
-            let meta = state
-                .extra
-                .get("skills_metadata")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let tools = state
-                .extra
-                .get("skills_tools")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let diagnostics = state
-                .extra
-                .get("skills_diagnostics")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let loaded = LoadedSkills {
-                metadata: serde_json::from_value(meta).unwrap_or_default(),
-                tools: serde_json::from_value(tools).unwrap_or_default(),
-                diagnostics: serde_json::from_value(diagnostics).unwrap_or_default(),
-            };
-            *self.state.write().unwrap() = loaded;
-        }
+            let loaded = load_skills(&self.sources, self.options.clone())?;
+            store_loaded_skills_snapshot(state, &loaded)?;
+            loaded
+        };
+        *self.state.write().unwrap() = loaded.clone();
 
-        if !has_injection_marker(&messages) {
-            let block = build_skills_block(&self.state.read().unwrap());
-            messages.insert(
-                0,
-                Message {
-                    role: "system".to_string(),
-                    content: block,
-                    content_blocks: None,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    status: None,
-                },
-            );
-        }
+        let block = build_skills_block(&loaded);
+        upsert_injection_message(&mut messages, block);
 
         Ok(messages)
     }
@@ -124,10 +72,10 @@ impl RuntimeMiddleware for SkillsMiddleware {
             None => return Ok(None),
         };
 
-        if let Err(e) = validate_input_schema(&tool.input_schema, &ctx.tool_call.arguments) {
+        if let Err(e) = validate_package_skill_input(&tool.input_schema, &ctx.tool_call.arguments) {
             return Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
-                error: Some(format!("invalid_request: {e}")),
+                error: Some(format!("invalid_request: {}", e)),
             }));
         }
 
@@ -141,23 +89,35 @@ impl RuntimeMiddleware for SkillsMiddleware {
             }));
         }
 
+        // Catch panics inside skill execution so a buggy package step is
+        // surfaced as a tool error instead of unwinding the whole runner.
         let result = timeout(
             Duration::from_millis(tool.policy.timeout_ms),
-            execute_skill_steps(ctx, &tool),
+            AssertUnwindSafe(execute_skill_steps(ctx, &tool)).catch_unwind(),
         )
         .await;
         match result {
-            Ok(Ok(out)) => Ok(Some(HandledToolCall {
+            Ok(Ok(Ok(out))) => Ok(Some(HandledToolCall {
                 output: out,
                 error: None,
             })),
-            Ok(Err(e)) => Ok(Some(HandledToolCall {
+            Ok(Ok(Err(e))) => Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
                 error: Some(e),
             })),
+            Ok(Err(payload)) => Ok(Some(HandledToolCall {
+                output: serde_json::Value::Null,
+                error: Some(format!(
+                    "skill_panic: {}",
+                    panic_payload_message(payload.as_ref())
+                )),
+            })),
             Err(_) => Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
-                error: Some("skill_timeout".to_string()),
+                error: Some(format!(
+                    "skill_timeout: exceeded {}ms",
+                    tool.policy.timeout_ms
+                )),
             })),
         }
     }
@@ -169,8 +129,12 @@ async fn execute_skill_steps(
 ) -> Result<serde_json::Value, String> {
     let mut last_output = serde_json::Value::Null;
     for step in &tool.steps {
-        if !is_step_allowed(step, &tool.policy) {
-            return Err("permission_denied: tool not allowed".to_string());
+        validate_step_access(step, &tool.policy)?;
+        if !step.arguments.is_object() {
+            return Err(format!(
+                "invalid_skill_definition: step {} arguments must be object",
+                step.tool_name
+            ));
         }
         let mut args = step.arguments.clone();
         args = merge_args(args, &ctx.tool_call.arguments);
@@ -339,24 +303,43 @@ fn mode_str(mode: ExecutionMode) -> String {
     }
 }
 
-fn is_step_allowed(
+/// Enforces the deny-by-default execution boundary for package skill steps.
+fn validate_step_access(
     step: &crate::skills::SkillToolStep,
     policy: &crate::skills::SkillToolPolicy,
-) -> bool {
-    if step.tool_name == "execute" {
-        return policy.allow_execute;
+) -> Result<(), String> {
+    match classify_package_skill_step_tool(&step.tool_name).map_err(|error| error.to_string())? {
+        PackageSkillStepKind::AgentOwned => Ok(()),
+        PackageSkillStepKind::Filesystem => {
+            if policy.allow_filesystem {
+                Ok(())
+            } else {
+                Err(format!(
+                    "permission_denied: {} requires allow_filesystem=true",
+                    step.tool_name
+                ))
+            }
+        }
+        PackageSkillStepKind::Execute => {
+            if policy.allow_execute {
+                Ok(())
+            } else {
+                Err("permission_denied: execute requires allow_execute=true".to_string())
+            }
+        }
     }
-    if is_filesystem_tool(&step.tool_name) {
-        return policy.allow_filesystem;
-    }
-    true
 }
 
-fn is_filesystem_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "ls" | "read_file" | "write_file" | "edit_file" | "delete_file" | "glob" | "grep"
-    )
+/// Extracts a readable panic message so skill unwinds can be surfaced as
+/// regular tool errors.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "skill step panicked".to_string()
 }
 
 fn build_skills_block(loaded: &LoadedSkills) -> String {
@@ -384,6 +367,95 @@ fn has_injection_marker(messages: &[Message]) -> bool {
     messages
         .iter()
         .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+}
+
+fn restore_loaded_skills(state: &mut AgentState) -> Result<Option<LoadedSkills>> {
+    let Some(metadata) = state.extra.get("skills_metadata").cloned() else {
+        return Ok(None);
+    };
+    let Some(tools) = state.extra.get("skills_tools").cloned() else {
+        return Ok(None);
+    };
+
+    let metadata = match serde_json::from_value::<Vec<SkillMetadata>>(metadata) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let tools = match serde_json::from_value::<Vec<SkillToolSpec>>(tools) {
+        Ok(tools) => tools,
+        Err(_) => return Ok(None),
+    };
+    let diagnostics = match state.extra.get("skills_diagnostics").cloned() {
+        Some(value) => match serde_json::from_value::<SkillsDiagnostics>(value) {
+            Ok(diagnostics) => diagnostics,
+            Err(_) => return Ok(None),
+        },
+        None => SkillsDiagnostics::default(),
+    };
+
+    let mut loaded = LoadedSkills {
+        metadata,
+        tools,
+        diagnostics,
+    };
+    loaded.canonicalize();
+    store_loaded_skills_snapshot(state, &loaded)?;
+    Ok(Some(loaded))
+}
+
+fn store_loaded_skills_snapshot(state: &mut AgentState, loaded: &LoadedSkills) -> Result<()> {
+    state.extra.insert(
+        "skills_metadata".to_string(),
+        serde_json::to_value(&loaded.metadata)?,
+    );
+    state.extra.insert(
+        "skills_tools".to_string(),
+        serde_json::to_value(&loaded.tools)?,
+    );
+    state.extra.insert(
+        "skills_diagnostics".to_string(),
+        serde_json::to_value(&loaded.diagnostics)?,
+    );
+    Ok(())
+}
+
+fn upsert_injection_message(messages: &mut Vec<Message>, block: String) {
+    if !has_injection_marker(messages) {
+        messages.insert(0, skills_injection_message(block));
+        return;
+    }
+
+    let mut seen_marker = false;
+    messages.retain(|message| {
+        if !message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1") {
+            return true;
+        }
+        if !seen_marker {
+            seen_marker = true;
+            return true;
+        }
+        false
+    });
+
+    if let Some(message) = messages
+        .iter_mut()
+        .find(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+    {
+        *message = skills_injection_message(block);
+    }
+}
+
+fn skills_injection_message(block: String) -> Message {
+    Message {
+        role: "system".to_string(),
+        content: block,
+        content_blocks: None,
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        status: None,
+    }
 }
 
 fn merge_args(base: serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
@@ -432,57 +504,5 @@ fn truncate_output(value: serde_json::Value, max: usize) -> serde_json::Value {
                 other
             }
         }
-    }
-}
-
-fn validate_input_schema(
-    schema: &serde_json::Value,
-    input: &serde_json::Value,
-) -> Result<(), String> {
-    let Some(schema_obj) = schema.as_object() else {
-        return Err("schema must be object".to_string());
-    };
-    let typ = schema_obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("object");
-    if typ != "object" {
-        return Err("schema type must be object".to_string());
-    }
-    let input_obj = input
-        .as_object()
-        .ok_or_else(|| "input must be object".to_string())?;
-    if let Some(required) = schema_obj.get("required").and_then(|v| v.as_array()) {
-        for r in required {
-            let key = r
-                .as_str()
-                .ok_or_else(|| "required must be string".to_string())?;
-            if !input_obj.contains_key(key) {
-                return Err(format!("missing required field: {}", key));
-            }
-        }
-    }
-    if let Some(props) = schema_obj.get("properties").and_then(|v| v.as_object()) {
-        for (k, prop) in props {
-            if let Some(value) = input_obj.get(k) {
-                if let Some(t) = prop.get("type").and_then(|v| v.as_str()) {
-                    if !matches_type(value, t) {
-                        return Err(format!("field {} must be {}", k, t));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn matches_type(value: &serde_json::Value, typ: &str) -> bool {
-    match typ {
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "boolean" => value.is_boolean(),
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        _ => true,
     }
 }

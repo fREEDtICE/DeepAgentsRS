@@ -126,7 +126,7 @@ pub struct AssistantMessageMetadata {
 
 impl AssistantMessageMetadata {
     pub fn is_empty(&self) -> bool {
-        self.content_blocks.as_ref().map_or(true, Vec::is_empty) && self.reasoning_content.is_none()
+        self.content_blocks.as_ref().is_none_or(Vec::is_empty) && self.reasoning_content.is_none()
     }
 }
 
@@ -417,6 +417,19 @@ pub trait LlmProvider: Send + Sync {
         Ok(ToolsPayload::None)
     }
 
+    fn prompt_cache_payload(
+        &self,
+        req: &ChatRequest,
+        tools_payload: &ToolsPayload,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "messages": req.messages,
+            "tool_choice": req.tool_choice,
+            "structured_output": req.structured_output,
+            "tools_payload": tools_payload,
+        }))
+    }
+
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse>;
 
     async fn stream_chat(&self, req: ChatRequest) -> anyhow::Result<LlmEventStream>;
@@ -430,18 +443,22 @@ pub struct MockLlmProvider {
 
 impl MockLlmProvider {
     pub fn new(events: Vec<LlmEvent>) -> Self {
-        let mut capabilities = LlmProviderCapabilities::default();
-        capabilities.supports_streaming = true;
-        capabilities.reports_usage = events.iter().any(|event| match event {
+        let reports_usage = events.iter().any(|event| match event {
             LlmEvent::Usage { .. } => true,
             LlmEvent::FinalResponse { response } => response.usage.is_some(),
             _ => false,
         });
-        capabilities.supports_tool_calling = events.iter().any(|event| match event {
+        let supports_tool_calling = events.iter().any(|event| match event {
             LlmEvent::ToolCallArgsDelta { .. } => true,
             LlmEvent::FinalResponse { response } => response.has_tool_calls(),
             _ => false,
         });
+        let capabilities = LlmProviderCapabilities {
+            supports_streaming: true,
+            reports_usage,
+            supports_tool_calling,
+            ..Default::default()
+        };
         Self {
             events: Arc::new(events),
             capabilities,

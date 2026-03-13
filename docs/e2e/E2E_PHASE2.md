@@ -18,7 +18,7 @@
   - 可选：`--state-file <path>`（用于输出稳定的结构化 JSON，失败也会打印 JSON）
 - `run` 子命令（非交互、可脚本化）
   - 入参：`--input <text>`
-  - 可选：`--provider`、`--mock-script`、`--plugin`、`--max-steps`、`--provider-timeout-ms`
+  - 可选：`--provider`、`--mock-script`、`--skills-source`、`--max-steps`、`--provider-timeout-ms`
 
 ### 0.2 Phase 2 对外能力缺口（以行为为准）
 

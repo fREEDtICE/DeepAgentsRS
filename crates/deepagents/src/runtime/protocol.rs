@@ -55,18 +55,13 @@ pub struct RuntimeError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
+    #[default]
     Completed,
     Interrupted,
     Error,
-}
-
-impl Default for RunStatus {
-    fn default() -> Self {
-        Self::Completed
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::{AssistantMessageMetadata, StructuredOutputSpec, ToolChoice};
-use crate::skills::SkillSpec;
+use crate::provider::prompt_cache::{
+    PromptCachePlan, ProviderPromptCacheHint, ProviderPromptCacheObservation,
+};
 use crate::state::AgentState;
 use crate::types::Message;
 
@@ -37,13 +39,6 @@ pub enum AgentStep {
     },
     ToolCalls {
         calls: Vec<AgentToolCall>,
-    },
-    SkillCall {
-        name: String,
-        #[serde(default)]
-        input: serde_json::Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
     },
     Error {
         error: AgentProviderError,
@@ -92,8 +87,6 @@ pub struct AgentProviderRequest {
     pub tool_specs: Vec<crate::runtime::ToolSpec>,
     #[serde(default)]
     pub tool_choice: ToolChoice,
-    #[serde(default)]
-    pub skills: Vec<SkillSpec>,
     #[serde(default)]
     pub state: AgentState,
     #[serde(default)]
@@ -169,6 +162,26 @@ pub trait AgentProvider: Send + Sync {
         _collector: &mut dyn AgentProviderEventCollector,
     ) -> anyhow::Result<AgentStepOutput> {
         self.step_output(req).await
+    }
+
+    fn prompt_cache_plan(&self, req: &AgentProviderRequest) -> anyhow::Result<PromptCachePlan> {
+        Ok(PromptCachePlan::from_agent_request(req))
+    }
+
+    fn apply_prompt_cache_hint(
+        &self,
+        req: AgentProviderRequest,
+        _hint: &ProviderPromptCacheHint,
+    ) -> AgentProviderRequest {
+        req
+    }
+
+    fn observe_prompt_cache_result(
+        &self,
+        _output: &AgentStepOutput,
+        _events: &[AgentProviderEvent],
+    ) -> Option<ProviderPromptCacheObservation> {
+        None
     }
 }
 

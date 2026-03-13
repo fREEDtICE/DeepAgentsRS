@@ -46,7 +46,6 @@ async fn h01_approve_executes_tool() {
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -108,7 +107,6 @@ async fn h02_reject_cancels_without_side_effect() {
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -173,7 +171,6 @@ async fn h03_edit_changes_args_and_keeps_call_id() {
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -255,7 +252,6 @@ async fn h04_multiple_interrupts_in_one_batch() {
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -317,7 +313,6 @@ async fn h05_invalid_resume_keeps_pending_and_allows_retry() {
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -395,7 +390,6 @@ async fn h06_interactive_execute_resume_approve_runs_when_policy_requires_approv
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -464,7 +458,6 @@ async fn h07_interactive_execute_resume_edit_runs_when_policy_requires_approval(
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,

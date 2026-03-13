@@ -104,7 +104,6 @@ fn response_from_step(step: AgentStep) -> ChatResponse {
             .with_tool_calls(calls.into_iter().map(convert_tool_call).collect()),
         AgentStep::ToolCalls { calls } => ChatResponse::new("")
             .with_tool_calls(calls.into_iter().map(convert_tool_call).collect()),
-        AgentStep::SkillCall { .. } => panic!("skill calls are not valid llm responses"),
         AgentStep::Error { error } => {
             panic!("unexpected provider error in test fixture: {error:?}")
         }
@@ -156,7 +155,6 @@ fn sample_request(tool_choice: ToolChoice) -> AgentProviderRequest {
             }),
         }],
         tool_choice,
-        skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
         structured_output: None,
@@ -170,7 +168,6 @@ fn build_runner(root: &std::path::Path, provider: Arc<dyn AgentProvider>) -> Res
     ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: RuntimeConfig {
                 max_steps: 8,

@@ -5,7 +5,7 @@
 对齐锚点（行为优先）：
 
 - Extras 验收索引（按生命周期划分的必测能力）：[skills/index.md](../acceptance_extras/skills/index.md)
-- Phase 6 详细契约与范围定义：[ITERATION_PHASE6_DETAILED.md](../iteration/ITERATION_PHASE6_DETAILED.md)
+- 当前发布路径与迭代门禁：[agent-skill-iteration-plan.md](../iteration/skill/agent-skill-iteration-plan.md)
 
 ---
 
@@ -20,7 +20,7 @@
 
 黑盒原则：
 
-- 不依赖具体实现路径（技能是“宏工具”还是“skill_call 展开”都可），但必须提供等价的外部观察点以断言上述效果。
+- 不依赖具体实现细节（例如中间件顺序、内部状态快照的序列化形式），但必须提供稳定的外部观察点以断言上述效果。
 - 不依赖真实 LLM：必须使用确定性模型（ScriptedModel/MockProvider）驱动技能调用，避免 flake。
 - 不依赖外部网络：禁止访问公网；如需“网络能力”只测试权限拒绝，不测试真实网络请求。
 
@@ -88,7 +88,7 @@ stdout/stderr 基线（为 E2E 稳定性强制）：
 
 E2E 必须使用“脚本驱动模型”，确保每次都触发同一组 tool_calls：
 
-- Step 1：输出对某个技能工具的 tool_call（或 skill_call，视外部协议而定）
+- Step 1：输出对某个技能工具的 tool_call
 - Step 2：输出 final_text（或从 last_tool_result 派生 final_text），用于验证“技能结果确实进入了对话闭环”
 
 核心要求是：测试能断言 runner 发给模型的 request 中包含“技能工具/schema”和“system 注入块”，且能稳定触发技能工具执行。
@@ -176,8 +176,7 @@ root 外预置（用于越界/绕行测试）：
 - 能找到“技能注入已发生”的证据（例如 system message 含固定 marker/固定前缀，或 trace 中有 `skills_injected=true`）。
 - 能找到“技能工具可调用”的证据（例如 model tools 列表包含技能工具名；或 request.snapshot 中可读到 tools；或 trace 中记录已注入 tools 数量）。
 - 能找到“技能工具被调用并执行”的证据：
-  - tool_calls 中出现技能工具名（若技能工具化）
-  - 或者出现 `skill_call` 记录，并能在 tool_results/trace 中看到其展开与执行结果
+  - tool_calls 中出现技能工具名
 - 能断言“技能失败的错误码分类”：
   - schema 校验失败（invalid_request / schema_validation_failed）
   - 权限不足（permission_denied / tool_not_allowed）
@@ -257,7 +256,7 @@ root 外预置（用于越界/绕行测试）：
 - 输入：`math-add` 技能工具；脚本第 1 步发起 tool_call `math-add(a=1,b=2)`，第 2 步输出 final（可从 last_tool_result 派生）
 - 步骤：`deepagents run --skills-source <src> --mock-script <call_math_add_then_finalize>`
 - 断言：
-  - 发生技能调用记录（tool_calls 或 skill_calls）
+  - 发生技能调用记录（tool_calls）
   - 有对应的 tool_result 且可被关联（call_id 对齐或等价关联）
   - final_text 受技能输出影响（包含 `3` 或等价结构）
 
@@ -454,4 +453,3 @@ root 外预置（用于越界/绕行测试）：
 
 - 第 1 步：发起 tool_call 调用 `echo-skill`，但缺必填字段
 - 第 2 步：final_text 固定为 `done`（用于断言“错误不崩溃且可继续”）
-

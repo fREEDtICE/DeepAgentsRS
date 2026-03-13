@@ -12,7 +12,6 @@ use crate::middleware::ToolExecutionMiddleware;
 use crate::provider::AgentProvider;
 use crate::runtime::simple::{SimpleRuntime, SimpleRuntimeOptions};
 use crate::runtime::{RuntimeConfig, RuntimeMiddleware};
-use crate::skills::SkillPlugin;
 use crate::state::AgentState;
 use crate::tools::{default_tools, Tool, ToolResult};
 use crate::types::{AgentRequest, AgentResponse};
@@ -25,7 +24,6 @@ pub struct Ready;
 
 #[derive(Default)]
 struct AgentRuntimeBuilderState {
-    skills: Vec<Arc<dyn SkillPlugin>>,
     config: RuntimeConfig,
     approval: Option<Arc<dyn ApprovalPolicy>>,
     audit: Option<Arc<dyn AuditSink>>,
@@ -213,11 +211,6 @@ pub fn create_local_sandbox_backend(
 }
 
 impl<State> AgentRuntimeBuilder<State> {
-    pub fn with_skills(mut self, skills: Vec<Arc<dyn SkillPlugin>>) -> Self {
-        self.state.skills = skills;
-        self
-    }
-
     pub fn with_config(mut self, config: RuntimeConfig) -> Self {
         self.state.config = config;
         self
@@ -294,7 +287,6 @@ impl AgentRuntimeBuilder<Ready> {
         let runtime = SimpleRuntime::new(
             agent,
             provider,
-            state.skills,
             SimpleRuntimeOptions {
                 config: state.config,
                 approval: state.approval,

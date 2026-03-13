@@ -182,7 +182,6 @@ async fn normalize_accepts_string_json_arguments_for_tool_calls() {
     let runtime = SimpleRuntime::new(
         agent,
         provider,
-        Vec::new(),
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: RuntimeConfig {
                 max_steps: 8,

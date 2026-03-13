@@ -13,6 +13,10 @@ use deepagents::approval::{
     ExecutionMode,
 };
 use deepagents::audit::{AuditEvent, AuditSink};
+use deepagents::config::{
+    ConfigKey, ConfigManager, ConfigOverrides, ConfigScope, ConfigValue, EffectiveConfig,
+    PromptCacheBackendKind,
+};
 use deepagents::provider::mock::MockScript;
 use deepagents::state::AgentState;
 use deepagents::{create_deep_agent_with_backend, create_local_sandbox_backend, DeepAgent};
@@ -121,6 +125,53 @@ struct EndSessionRequest {
     session_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigListRequest {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigGetRequest {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigSetRequest {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    key: String,
+    value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigUnsetRequest {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDoctorRequest {
+    #[serde(default)]
+    root: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorObj {
     code: String,
@@ -165,6 +216,12 @@ pub fn router() -> Router {
         .route("/resume_stream", post(resume_session_stream))
         .route("/session_state/:session_id", get(get_session_state))
         .route("/end_session", post(end_session))
+        .route("/config/schema", get(config_schema))
+        .route("/config/list", post(config_list))
+        .route("/config/get", post(config_get))
+        .route("/config/set", post(config_set))
+        .route("/config/unset", post(config_unset))
+        .route("/config/doctor", post(config_doctor))
         .with_state(state)
 }
 
@@ -177,6 +234,168 @@ async fn initialize() -> (StatusCode, Json<Value>) {
         }
     }));
     (StatusCode::OK, v)
+}
+
+async fn config_schema() -> (StatusCode, Json<Value>) {
+    let manager = match ConfigManager::new(".") {
+        Ok(manager) => manager,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    match serde_json::to_value(manager.schema()) {
+        Ok(value) => (StatusCode::OK, resp_ok(value)),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resp_err("internal_error", &err.to_string(), None),
+        ),
+    }
+}
+
+async fn config_list(Json(req): Json<ConfigListRequest>) -> (StatusCode, Json<Value>) {
+    let manager = match config_manager_from_root(req.root.as_deref()) {
+        Ok(manager) => manager,
+        Err(err) => return err,
+    };
+    let scope = match parse_config_scope(req.scope.as_deref(), ConfigScope::Effective) {
+        Ok(scope) => scope,
+        Err(err) => return err,
+    };
+    match manager.list(scope, &ConfigOverrides::new()) {
+        Ok(entries) => (
+            StatusCode::OK,
+            resp_ok(json!({ "scope": scope, "entries": entries })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        ),
+    }
+}
+
+async fn config_get(Json(req): Json<ConfigGetRequest>) -> (StatusCode, Json<Value>) {
+    let manager = match config_manager_from_root(req.root.as_deref()) {
+        Ok(manager) => manager,
+        Err(err) => return err,
+    };
+    let scope = match parse_config_scope(req.scope.as_deref(), ConfigScope::Effective) {
+        Ok(scope) => scope,
+        Err(err) => return err,
+    };
+    let key = match ConfigKey::parse(req.key) {
+        Ok(key) => key,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    match manager.get(scope, &key, &ConfigOverrides::new()) {
+        Ok(value) => match serde_json::to_value(value) {
+            Ok(value) => (StatusCode::OK, resp_ok(value)),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resp_err("internal_error", &err.to_string(), None),
+            ),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        ),
+    }
+}
+
+async fn config_set(Json(req): Json<ConfigSetRequest>) -> (StatusCode, Json<Value>) {
+    let manager = match config_manager_from_root(req.root.as_deref()) {
+        Ok(manager) => manager,
+        Err(err) => return err,
+    };
+    let scope = match parse_config_scope(req.scope.as_deref(), ConfigScope::Workspace) {
+        Ok(scope) => scope,
+        Err(err) => return err,
+    };
+    let key = match ConfigKey::parse(req.key) {
+        Ok(key) => key,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    let value = match manager.parse_json_value(&key, req.value) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    match manager.set(scope, &key, value) {
+        Ok(()) => (
+            StatusCode::OK,
+            resp_ok(json!({ "status": "ok", "scope": scope, "key": key })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        ),
+    }
+}
+
+async fn config_unset(Json(req): Json<ConfigUnsetRequest>) -> (StatusCode, Json<Value>) {
+    let manager = match config_manager_from_root(req.root.as_deref()) {
+        Ok(manager) => manager,
+        Err(err) => return err,
+    };
+    let scope = match parse_config_scope(req.scope.as_deref(), ConfigScope::Workspace) {
+        Ok(scope) => scope,
+        Err(err) => return err,
+    };
+    let key = match ConfigKey::parse(req.key) {
+        Ok(key) => key,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    match manager.unset(scope, &key) {
+        Ok(()) => (
+            StatusCode::OK,
+            resp_ok(json!({ "status": "ok", "scope": scope, "key": key })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        ),
+    }
+}
+
+async fn config_doctor(Json(req): Json<ConfigDoctorRequest>) -> (StatusCode, Json<Value>) {
+    let manager = match config_manager_from_root(req.root.as_deref()) {
+        Ok(manager) => manager,
+        Err(err) => return err,
+    };
+    match manager.doctor(&ConfigOverrides::new()) {
+        Ok(report) => match serde_json::to_value(report) {
+            Ok(value) => (StatusCode::OK, resp_ok(value)),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resp_err("internal_error", &err.to_string(), None),
+            ),
+        },
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        ),
+    }
 }
 
 async fn new_session(
@@ -196,9 +415,35 @@ async fn new_session(
         }
     }
 
-    let mode = parse_execution_mode(req.execution_mode.as_deref())
-        .unwrap_or(ExecutionMode::NonInteractive);
-    let allow_list = req.shell_allow_list.unwrap_or_default();
+    let config_manager = match ConfigManager::new(req.root.clone()) {
+        Ok(manager) => manager,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    let overrides = match build_session_overrides(&req) {
+        Ok(overrides) => overrides,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    let effective = match config_manager.resolve_effective(&overrides) {
+        Ok(effective) => effective,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }
+    };
+    let mode = effective.security.execution_mode;
+    let allow_list = effective.security.shell_allow_list.clone();
 
     let backend_shell_allow = match mode {
         ExecutionMode::NonInteractive => Some(allow_list.clone()),
@@ -227,10 +472,8 @@ async fn new_session(
     let agent = create_deep_agent_with_backend(backend);
 
     let approval: Arc<dyn ApprovalPolicy> = Arc::new(DefaultApprovalPolicy::new(allow_list));
-    let audit: Option<Arc<dyn AuditSink>> = req
-        .audit_json
-        .as_deref()
-        .map(|p| Arc::new(JsonlFileAuditSink::new(p)) as Arc<dyn AuditSink>);
+    let audit: Option<Arc<dyn AuditSink>> =
+        build_audit_sink(&config_manager, effective.audit.jsonl_path.as_deref());
 
     let n = st.next_id.fetch_add(1, Ordering::Relaxed);
     let session_id = format!("s-{}-{}", now_ms(), n);
@@ -625,12 +868,181 @@ fn tool_result_error(
     })
 }
 
-fn parse_execution_mode(s: Option<&str>) -> Option<ExecutionMode> {
-    match s? {
-        "non_interactive" | "non-interactive" => Some(ExecutionMode::NonInteractive),
-        "interactive" => Some(ExecutionMode::Interactive),
-        _ => None,
+fn parse_config_scope(
+    scope: Option<&str>,
+    default: ConfigScope,
+) -> Result<ConfigScope, (StatusCode, Json<Value>)> {
+    match scope {
+        Some(scope) => ConfigScope::parse(scope).map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        }),
+        None => Ok(default),
     }
+}
+
+fn config_manager_from_root(
+    root: Option<&str>,
+) -> Result<ConfigManager, (StatusCode, Json<Value>)> {
+    ConfigManager::new(root.unwrap_or(".")).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resp_err(err.code, &err.message, None),
+        )
+    })
+}
+
+fn build_session_overrides(
+    req: &NewSessionRequest,
+) -> Result<ConfigOverrides, deepagents::config::ConfigError> {
+    let mut overrides = ConfigOverrides::new();
+    if let Some(execution_mode) = req.execution_mode.as_deref() {
+        let normalized = match execution_mode {
+            "non-interactive" => "non_interactive",
+            other => other,
+        };
+        insert_override(
+            &mut overrides,
+            "security.execution_mode",
+            ConfigValue::String(normalized.to_string()),
+        )?;
+    }
+    if let Some(shell_allow_list) = req.shell_allow_list.as_ref() {
+        insert_override(
+            &mut overrides,
+            "security.shell_allow_list",
+            ConfigValue::StringList(shell_allow_list.clone()),
+        )?;
+    }
+    if let Some(audit_json) = req.audit_json.as_ref() {
+        insert_override(
+            &mut overrides,
+            "audit.jsonl_path",
+            ConfigValue::String(audit_json.clone()),
+        )?;
+    }
+    Ok(overrides)
+}
+
+fn build_run_overrides(
+    req: &RunRequest,
+) -> Result<ConfigOverrides, deepagents::config::ConfigError> {
+    let mut overrides = ConfigOverrides::new();
+    let provider_id = canonical_provider_id(&req.provider);
+    if provider_id != "mock" && provider_id != "mock2" {
+        insert_override(
+            &mut overrides,
+            &format!("providers.{provider_id}.enabled"),
+            ConfigValue::Boolean(true),
+        )?;
+    }
+    if let Some(model) = req.model.as_ref() {
+        insert_override(
+            &mut overrides,
+            &format!("providers.{provider_id}.model"),
+            ConfigValue::String(model.clone()),
+        )?;
+    }
+    if let Some(base_url) = req.base_url.as_ref() {
+        insert_override(
+            &mut overrides,
+            &format!("providers.{provider_id}.base_url"),
+            ConfigValue::String(base_url.clone()),
+        )?;
+    }
+    if let Some(api_key_env) = req.api_key_env.as_ref() {
+        insert_override(
+            &mut overrides,
+            &format!("providers.{provider_id}.api_key_env"),
+            ConfigValue::String(api_key_env.clone()),
+        )?;
+    }
+    if let Some(max_steps) = req.max_steps {
+        insert_override(
+            &mut overrides,
+            "runtime.max_steps",
+            ConfigValue::Integer(max_steps as i64),
+        )?;
+    }
+    if let Some(timeout_ms) = req.provider_timeout_ms {
+        insert_override(
+            &mut overrides,
+            "runtime.provider_timeout_ms",
+            ConfigValue::Integer(timeout_ms as i64),
+        )?;
+    }
+    if let Some(memory_disable) = req.memory_disable {
+        insert_override(
+            &mut overrides,
+            "memory.file.enabled",
+            ConfigValue::Boolean(!memory_disable),
+        )?;
+    }
+    if let Some(summarization_disable) = req.summarization_disable {
+        insert_override(
+            &mut overrides,
+            "runtime.summarization.enabled",
+            ConfigValue::Boolean(!summarization_disable),
+        )?;
+    }
+    Ok(overrides)
+}
+
+fn insert_override(
+    overrides: &mut ConfigOverrides,
+    key: &str,
+    value: ConfigValue,
+) -> Result<(), deepagents::config::ConfigError> {
+    let key = ConfigKey::parse(key.to_string())?;
+    overrides.set(key, value);
+    Ok(())
+}
+
+fn build_audit_sink(
+    config_manager: &ConfigManager,
+    audit_path: Option<&str>,
+) -> Option<Arc<dyn AuditSink>> {
+    audit_path.map(|path| {
+        let path = config_manager.resolve_path(path);
+        let path_string = path.to_string_lossy().into_owned();
+        Arc::new(JsonlFileAuditSink::new(&path_string)) as Arc<dyn AuditSink>
+    })
+}
+
+fn canonical_provider_id(provider_id: &str) -> &str {
+    match provider_id {
+        "openai_compatible" => "openai-compatible",
+        other => other,
+    }
+}
+
+fn resolve_provider_api_key(
+    direct_api_key: Option<String>,
+    explicit_env_var: Option<&str>,
+    configured_env_var: Option<&str>,
+) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    if direct_api_key.is_some() {
+        return Ok(direct_api_key);
+    }
+    if let Some(env_var) = explicit_env_var {
+        return match std::env::var(env_var) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Err((
+                StatusCode::BAD_REQUEST,
+                resp_err(
+                    "invalid_request",
+                    "missing env var for api_key_env",
+                    Some(json!({ "env": env_var })),
+                ),
+            )),
+        };
+    }
+    let Some(env_var) = configured_env_var else {
+        return Ok(None);
+    };
+    Ok(std::env::var(env_var).ok())
 }
 
 fn classify_anyhow_tool_error(e: &anyhow::Error) -> (String, String) {
@@ -663,6 +1075,7 @@ fn classify_anyhow_tool_error(e: &anyhow::Error) -> (String, String) {
     ("unknown".to_string(), s)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_audit(
     session: &Session,
     command: &str,
@@ -857,7 +1270,22 @@ fn ensure_runner_initialized(
         return Ok(());
     }
 
-    let provider_bundle = build_provider_bundle(req)?;
+    let config_manager = config_manager_from_root(Some(&session.root))?;
+    let overrides = build_run_overrides(req).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            resp_err(err.code, &err.message, None),
+        )
+    })?;
+    let effective = config_manager
+        .resolve_effective(&overrides)
+        .map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                resp_err(err.code, &err.message, None),
+            )
+        })?;
+    let provider_bundle = build_provider_bundle(req, &effective)?;
     if let Some(spec) = req.structured_output.as_ref() {
         if let Err(error) = spec.validate() {
             return Err((
@@ -906,9 +1334,13 @@ fn ensure_runner_initialized(
         Arc::new(deepagents::runtime::TodoListMiddleware::new()),
     );
 
-    if !req.memory_disable.unwrap_or(false) {
-        let sources = vec![".deepagents/AGENTS.md".to_string(), "AGENTS.md".to_string()];
-        let options = deepagents::runtime::MemoryLoadOptions::default();
+    if effective.memory.enabled {
+        let sources = effective.memory.sources.clone();
+        let options = deepagents::runtime::MemoryLoadOptions {
+            allow_host_paths: effective.memory.allow_host_paths,
+            max_injected_chars: effective.memory.max_injected_chars,
+            ..Default::default()
+        };
         let memory_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
             deepagents::runtime::MemoryMiddleware::new(session.root.clone(), sources, options),
         );
@@ -932,9 +1364,15 @@ fn ensure_runner_initialized(
         subagent_mw,
     );
 
-    if !req.summarization_disable.unwrap_or(false) {
+    if effective.runtime.summarization.enabled {
         let options = deepagents::runtime::SummarizationOptions {
             policy: deepagents::runtime::SummarizationPolicyKind::Budget,
+            max_char_budget: effective.runtime.summarization.max_char_budget,
+            max_turns_visible: effective.runtime.summarization.max_turns_visible,
+            min_recent_messages: effective.runtime.summarization.min_recent_messages,
+            redact_tool_args: effective.runtime.summarization.redact_tool_args,
+            max_tool_arg_chars: effective.runtime.summarization.max_tool_arg_chars,
+            truncate_tool_args_keep_last: effective.runtime.summarization.truncate_keep_last,
             ..Default::default()
         };
         let summarization_mw: Arc<dyn deepagents::runtime::RuntimeMiddleware> = Arc::new(
@@ -947,10 +1385,50 @@ fn ensure_runner_initialized(
         );
     }
 
+    let model_id = effective
+        .provider(canonical_provider_id(&req.provider))
+        .and_then(|p| p.model.clone())
+        .unwrap_or_default();
     asm.push(
         deepagents::runtime::RuntimeMiddlewareSlot::PromptCaching,
         "prompt_caching",
-        Arc::new(deepagents::runtime::PromptCachingMiddleware::disabled()),
+        Arc::new(deepagents::runtime::PromptCachingMiddleware::new(
+            deepagents::runtime::PromptCacheOptions {
+                enabled: matches!(
+                    effective.runtime.prompt_cache.backend,
+                    PromptCacheBackendKind::Memory
+                ),
+                backend: deepagents::runtime::CacheBackend::Memory,
+                native: match effective.runtime.prompt_cache.native {
+                    deepagents::config::PromptCacheNativeMode::Auto => {
+                        deepagents::runtime::PromptCacheNativeMode::Auto
+                    }
+                    deepagents::config::PromptCacheNativeMode::Off => {
+                        deepagents::runtime::PromptCacheNativeMode::Off
+                    }
+                    deepagents::config::PromptCacheNativeMode::Required => {
+                        deepagents::runtime::PromptCacheNativeMode::Required
+                    }
+                },
+                layout: match effective.runtime.prompt_cache.layout {
+                    deepagents::config::PromptCacheLayoutMode::Auto => {
+                        deepagents::runtime::PromptCacheLayoutMode::Auto
+                    }
+                    deepagents::config::PromptCacheLayoutMode::SingleSystem => {
+                        deepagents::runtime::PromptCacheLayoutMode::SingleSystem
+                    }
+                    deepagents::config::PromptCacheLayoutMode::PreservePrefixSegments => {
+                        deepagents::runtime::PromptCacheLayoutMode::PreservePrefixSegments
+                    }
+                },
+                enable_l2_response_cache: effective.runtime.prompt_cache.l2,
+                ttl_ms: effective.runtime.prompt_cache.ttl_ms,
+                max_entries: effective.runtime.prompt_cache.max_entries,
+                provider_id: canonical_provider_id(&req.provider).to_string(),
+                model_id,
+                partition: session.root.clone(),
+            },
+        )),
     );
     asm.push(
         deepagents::runtime::RuntimeMiddlewareSlot::PatchToolCalls,
@@ -980,11 +1458,10 @@ fn ensure_runner_initialized(
     let mut runner = deepagents::runtime::ResumableRunner::new(
         session.agent.clone(),
         provider,
-        vec![],
         deepagents::runtime::ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
-                max_steps: req.max_steps.unwrap_or(8),
-                provider_timeout_ms: req.provider_timeout_ms.unwrap_or(1000),
+                max_steps: effective.runtime.max_steps,
+                provider_timeout_ms: effective.runtime.provider_timeout_ms,
             },
             approval: Some(session.approval.clone()),
             audit: session.audit.clone(),
@@ -1030,12 +1507,14 @@ fn parse_mock_script(mock_script: Option<Value>) -> Result<MockScript, (StatusCo
 
 fn build_provider_bundle(
     req: &RunRequest,
+    effective: &EffectiveConfig,
 ) -> Result<deepagents::provider::ProviderInitBundle, (StatusCode, Json<Value>)> {
-    match req.provider.as_str() {
+    let provider_id = canonical_provider_id(&req.provider);
+    match provider_id {
         "mock" => {
             let script = parse_mock_script(req.mock_script.clone())?;
             Ok(deepagents::provider::build_provider_bundle(
-                req.provider.clone(),
+                provider_id.to_string(),
                 deepagents::provider::ProviderInitSpec::Mock {
                     script,
                     omit_call_ids: false,
@@ -1045,7 +1524,7 @@ fn build_provider_bundle(
         "mock2" => {
             let script = parse_mock_script(req.mock_script.clone())?;
             Ok(deepagents::provider::build_provider_bundle(
-                req.provider.clone(),
+                provider_id.to_string(),
                 deepagents::provider::ProviderInitSpec::Mock {
                     script,
                     omit_call_ids: true,
@@ -1053,7 +1532,17 @@ fn build_provider_bundle(
             ))
         }
         "openai-compatible" | "openai_compatible" => {
-            let model = req.model.clone().ok_or_else(|| {
+            let provider_cfg = effective.provider("openai-compatible").ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "missing config for openai-compatible provider",
+                        None,
+                    ),
+                )
+            })?;
+            let model = provider_cfg.model.clone().ok_or_else(|| {
                 (
                     StatusCode::BAD_REQUEST,
                     resp_err(
@@ -1064,33 +1553,37 @@ fn build_provider_bundle(
                 )
             })?;
             let mut config = deepagents::llm::OpenAiCompatibleConfig::new(model);
-            if let Some(base_url) = &req.base_url {
-                config = config.with_base_url(base_url.clone());
+            if let Some(base_url) = provider_cfg.base_url.clone() {
+                config = config.with_base_url(base_url);
             }
-            let api_key = match (&req.api_key, &req.api_key_env) {
-                (Some(api_key), _) => Some(api_key.clone()),
-                (None, Some(env_name)) => Some(std::env::var(env_name).map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        resp_err(
-                            "invalid_request",
-                            "missing env var for api_key_env",
-                            Some(json!({ "env": env_name })),
-                        ),
-                    )
-                })?),
-                (None, None) => std::env::var("OPENAI_API_KEY").ok(),
-            };
+            let api_key = resolve_provider_api_key(
+                req.api_key.clone(),
+                req.api_key_env.as_deref(),
+                provider_cfg
+                    .api_key_env
+                    .as_ref()
+                    .map(|value| value.as_str()),
+            )?;
             if let Some(api_key) = api_key {
                 config = config.with_api_key(api_key);
             }
             Ok(deepagents::provider::build_provider_bundle(
-                req.provider.clone(),
+                provider_id.to_string(),
                 deepagents::provider::ProviderInitSpec::OpenAiCompatible { config },
             ))
         }
         "openrouter" => {
-            let model = req.model.clone().ok_or_else(|| {
+            let provider_cfg = effective.provider("openrouter").ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    resp_err(
+                        "invalid_request",
+                        "missing config for openrouter provider",
+                        None,
+                    ),
+                )
+            })?;
+            let model = provider_cfg.model.clone().ok_or_else(|| {
                 (
                     StatusCode::BAD_REQUEST,
                     resp_err(
@@ -1101,28 +1594,22 @@ fn build_provider_bundle(
                 )
             })?;
             let mut config = deepagents::llm::OpenRouterConfig::new(model);
-            if let Some(base_url) = &req.base_url {
-                config = config.with_base_url(base_url.clone());
+            if let Some(base_url) = provider_cfg.base_url.clone() {
+                config = config.with_base_url(base_url);
             }
-            let api_key = match (&req.api_key, &req.api_key_env) {
-                (Some(api_key), _) => Some(api_key.clone()),
-                (None, Some(env_name)) => Some(std::env::var(env_name).map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        resp_err(
-                            "invalid_request",
-                            "missing env var for api_key_env",
-                            Some(json!({ "env": env_name })),
-                        ),
-                    )
-                })?),
-                (None, None) => std::env::var("OPENROUTER_API_KEY").ok(),
-            };
+            let api_key = resolve_provider_api_key(
+                req.api_key.clone(),
+                req.api_key_env.as_deref(),
+                provider_cfg
+                    .api_key_env
+                    .as_ref()
+                    .map(|value| value.as_str()),
+            )?;
             if let Some(api_key) = api_key {
                 config = config.with_api_key(api_key);
             }
             Ok(deepagents::provider::build_provider_bundle(
-                req.provider.clone(),
+                provider_id.to_string(),
                 deepagents::provider::ProviderInitSpec::OpenRouter { config },
             ))
         }

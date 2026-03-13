@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod audit;
 pub mod backends;
+pub mod config;
 pub mod llm;
 pub mod memory;
 pub mod middleware;

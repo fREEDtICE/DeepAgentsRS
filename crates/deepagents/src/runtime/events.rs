@@ -15,7 +15,6 @@ pub enum ProviderStepKind {
     AssistantMessageWithToolCalls,
     FinalText,
     ToolCalls,
-    SkillCall,
     Error,
 }
 
@@ -157,7 +156,6 @@ pub fn provider_step_kind(step: &AgentStep) -> ProviderStepKind {
         }
         AgentStep::FinalText { .. } => ProviderStepKind::FinalText,
         AgentStep::ToolCalls { .. } => ProviderStepKind::ToolCalls,
-        AgentStep::SkillCall { .. } => ProviderStepKind::SkillCall,
         AgentStep::Error { .. } => ProviderStepKind::Error,
     }
 }

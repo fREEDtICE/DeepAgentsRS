@@ -20,7 +20,6 @@ fn runtime_with_script(
     deepagents::runtime::simple::SimpleRuntime::new(
         agent,
         provider,
-        vec![],
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,

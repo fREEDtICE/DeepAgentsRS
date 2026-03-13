@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::provider::prompt_cache::{
+    ProviderPromptCacheSource, ProviderPromptCacheStatus, ProviderPromptCacheStrategy,
+};
 use crate::state::AgentState;
 
 pub const PROVIDER_CACHE_EVENTS_KEY: &str = "_provider_cache_events";
@@ -12,6 +15,10 @@ pub struct PromptCacheOptions {
     pub enabled: bool,
     #[serde(default = "PromptCacheOptions::default_backend")]
     pub backend: CacheBackend,
+    #[serde(default = "PromptCacheOptions::default_native")]
+    pub native: PromptCacheNativeMode,
+    #[serde(default = "PromptCacheOptions::default_layout")]
+    pub layout: PromptCacheLayoutMode,
     #[serde(default)]
     pub enable_l2_response_cache: bool,
     #[serde(default = "PromptCacheOptions::default_ttl_ms")]
@@ -21,12 +28,22 @@ pub struct PromptCacheOptions {
     #[serde(default)]
     pub provider_id: String,
     #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
     pub partition: String,
 }
 
 impl PromptCacheOptions {
     fn default_backend() -> CacheBackend {
         CacheBackend::Memory
+    }
+
+    fn default_native() -> PromptCacheNativeMode {
+        PromptCacheNativeMode::Auto
+    }
+
+    fn default_layout() -> PromptCacheLayoutMode {
+        PromptCacheLayoutMode::Auto
     }
 
     fn default_ttl_ms() -> u64 {
@@ -49,6 +66,22 @@ pub enum CacheBackend {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheNativeMode {
+    Auto,
+    Off,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheLayoutMode {
+    Auto,
+    SingleSystem,
+    PreservePrefixSegments,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CacheLevel {
     #[serde(rename = "L0")]
     L0,
@@ -61,11 +94,9 @@ pub enum CacheLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheKeyComponents {
     pub l0_hash: String,
-    pub system_hash: String,
-    pub tools_hash: String,
-    pub messages_hash: String,
+    pub l1_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub summarization_event_hash: Option<String>,
+    pub l2_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +108,14 @@ pub enum ProviderCacheEvent {
         lookup_hit: bool,
         cache_key_hash: String,
         components: CacheKeyComponents,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_source: Option<ProviderPromptCacheSource>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_strategy: Option<ProviderPromptCacheStrategy>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_cache_status: Option<ProviderPromptCacheStatus>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_handle_hash: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         inserted: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]

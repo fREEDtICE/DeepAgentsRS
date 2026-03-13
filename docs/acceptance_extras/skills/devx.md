@@ -16,7 +16,7 @@ scope: extras
 - CLI 提供一个技能脚手架命令（示例）：
   - `deepagents skill init <dir>`
 - CLI 提供一个快速校验命令（示例）：
-  - `deepagents skill validate <dir>`
+  - `deepagents skill validate --source <parent-dir>`
 - 如果最终实现不使用这些命令名称，也必须提供等价入口并文档化
 
 ## 3. E2E 场景（必测）
@@ -27,7 +27,7 @@ scope: extras
 
 则：
 
-- 生成的目录结构完整（元数据文件 + 实现文件）
+- 生成的目录结构完整（至少 `SKILL.md` 与 `tools.json`）
 - 默认技能能被加载（见 loading_injection 文档）
 
 ### SDX-02：validate 能发现 schema/实现错误
@@ -41,7 +41,7 @@ scope: extras
 则：
 
 - validate 返回非 0 exit code
-- 输出包含可定位错误（文件路径/字段名）
+- 输出包含可定位错误（至少文件路径/字段名）
 
 ### SDX-03：validate 成功时可在 CI 使用
 
@@ -51,8 +51,8 @@ scope: extras
 
 - exit code == 0
 - 输出包含技能名、工具名、参数摘要
+- 输出可直接作为 CI 产物留档（结构化 JSON）
 
 ## 4. 通过标准
 
 - SDX-01 ~ SDX-03 全通过
-

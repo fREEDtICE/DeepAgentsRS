@@ -225,6 +225,13 @@ impl CompiledSubAgent for ExtraStateSubAgent {
         req.state
             .extra
             .insert("skills_metadata".to_string(), serde_json::json!({"k":"v"}));
+        req.state
+            .extra
+            .insert("skills_tools".to_string(), serde_json::json!(["tool"]));
+        req.state.extra.insert(
+            "skills_diagnostics".to_string(),
+            serde_json::json!({"sources":[],"overrides":[]}),
+        );
         req.state.extra.insert(
             "structured_response".to_string(),
             serde_json::json!({"ok": true}),
@@ -232,6 +239,14 @@ impl CompiledSubAgent for ExtraStateSubAgent {
         req.state
             .extra
             .insert("messages".to_string(), serde_json::json!(["bad"]));
+        req.state.extra.insert(
+            "_prompt_cache_options".to_string(),
+            serde_json::json!({"enabled": true}),
+        );
+        req.state.extra.insert(
+            "_provider_cache_events".to_string(),
+            serde_json::json!([{"cache_level": "L1"}]),
+        );
         Ok(SubAgentRunOutput {
             final_text: "OK".to_string(),
             state: req.state,
@@ -326,7 +341,6 @@ impl CompiledSubAgent for RuntimeMockSubAgent {
         let runtime = SimpleRuntime::new(
             req.agent,
             provider,
-            Vec::new(),
             crate::runtime::simple::SimpleRuntimeOptions {
                 config: RuntimeConfig {
                     max_steps: 8,

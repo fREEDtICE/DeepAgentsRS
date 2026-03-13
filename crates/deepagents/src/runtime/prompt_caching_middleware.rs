@@ -31,10 +31,13 @@ impl PromptCachingMiddleware {
             options: PromptCacheOptions {
                 enabled: false,
                 backend: crate::runtime::CacheBackend::Memory,
+                native: crate::runtime::PromptCacheNativeMode::Auto,
+                layout: crate::runtime::PromptCacheLayoutMode::Auto,
                 enable_l2_response_cache: false,
                 ttl_ms: 0,
                 max_entries: 0,
                 provider_id: String::new(),
+                model_id: String::new(),
                 partition: String::new(),
             },
         }

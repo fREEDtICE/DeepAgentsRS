@@ -113,6 +113,32 @@ impl LlmProvider for OpenRouterProvider {
         self.inner.convert_tools(tool_specs)
     }
 
+    fn prompt_cache_payload(
+        &self,
+        req: &ChatRequest,
+        tools_payload: &ToolsPayload,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut payload = self.inner.prompt_cache_payload(req, tools_payload)?;
+        if let Some(object) = payload.as_object_mut() {
+            let tools_has_any = object
+                .get("tools")
+                .and_then(|tools| tools.as_array())
+                .map(|tools| !tools.is_empty())
+                .unwrap_or(false);
+            let tool_choice_missing = object
+                .get("tool_choice")
+                .map(|tool_choice| tool_choice.is_null())
+                .unwrap_or(true);
+            if tools_has_any && tool_choice_missing {
+                object.insert(
+                    "tool_choice".to_string(),
+                    serde_json::Value::String("auto".to_string()),
+                );
+            }
+        }
+        Ok(payload)
+    }
+
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
         self.inner.chat(req).await
     }

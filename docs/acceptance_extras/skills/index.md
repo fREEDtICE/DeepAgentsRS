@@ -10,5 +10,6 @@ scope: extras
 - 技能执行与运行时隔离（权限、沙箱、资源）： [execution_isolation.md](execution_isolation.md)
 - 技能开发者体验（脚手架/快速验证）： [devx.md](devx.md)
 
-技能的端到端目标：用户只通过配置 skills 源路径即可获得新增工具能力，且能力可控（权限/隔离），并能在 CLI/TUI 中稳定呈现与调试。
-
+技能的端到端目标：用户只通过配置 package skill sources（`SKILL.md` + 可选
+`tools.json`）即可获得新增工具能力，且能力可控（权限/隔离），并能在 CLI/TUI 中稳定
+呈现与调试。

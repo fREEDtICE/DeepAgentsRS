@@ -1,0 +1,221 @@
+version = 1
+
+[[fields]]
+key = "providers.openai-compatible.enabled"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = false
+
+[[fields]]
+key = "providers.openai-compatible.surface"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "openai-compatible"
+enum_values = ["openai-compatible"]
+
+[[fields]]
+key = "providers.openai-compatible.base_url"
+kind = "path"
+scopes = ["global", "workspace"]
+default = "https://api.openai.com/v1"
+
+[[fields]]
+key = "providers.openai-compatible.api_key_env"
+kind = "env_var"
+scopes = ["global", "workspace"]
+default = "OPENAI_API_KEY"
+
+[[fields]]
+key = "providers.openai-compatible.model"
+kind = "string"
+scopes = ["global", "workspace"]
+default = "gpt-4o"
+
+[[fields]]
+key = "providers.openrouter.enabled"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = false
+
+[[fields]]
+key = "providers.openrouter.surface"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "openrouter"
+enum_values = ["openrouter"]
+
+[[fields]]
+key = "providers.openrouter.base_url"
+kind = "path"
+scopes = ["global", "workspace"]
+default = "https://openrouter.ai/api/v1"
+
+[[fields]]
+key = "providers.openrouter.api_key_env"
+kind = "env_var"
+scopes = ["global", "workspace"]
+default = "OPENROUTER_API_KEY"
+
+[[fields]]
+key = "providers.openrouter.model"
+kind = "string"
+scopes = ["global", "workspace"]
+default = "openai/gpt-4o-mini"
+
+[[fields]]
+key = "memory.backend"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "file"
+enum_values = ["file"]
+
+[[fields]]
+key = "memory.file.enabled"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = true
+
+[[fields]]
+key = "memory.file.store_path"
+kind = "path"
+scopes = ["global", "workspace"]
+default = ".deepagents/memory_store.json"
+
+[[fields]]
+key = "memory.file.sources"
+kind = "string_list"
+scopes = ["global", "workspace"]
+default = [".deepagents/AGENTS.md", "AGENTS.md"]
+
+[[fields]]
+key = "memory.file.allow_host_paths"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = false
+
+[[fields]]
+key = "memory.file.max_injected_chars"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 30000
+min = 1
+
+[[fields]]
+key = "runtime.max_steps"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 8
+min = 1
+
+[[fields]]
+key = "runtime.provider_timeout_ms"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 1000
+min = 1
+
+[[fields]]
+key = "runtime.prompt_cache.backend"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "off"
+enum_values = ["off", "memory"]
+
+[[fields]]
+key = "runtime.prompt_cache.native"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "auto"
+enum_values = ["auto", "off", "required"]
+
+[[fields]]
+key = "runtime.prompt_cache.layout"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "auto"
+enum_values = ["auto", "single_system", "preserve_prefix_segments"]
+
+[[fields]]
+key = "runtime.prompt_cache.l2"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = false
+
+[[fields]]
+key = "runtime.prompt_cache.ttl_ms"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 300000
+min = 1
+
+[[fields]]
+key = "runtime.prompt_cache.max_entries"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 1024
+min = 1
+
+[[fields]]
+key = "runtime.summarization.enabled"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = true
+
+[[fields]]
+key = "runtime.summarization.max_char_budget"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 12000
+min = 1
+
+[[fields]]
+key = "runtime.summarization.max_turns_visible"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 12
+min = 1
+
+[[fields]]
+key = "runtime.summarization.min_recent_messages"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 3
+min = 1
+
+[[fields]]
+key = "runtime.summarization.redact_tool_args"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = true
+
+[[fields]]
+key = "runtime.summarization.max_tool_arg_chars"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 2000
+min = 1
+
+[[fields]]
+key = "runtime.summarization.truncate_keep_last"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 6
+min = 1
+
+[[fields]]
+key = "security.execution_mode"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "non_interactive"
+enum_values = ["interactive", "non_interactive"]
+
+[[fields]]
+key = "security.shell_allow_list"
+kind = "string_list"
+scopes = ["global", "workspace"]
+default = []
+
+[[fields]]
+key = "audit.jsonl_path"
+kind = "path"
+scopes = ["global", "workspace"]

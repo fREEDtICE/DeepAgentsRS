@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ impl Default for SkillsLoadOptions {
 }
 
 pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<LoadedSkills> {
-    let mut skill_map: HashMap<String, SkillPackage> = HashMap::new();
+    let mut skill_map: BTreeMap<String, SkillPackage> = BTreeMap::new();
     let mut diagnostics = SkillsDiagnostics::default();
 
     for src in sources {
@@ -48,10 +48,11 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
         }
 
         let source_name = source_name(&source_path);
-        let entries = std::fs::read_dir(&source_path)?;
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+        let mut entries = std::fs::read_dir(&source_path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort();
+        for path in entries {
             if !path.is_dir() {
                 continue;
             }
@@ -75,12 +76,10 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
                 }
                 Err(e) => {
                     if options.strict {
-                        return Err(anyhow::anyhow!("{}: {}", path.display(), e));
+                        return Err(e);
                     }
                     source_diag.skipped += 1;
-                    source_diag
-                        .errors
-                        .push(format!("{}: {}", path.display(), e));
+                    source_diag.errors.push(e.to_string());
                 }
             }
         }
@@ -88,14 +87,15 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
     }
 
     let mut metadata: Vec<SkillMetadata> = Vec::new();
-    let mut tool_map: HashMap<String, SkillToolSpec> = HashMap::new();
+    let mut tool_map: BTreeMap<String, SkillToolSpec> = BTreeMap::new();
     for (_, pkg) in skill_map {
         metadata.push(pkg.metadata.clone());
         for tool in pkg.tools {
             if is_core_tool(&tool.name) {
                 return Err(anyhow::anyhow!(
-                    "skill tool conflicts with core tool: {}",
-                    tool.name
+                    "tool_conflict_with_core: skill tool {} from skill {} conflicts with core tool",
+                    tool.name,
+                    tool.skill_name
                 ));
             }
             if let Some(prev) = tool_map.get(&tool.name) {
@@ -110,11 +110,13 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
     }
 
     let tools = tool_map.into_values().collect::<Vec<_>>();
-    Ok(LoadedSkills {
+    let mut loaded = LoadedSkills {
         metadata,
         tools,
         diagnostics,
-    })
+    };
+    loaded.canonicalize();
+    Ok(loaded)
 }
 
 fn source_name(path: &Path) -> String {

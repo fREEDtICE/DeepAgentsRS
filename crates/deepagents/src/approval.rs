@@ -3,17 +3,12 @@ use std::collections::HashSet;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
+    #[default]
     NonInteractive,
     Interactive,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::NonInteractive
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

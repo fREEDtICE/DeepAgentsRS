@@ -12,7 +12,6 @@ use crate::runtime::protocol::{
     RunOutput, Runtime, RuntimeConfig, RuntimeMiddleware, StreamingRuntime,
 };
 use crate::runtime::{ResumableRunner, ResumableRunnerOptions};
-use crate::skills::SkillPlugin;
 use crate::state::AgentState;
 use crate::types::Message;
 use crate::DeepAgent;
@@ -20,7 +19,6 @@ use crate::DeepAgent;
 pub struct SimpleRuntime {
     agent: DeepAgent,
     provider: Arc<dyn AgentProvider>,
-    skills: Vec<Arc<dyn SkillPlugin>>,
     config: RuntimeConfig,
     approval: Option<Arc<dyn ApprovalPolicy>>,
     audit: Option<Arc<dyn AuditSink>>,
@@ -45,7 +43,6 @@ impl SimpleRuntime {
     pub fn new(
         agent: DeepAgent,
         provider: Arc<dyn AgentProvider>,
-        skills: Vec<Arc<dyn SkillPlugin>>,
         options: SimpleRuntimeOptions,
     ) -> Self {
         let SimpleRuntimeOptions {
@@ -58,7 +55,6 @@ impl SimpleRuntime {
         Self {
             agent,
             provider,
-            skills,
             config,
             approval,
             audit,
@@ -113,7 +109,6 @@ impl SimpleRuntime {
         let runner = ResumableRunner::new(
             self.agent.clone(),
             self.provider.clone(),
-            self.skills.clone(),
             ResumableRunnerOptions {
                 config: self.config.clone(),
                 approval: self.approval.clone(),

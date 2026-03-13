@@ -1,12 +1,13 @@
 use std::process::Command;
 
+#[allow(clippy::too_many_arguments)]
 fn run_runtime(
     bin: &str,
     root: &str,
     shell_allow: &[&str],
     provider: &str,
     mock_script: &str,
-    plugins: &[&str],
+    skills_sources: &[&str],
     input: &str,
     provider_timeout_ms: u64,
     max_steps: Option<usize>,
@@ -18,8 +19,8 @@ fn run_runtime(
     }
     cmd.args(["run", "--provider", provider]);
     cmd.args(["--mock-script", mock_script]);
-    for p in plugins {
-        cmd.args(["--plugin", p]);
+    for source in skills_sources {
+        cmd.args(["--skills-source", source]);
     }
     if let Some(ms) = max_steps {
         cmd.args(["--max-steps", &ms.to_string()]);
@@ -29,6 +30,24 @@ fn run_runtime(
     let out = cmd.output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     (out.status, v)
+}
+
+fn write_skill_package(
+    source_root: &std::path::Path,
+    skill_name: &str,
+    description: &str,
+    tools_json: serde_json::Value,
+) {
+    let skill_dir = source_root.join(skill_name);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let skill_md =
+        format!("---\nname: {skill_name}\ndescription: {description}\n---\n\n# {skill_name}\n");
+    std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+    std::fs::write(
+        skill_dir.join("tools.json"),
+        serde_json::to_vec_pretty(&tools_json).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -229,28 +248,31 @@ fn phase1_5_tool_error_is_recorded_and_run_can_still_finalize() {
 }
 
 #[test]
-fn phase1_5_declarative_skill_plugin_can_trigger_tool() {
+fn phase1_5_package_skill_can_trigger_tool() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(root.join("README.md"), "Project: DeepAgents\n").unwrap();
-
-    let manifest = serde_json::json!({
-      "skills": [
+    let skills_source = root.join("skills");
+    let tools_json = serde_json::json!({
+      "tools": [
         {
-          "name": "read_readme",
+          "name": "read-readme",
           "description": "Read README",
-          "tool_calls": [
+          "input_schema": { "type": "object", "properties": {}, "required": [] },
+          "steps": [
             { "tool_name": "read_file", "arguments": { "file_path": "README.md", "limit": 20 } }
-          ]
+          ],
+          "policy": { "allow_filesystem": true }
         }
       ]
     });
-    let plugin_path = root.join("skills.json");
-    std::fs::write(&plugin_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    write_skill_package(&skills_source, "read-readme", "Read README", tools_json);
 
     let script = serde_json::json!({
       "steps": [
-        { "type": "skill_call", "name": "read_readme", "input": {} },
+        { "type": "tool_calls", "calls": [
+          { "tool_name": "read-readme", "arguments": {}, "call_id": "c1" }
+        ]},
         { "type": "final_from_last_tool_first_line", "prefix": "" }
       ]
     });
@@ -264,7 +286,7 @@ fn phase1_5_declarative_skill_plugin_can_trigger_tool() {
         &[],
         "mock",
         script_path.to_string_lossy().as_ref(),
-        &[plugin_path.to_string_lossy().as_ref()],
+        &[skills_source.to_string_lossy().as_ref()],
         "use skill",
         1000,
         None,
@@ -632,74 +654,41 @@ fn phase1_5_max_steps_exceeded_is_classified() {
 }
 
 #[test]
-fn phase1_5_skill_not_found_is_classified() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-
-    let script = serde_json::json!({
-      "steps": [
-        { "type": "skill_call", "name": "nope", "input": {} }
-      ]
-    });
-    let script_path = root.join("script.json");
-    std::fs::write(&script_path, serde_json::to_vec_pretty(&script).unwrap()).unwrap();
-
-    let bin = env!("CARGO_BIN_EXE_deepagents");
-    let (st, v) = run_runtime(
-        bin,
-        root.to_string_lossy().as_ref(),
-        &[],
-        "mock",
-        script_path.to_string_lossy().as_ref(),
-        &[],
-        "skill",
-        1000,
-        None,
-    );
-    assert!(!st.success());
-    assert_eq!(
-        v.get("error")
-            .unwrap()
-            .get("code")
-            .and_then(|c| c.as_str())
-            .unwrap(),
-        "skill_not_found"
-    );
-    assert_eq!(
-        v.get("trace")
-            .unwrap()
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .unwrap(),
-        "skill_error"
-    );
-}
-
-#[test]
-fn phase1_5_declarative_skill_merge_args_overrides_base() {
+fn phase1_5_package_skill_step_arguments_are_overlaid_by_tool_call_input() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("README.md"), "Project: DeepAgents\n").unwrap();
     std::fs::write(root.join("src/lib.rs"), "needle\n").unwrap();
-
-    let manifest = serde_json::json!({
-      "skills": [
+    let skills_source = root.join("skills");
+    let tools_json = serde_json::json!({
+      "tools": [
         {
-          "name": "read_any",
+          "name": "read-any",
           "description": "Read any file",
-          "tool_calls": [
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "file_path": { "type": "string" },
+              "limit": { "type": "integer" }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+          },
+          "steps": [
             { "tool_name": "read_file", "arguments": { "file_path": "README.md", "limit": 20 } }
-          ]
+          ],
+          "policy": { "allow_filesystem": true }
         }
       ]
     });
-    let plugin_path = root.join("skills.json");
-    std::fs::write(&plugin_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    write_skill_package(&skills_source, "read-any", "Read any file", tools_json);
 
     let script = serde_json::json!({
       "steps": [
-        { "type": "skill_call", "name": "read_any", "input": { "file_path": "src/lib.rs", "limit": 1 } },
+        { "type": "tool_calls", "calls": [
+          { "tool_name": "read-any", "arguments": { "file_path": "src/lib.rs", "limit": 1 }, "call_id": "c1" }
+        ]},
         { "type": "final_from_last_tool_first_line", "prefix": "" }
       ]
     });
@@ -713,7 +702,7 @@ fn phase1_5_declarative_skill_merge_args_overrides_base() {
         &[],
         "mock",
         script_path.to_string_lossy().as_ref(),
-        &[plugin_path.to_string_lossy().as_ref()],
+        &[skills_source.to_string_lossy().as_ref()],
         "merge args",
         1000,
         None,

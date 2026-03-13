@@ -10,12 +10,12 @@ use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 
 use crate::llm::common::{
-    build_data_url, finalize_assistant_text, openai_chat_completions_url, parse_image_content_block,
-    parse_sse_json_response, send_openai_compatible_request,
+    build_data_url, finalize_assistant_text, openai_chat_completions_url,
+    parse_image_content_block, parse_sse_json_response, send_openai_compatible_request,
 };
 use crate::llm::{
-    AssistantMessageMetadata, ChatMessage, ChatRequest, ChatResponse, FunctionTool, LlmEvent,
-    LlmEventStream, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities, ChatRole,
+    AssistantMessageMetadata, ChatMessage, ChatRequest, ChatResponse, ChatRole, FunctionTool,
+    LlmEvent, LlmEventStream, LlmProvider, LlmProviderCapabilities, MultimodalCapabilities,
     MultimodalInputRoles, TokenUsage, ToolCall as LlmToolCall, ToolChoice, ToolSpec, ToolsPayload,
 };
 use crate::types::{fallback_text_for_content_blocks, ContentBlock};
@@ -89,9 +89,10 @@ impl OpenAiCompatibleConfig {
         let mut headers = HeaderMap::new();
         if let Some(api_key) = self.api_key.as_deref() {
             let (name, value) = match &self.auth_style {
-                OpenAiAuthStyle::Bearer => {
-                    (AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {api_key}"))?)
-                }
+                OpenAiAuthStyle::Bearer => (
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {api_key}"))?,
+                ),
                 OpenAiAuthStyle::XApiKey => (
                     HeaderName::from_static("x-api-key"),
                     HeaderValue::from_str(api_key)?,
@@ -164,6 +165,22 @@ impl LlmProvider for OpenAiCompatibleProvider {
             })
             .collect();
         Ok(ToolsPayload::FunctionTools { tools })
+    }
+
+    fn prompt_cache_payload(
+        &self,
+        req: &ChatRequest,
+        tools_payload: &ToolsPayload,
+    ) -> anyhow::Result<serde_json::Value> {
+        let req = self.prepare_request(req.clone());
+        let request = build_chat_request(
+            &self.config.model,
+            &req,
+            tools_payload,
+            self.config.multimodal_input_roles,
+            false,
+        )?;
+        serde_json::to_value(request).map_err(|err| anyhow::anyhow!(err))
     }
 
     async fn chat(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
@@ -642,7 +659,10 @@ fn flatten_system_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         .filter(|message| message.role != ChatRole::System)
         .cloned()
         .collect::<Vec<_>>();
-    if let Some(first_user) = result.iter_mut().find(|message| message.role == ChatRole::User) {
+    if let Some(first_user) = result
+        .iter_mut()
+        .find(|message| message.role == ChatRole::User)
+    {
         first_user.content = if first_user.content.is_empty() {
             system_content
         } else {
@@ -1080,7 +1100,9 @@ mod tests {
             .with_user_agent("deepagents-test/1.0");
         let headers = config.request_headers().expect("headers should be valid");
         assert_eq!(
-            headers.get("x-api-key").and_then(|value| value.to_str().ok()),
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
             Some("k")
         );
         assert_eq!(

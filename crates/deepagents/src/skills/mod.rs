@@ -1,13 +1,9 @@
-pub mod declarative;
 pub mod loader;
-pub mod protocol;
 pub mod validator;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-
-pub use protocol::{SkillCall, SkillError, SkillPlugin, SkillSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -98,4 +94,29 @@ pub struct LoadedSkills {
     pub tools: Vec<SkillToolSpec>,
     #[serde(default)]
     pub diagnostics: SkillsDiagnostics,
+}
+
+impl LoadedSkills {
+    /// Canonicalizes loaded skill data so serialized snapshots, injected prompt
+    /// blocks, and provider tool specs stay stable across runs.
+    pub fn canonicalize(&mut self) {
+        self.metadata.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        self.tools.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.skill_name.cmp(&b.skill_name))
+                .then_with(|| a.source.cmp(&b.source))
+        });
+        self.diagnostics.overrides.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.overridden_source.cmp(&b.overridden_source))
+                .then_with(|| a.source.cmp(&b.source))
+        });
+    }
 }

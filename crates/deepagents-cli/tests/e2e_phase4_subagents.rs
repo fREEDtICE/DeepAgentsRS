@@ -160,7 +160,11 @@ fn phase4_sa03_isolation_excluded_keys_not_propagated_to_child() {
     assert!(!keys.contains(&"messages"));
     assert!(!keys.contains(&"structured_response"));
     assert!(!keys.contains(&"skills_metadata"));
+    assert!(!keys.contains(&"skills_tools"));
+    assert!(!keys.contains(&"skills_diagnostics"));
     assert!(!keys.contains(&"memory_contents"));
+    assert!(!keys.contains(&"_prompt_cache_options"));
+    assert!(!keys.contains(&"_provider_cache_events"));
 }
 
 #[test]
@@ -223,6 +227,8 @@ fn phase4_sa05_state_update_filtered_and_merged() {
     assert!(!extra.contains_key("todos"));
     assert!(!extra.contains_key("memory_contents"));
     assert!(!extra.contains_key("skills_metadata"));
+    assert!(!extra.contains_key("skills_tools"));
+    assert!(!extra.contains_key("skills_diagnostics"));
     assert!(!extra.contains_key("structured_response"));
     assert!(!extra.contains_key("messages"));
 }

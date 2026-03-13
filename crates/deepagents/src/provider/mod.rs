@@ -3,6 +3,7 @@ mod init;
 pub mod llm;
 pub mod mock;
 pub mod openai_compatible;
+pub mod prompt_cache;
 mod prompt_guided;
 pub mod protocol;
 
@@ -16,6 +17,11 @@ pub use catalog::{
 pub use init::{build_provider_bundle, ProviderInitBundle, ProviderInitSpec};
 pub use llm::{
     AgentProviderFromLlm, LlmProviderAdapter, ProviderDiagnostics, ProviderSurfaceCapabilities,
+};
+pub use prompt_cache::{
+    PromptCachePlan, PromptPrefixArtifact, ProviderPromptCacheHandle, ProviderPromptCacheHint,
+    ProviderPromptCacheObservation, ProviderPromptCacheSource, ProviderPromptCacheStatus,
+    ProviderPromptCacheStrategy,
 };
 pub use protocol::{
     AgentProvider, AgentProviderError, AgentProviderEvent, AgentProviderEventCollector,

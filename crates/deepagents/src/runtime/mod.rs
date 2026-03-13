@@ -34,8 +34,8 @@ pub use protocol::{
 };
 pub use provider_cache::{
     attach_provider_cache_events_to_trace, push_provider_cache_event, take_provider_cache_events,
-    CacheBackend, CacheKeyComponents, CacheLevel, PromptCacheOptions, ProviderCacheEvent,
-    PROMPT_CACHE_OPTIONS_KEY, PROVIDER_CACHE_EVENTS_KEY,
+    CacheBackend, CacheKeyComponents, CacheLevel, PromptCacheLayoutMode, PromptCacheNativeMode,
+    PromptCacheOptions, ProviderCacheEvent, PROMPT_CACHE_OPTIONS_KEY, PROVIDER_CACHE_EVENTS_KEY,
 };
 pub use resumable_runner::{ResumableRunner, ResumableRunnerOptions};
 pub use skills_middleware::SkillsMiddleware;

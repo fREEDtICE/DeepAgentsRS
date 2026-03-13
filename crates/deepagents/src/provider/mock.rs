@@ -27,13 +27,6 @@ pub enum MockStep {
     ToolCalls {
         calls: Vec<AgentToolCall>,
     },
-    SkillCall {
-        name: String,
-        #[serde(default)]
-        input: serde_json::Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
-    },
     Error {
         code: String,
         message: String,
@@ -121,15 +114,6 @@ impl AgentProvider for MockProvider {
                 }
                 Ok(AgentStep::ToolCalls { calls })
             }
-            MockStep::SkillCall {
-                name,
-                input,
-                call_id,
-            } => Ok(AgentStep::SkillCall {
-                name,
-                input,
-                call_id,
-            }),
             MockStep::Error { code, message } => Ok(AgentStep::Error {
                 error: AgentProviderError { code, message },
             }),

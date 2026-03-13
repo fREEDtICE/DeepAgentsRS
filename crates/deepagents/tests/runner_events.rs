@@ -41,7 +41,6 @@ fn build_runner(
     ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -67,7 +66,6 @@ fn build_runner_from_provider(
     ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -91,7 +89,6 @@ fn build_simple_runtime(root: &std::path::Path, script: MockScript) -> SimpleRun
     SimpleRuntime::new(
         agent,
         provider,
-        Vec::new(),
         SimpleRuntimeOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -724,7 +721,6 @@ async fn re10_llm_adapter_rejects_explicit_tool_binding_when_tool_calling_is_uns
             }),
         }],
         tool_choice: deepagents::llm::ToolChoice::Required,
-        skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
         structured_output: None,
@@ -737,9 +733,11 @@ async fn re10_llm_adapter_rejects_explicit_tool_binding_when_tool_calling_is_uns
 #[tokio::test]
 async fn re10a_llm_adapter_rejects_required_tool_choice_without_tools_even_if_tool_calling_is_supported(
 ) {
-    let mut capabilities = LlmProviderCapabilities::default();
-    capabilities.supports_tool_calling = true;
-    capabilities.supports_streaming = false;
+    let capabilities = LlmProviderCapabilities {
+        supports_tool_calling: true,
+        supports_streaming: false,
+        ..Default::default()
+    };
 
     let provider = LlmProviderAdapter::new(Arc::new(
         deepagents::llm::MockLlmProvider::new(vec![deepagents::llm::final_text_step("ok")])
@@ -758,7 +756,6 @@ async fn re10a_llm_adapter_rejects_required_tool_choice_without_tools_even_if_to
         }],
         tool_specs: Vec::new(),
         tool_choice: deepagents::llm::ToolChoice::Required,
-        skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
         structured_output: None,
@@ -784,7 +781,6 @@ async fn re10b_llm_adapter_rejects_structured_output_when_provider_does_not_supp
         }],
         tool_specs: Vec::new(),
         tool_choice: deepagents::llm::ToolChoice::Auto,
-        skills: Vec::new(),
         state: deepagents::state::AgentState::default(),
         last_tool_results: Vec::new(),
         structured_output: Some(deepagents::llm::StructuredOutputSpec {
@@ -1062,7 +1058,6 @@ async fn re13_non_interactive_execute_require_approval_is_reported_as_tool_error
     let mut runner = ResumableRunner::new(
         agent,
         provider,
-        Vec::new(),
         ResumableRunnerOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,

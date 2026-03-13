@@ -13,7 +13,14 @@ use deepagents::llm::{
     LlmProviderCapabilities, MultimodalCapabilities, MultimodalInputRoles, StructuredOutputSpec,
     ToolCall, ToolChoice, ToolSpec,
 };
+use deepagents::provider::{AgentProvider, AgentProviderRequest, LlmProviderAdapter};
+use deepagents::runtime::{
+    CacheBackend, PromptCacheLayoutMode, PromptCacheNativeMode, PromptCacheOptions,
+    PROMPT_CACHE_OPTIONS_KEY,
+};
+use deepagents::state::AgentState;
 use deepagents::types::ContentBlock;
+use deepagents::types::Message;
 
 fn sample_request() -> ChatRequest {
     ChatRequest {
@@ -66,6 +73,51 @@ fn sample_request() -> ChatRequest {
             }),
         }],
         tool_choice: ToolChoice::Auto,
+        structured_output: None,
+    }
+}
+
+fn prompt_cache_state(layout: PromptCacheLayoutMode) -> AgentState {
+    let mut state = AgentState::default();
+    state.extra.insert(
+        PROMPT_CACHE_OPTIONS_KEY.to_string(),
+        serde_json::to_value(PromptCacheOptions {
+            enabled: true,
+            backend: CacheBackend::Memory,
+            native: PromptCacheNativeMode::Auto,
+            layout,
+            enable_l2_response_cache: false,
+            ttl_ms: 300000,
+            max_entries: 1024,
+            provider_id: "openai".to_string(),
+            model_id: "gpt-4o-mini".to_string(),
+            partition: "t".to_string(),
+        })
+        .unwrap(),
+    );
+    state
+}
+
+fn text_message(role: &str, content: &str) -> Message {
+    Message {
+        role: role.to_string(),
+        content: content.to_string(),
+        content_blocks: None,
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        status: None,
+    }
+}
+
+fn adapter_request(messages: Vec<Message>, state: AgentState) -> AgentProviderRequest {
+    AgentProviderRequest {
+        messages,
+        tool_specs: Vec::new(),
+        tool_choice: ToolChoice::Auto,
+        state,
+        last_tool_results: Vec::new(),
         structured_output: None,
     }
 }
@@ -277,6 +329,204 @@ fn openai_provider_declares_expected_capabilities() {
             ),
         }
     );
+}
+
+#[test]
+fn prompt_cache_plan_uses_provider_mapped_payload() {
+    let config = OpenAiCompatibleConfig::new("gpt-4o-mini").with_merge_system_into_user(true);
+    let provider = OpenAiCompatibleProvider::new(
+        config,
+        Arc::new(MockOpenAiTransport::for_response(OpenAiChatResponse {
+            choices: Vec::new(),
+            usage: None,
+        })),
+    );
+    let adapter = LlmProviderAdapter::new(Arc::new(provider));
+    let req = AgentProviderRequest {
+        messages: vec![
+            Message {
+                role: "system".to_string(),
+                content: "SYS".to_string(),
+                content_blocks: None,
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                status: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: "HI".to_string(),
+                content_blocks: None,
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                status: None,
+            },
+        ],
+        tool_specs: Vec::new(),
+        tool_choice: ToolChoice::Auto,
+        state: AgentState::default(),
+        last_tool_results: Vec::new(),
+        structured_output: None,
+    };
+
+    let plan = adapter.prompt_cache_plan(&req).unwrap();
+    let prefix_messages = plan
+        .l1_view
+        .get("prefix_messages")
+        .and_then(|value| value.as_array())
+        .unwrap();
+    assert!(prefix_messages.is_empty());
+    let messages = plan
+        .l2_view
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .unwrap();
+    let first = messages.first().unwrap();
+    assert_eq!(first.get("role").and_then(|v| v.as_str()), Some("user"));
+    assert_eq!(
+        first.get("content").and_then(|v| v.as_str()),
+        Some("SYS\n\nHI")
+    );
+}
+
+#[tokio::test]
+async fn single_system_layout_merges_prefix_before_send_and_hash() {
+    let transport = Arc::new(CaptureTransport::new(OpenAiChatResponse {
+        choices: vec![OpenAiChoice {
+            message: OpenAiMessage {
+                role: "assistant".to_string(),
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            finish_reason: Some("stop".to_string()),
+        }],
+        usage: None,
+    }));
+    let provider = OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig::new("gpt-4o-mini"),
+        transport.clone(),
+    );
+    let adapter = LlmProviderAdapter::new(Arc::new(provider));
+    let req = adapter_request(
+        vec![
+            text_message("system", "A"),
+            text_message("system", "B"),
+            text_message("user", "HI"),
+        ],
+        prompt_cache_state(PromptCacheLayoutMode::SingleSystem),
+    );
+
+    let plan = adapter.prompt_cache_plan(&req).unwrap();
+    let prefix_messages = plan
+        .l1_view
+        .get("prefix_messages")
+        .and_then(|value| value.as_array())
+        .unwrap();
+    assert_eq!(prefix_messages.len(), 1);
+    assert_eq!(
+        prefix_messages[0]
+            .get("content")
+            .and_then(|value| value.as_str()),
+        Some("A\n\nB")
+    );
+
+    let _ = adapter.step_output(req).await.unwrap();
+    let built = transport.last_request();
+    assert_eq!(built.messages.len(), 2);
+    assert_eq!(built.messages[0].role, "system");
+    assert_eq!(
+        built.messages[0].content,
+        Some(OpenAiMessageContent::from("A\n\nB".to_string()))
+    );
+}
+
+#[test]
+fn prompt_cache_plan_same_final_single_system_payload_has_same_l1_hash() {
+    let provider = OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig::new("gpt-4o-mini"),
+        Arc::new(MockOpenAiTransport::for_response(OpenAiChatResponse {
+            choices: Vec::new(),
+            usage: None,
+        })),
+    );
+    let adapter = LlmProviderAdapter::new(Arc::new(provider));
+    let state = prompt_cache_state(PromptCacheLayoutMode::SingleSystem);
+
+    let plan_one = adapter
+        .prompt_cache_plan(&adapter_request(
+            vec![
+                text_message("system", "A"),
+                text_message("system", "B"),
+                text_message("user", "HI"),
+            ],
+            state.clone(),
+        ))
+        .unwrap();
+    let plan_two = adapter
+        .prompt_cache_plan(&adapter_request(
+            vec![text_message("system", "A\n\nB"), text_message("user", "HI")],
+            state,
+        ))
+        .unwrap();
+
+    assert_eq!(plan_one.l1_hash, plan_two.l1_hash);
+}
+
+#[test]
+fn prompt_cache_layout_hashes_change_only_when_final_payload_changes() {
+    let provider_same_payload = OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig::new("gpt-4o-mini").with_merge_system_into_user(true),
+        Arc::new(MockOpenAiTransport::for_response(OpenAiChatResponse {
+            choices: Vec::new(),
+            usage: None,
+        })),
+    );
+    let adapter_same_payload = LlmProviderAdapter::new(Arc::new(provider_same_payload));
+    let messages = vec![
+        text_message("system", "A"),
+        text_message("system", "B"),
+        text_message("user", "HI"),
+    ];
+    let plan_single = adapter_same_payload
+        .prompt_cache_plan(&adapter_request(
+            messages.clone(),
+            prompt_cache_state(PromptCacheLayoutMode::SingleSystem),
+        ))
+        .unwrap();
+    let plan_preserved = adapter_same_payload
+        .prompt_cache_plan(&adapter_request(
+            messages.clone(),
+            prompt_cache_state(PromptCacheLayoutMode::PreservePrefixSegments),
+        ))
+        .unwrap();
+    assert_eq!(plan_single.l1_hash, plan_preserved.l1_hash);
+
+    let provider_different_payload = OpenAiCompatibleProvider::new(
+        OpenAiCompatibleConfig::new("gpt-4o-mini"),
+        Arc::new(MockOpenAiTransport::for_response(OpenAiChatResponse {
+            choices: Vec::new(),
+            usage: None,
+        })),
+    );
+    let adapter_different_payload = LlmProviderAdapter::new(Arc::new(provider_different_payload));
+    let plan_single = adapter_different_payload
+        .prompt_cache_plan(&adapter_request(
+            messages.clone(),
+            prompt_cache_state(PromptCacheLayoutMode::SingleSystem),
+        ))
+        .unwrap();
+    let plan_preserved = adapter_different_payload
+        .prompt_cache_plan(&adapter_request(
+            messages,
+            prompt_cache_state(PromptCacheLayoutMode::PreservePrefixSegments),
+        ))
+        .unwrap();
+    assert_ne!(plan_single.l1_hash, plan_preserved.l1_hash);
 }
 
 #[tokio::test]

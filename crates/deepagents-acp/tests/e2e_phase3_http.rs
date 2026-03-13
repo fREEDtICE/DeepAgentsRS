@@ -81,6 +81,128 @@ async fn get(app: axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
 }
 
 #[tokio::test]
+async fn config_endpoints_round_trip() {
+    let app = deepagents_acp::server::router();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let env_name = "DEEPAGENTS_TEST_ACP_KEY";
+
+    let (st, v) = post_json(
+        app.clone(),
+        "/config/set",
+        serde_json::json!({
+            "root": root.to_string_lossy(),
+            "scope": "workspace",
+            "key": "providers.openai-compatible.api_key_env",
+            "value": env_name
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["ok"], true);
+
+    let (st, v) = post_json(
+        app.clone(),
+        "/config/get",
+        serde_json::json!({
+            "root": root.to_string_lossy(),
+            "key": "providers.openai-compatible.api_key_env"
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["result"]["value"].as_str(), Some(env_name));
+
+    let (st, v) = post_json(
+        app.clone(),
+        "/config/doctor",
+        serde_json::json!({
+            "root": root.to_string_lossy()
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(v["result"]["issues"].is_array());
+}
+
+#[tokio::test]
+async fn run_uses_configured_provider_defaults() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route("/chat/completions", post(chat_json_handler));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let app = deepagents_acp::server::router();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let env_name = "DEEPAGENTS_TEST_ACP_RUN_KEY";
+
+    for (key, value) in [
+        (
+            "providers.openai-compatible.enabled",
+            serde_json::json!(true),
+        ),
+        (
+            "providers.openai-compatible.model",
+            serde_json::json!("gpt-4o-mini"),
+        ),
+        (
+            "providers.openai-compatible.base_url",
+            serde_json::json!(format!("http://{}", addr)),
+        ),
+        (
+            "providers.openai-compatible.api_key_env",
+            serde_json::json!(env_name),
+        ),
+    ] {
+        let (st, v) = post_json(
+            app.clone(),
+            "/config/set",
+            serde_json::json!({
+                "root": root.to_string_lossy(),
+                "scope": "workspace",
+                "key": key,
+                "value": value
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+    }
+
+    let (st, v) = post_json(
+        app.clone(),
+        "/new_session",
+        serde_json::json!({
+            "root": root.to_string_lossy(),
+            "execution_mode": "non_interactive"
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let session_id = v["result"]["session_id"].as_str().unwrap().to_string();
+
+    std::env::set_var(env_name, "dummy-key");
+    let (st, v) = post_json(
+        app.clone(),
+        "/run",
+        serde_json::json!({
+            "session_id": session_id,
+            "provider": "openai-compatible",
+            "input": "hello"
+        }),
+    )
+    .await;
+    std::env::remove_var(env_name);
+
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v["result"]["output"]["final_text"].as_str(), Some("done"));
+}
+
+#[tokio::test]
 async fn phase3_session_tool_and_state_flow() {
     let app = deepagents_acp::server::router();
     let dir = tempfile::tempdir().unwrap();
@@ -140,6 +262,24 @@ async fn phase3_session_tool_and_state_flow() {
         .and_then(|v| v.as_u64())
         .unwrap();
     assert!(state_version >= 1);
+}
+
+async fn chat_json_handler(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    assert_eq!(body["model"], "gpt-4o-mini");
+    Json(serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 1,
+            "total_tokens": 6
+        }
+    }))
 }
 
 #[tokio::test]

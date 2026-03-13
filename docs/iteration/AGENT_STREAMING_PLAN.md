@@ -374,15 +374,10 @@ ScriptedModel / MockProvider 下，必须稳定：
 
 - 即使 provider 本身没有自然文本，也应向外发一条 assistant message，以固定事件心智
 
-### `SkillCall`
+### Skills
 
-第一阶段建议内部展开为 tool calls，不引入单独事件类型。
-
-可选补充：
-
-- `Warning { code: "skill_call_expanded" }`
-
-第二阶段再考虑是否新增 `SkillCallStarted/Finished`。
+Package skills 通过普通 `ToolCalls { calls }` 暴露给模型与事件流，不保留单独的
+`SkillCall` 事件类型。
 
 ### `Error { error }`
 

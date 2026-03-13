@@ -33,7 +33,6 @@ use crate::runtime::structured_output::parse_structured_output;
 use crate::runtime::tool_compat::{
     normalize_tool_call_for_execution, tool_results_from_messages, NormalizedToolCall,
 };
-use crate::skills::{SkillCall, SkillPlugin};
 use crate::state::AgentState;
 use crate::types::{Message, ToolCall};
 use crate::DeepAgent;
@@ -215,7 +214,6 @@ struct PendingInterrupt {
 pub struct ResumableRunner {
     agent: DeepAgent,
     provider: Arc<dyn AgentProvider>,
-    skills: Vec<Arc<dyn SkillPlugin>>,
     config: crate::runtime::RuntimeConfig,
     approval: Option<Arc<dyn ApprovalPolicy>>,
     audit: Option<Arc<dyn AuditSink>>,
@@ -276,13 +274,11 @@ impl ResumableRunner {
     pub fn new(
         agent: DeepAgent,
         provider: Arc<dyn AgentProvider>,
-        skills: Vec<Arc<dyn SkillPlugin>>,
         options: ResumableRunnerOptions,
     ) -> Self {
         Self {
             agent,
             provider,
-            skills,
             config: options.config,
             approval: options.approval,
             audit: options.audit,
@@ -506,6 +502,7 @@ impl ResumableRunner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn push_tool_result_and_message(
         &mut self,
         step_index: usize,
@@ -678,12 +675,7 @@ impl ResumableRunner {
             let event_step_idx = self.step_counter;
             self.step_counter = self.step_counter.saturating_add(1);
             let tool_specs = self.agent_tools(&self.state);
-            let skill_specs = self
-                .skills
-                .iter()
-                .flat_map(|p| p.list_skills())
-                .collect::<Vec<_>>();
-            let skill_specs_for_req = skill_specs.clone();
+            let skill_names_for_event = self.skill_names(&self.state);
 
             let mut provider_messages = self.messages.clone();
             if !self.runtime_middlewares.is_empty() {
@@ -734,7 +726,7 @@ impl ResumableRunner {
                 RunEvent::ModelRequestBuilt {
                     step_index: event_step_idx,
                     tool_names: tool_specs.iter().map(|t| t.name.clone()).collect(),
-                    skills: skill_specs_for_req.iter().map(|s| s.name.clone()).collect(),
+                    skills: skill_names_for_event,
                     message_count: provider_messages.len(),
                     message_summary: summarize_messages(&provider_messages),
                 },
@@ -745,7 +737,6 @@ impl ResumableRunner {
                 messages: provider_messages.clone(),
                 tool_specs,
                 tool_choice: self.tool_choice.clone(),
-                skills: skill_specs_for_req,
                 state: self.state.clone(),
                 last_tool_results: self.tool_results.clone(),
                 structured_output: self.structured_output.clone(),
@@ -781,6 +772,33 @@ impl ResumableRunner {
                     });
                     return self
                         .finish_with_output(sink, out, "provider_error", event_step_idx + 1)
+                        .await;
+                }
+                Err(CachedProviderError::PromptCache(e)) => {
+                    let out = finalize_run_output(RunOutput {
+                        status: RunStatus::Error,
+                        interrupts: Vec::new(),
+                        final_text: String::new(),
+                        tool_calls: self.tool_calls.clone(),
+                        tool_results: self.tool_results.clone(),
+                        state: self.state.clone(),
+                        error: Some(RuntimeError {
+                            code: "prompt_cache_error".to_string(),
+                            message: e.to_string(),
+                        }),
+                        structured_output: None,
+                        summarization_events: self
+                            .state
+                            .extra
+                            .get("_summarization_events")
+                            .cloned(),
+                        trace: Some(serde_json::json!({
+                            "terminated_at_step": step_idx,
+                            "reason": "prompt_cache_error"
+                        })),
+                    });
+                    return self
+                        .finish_with_output(sink, out, "prompt_cache_error", event_step_idx + 1)
                         .await;
                 }
                 Err(CachedProviderError::Timeout) => {
@@ -871,7 +889,6 @@ impl ResumableRunner {
                         messages: overflow_messages,
                         tool_specs: self.agent_tools(&self.state),
                         tool_choice: self.tool_choice.clone(),
-                        skills: skill_specs.clone(),
                         state: self.state.clone(),
                         last_tool_results: self.tool_results.clone(),
                         structured_output: self.structured_output.clone(),
@@ -906,6 +923,38 @@ impl ResumableRunner {
                             });
                             return self
                                 .finish_with_output(sink, out, "provider_error", event_step_idx + 1)
+                                .await;
+                        }
+                        Err(CachedProviderError::PromptCache(e)) => {
+                            let out = finalize_run_output(RunOutput {
+                                status: RunStatus::Error,
+                                interrupts: Vec::new(),
+                                final_text: String::new(),
+                                tool_calls: self.tool_calls.clone(),
+                                tool_results: self.tool_results.clone(),
+                                state: self.state.clone(),
+                                error: Some(RuntimeError {
+                                    code: "prompt_cache_error".to_string(),
+                                    message: e.to_string(),
+                                }),
+                                structured_output: None,
+                                summarization_events: self
+                                    .state
+                                    .extra
+                                    .get("_summarization_events")
+                                    .cloned(),
+                                trace: Some(serde_json::json!({
+                                    "terminated_at_step": step_idx,
+                                    "reason": "prompt_cache_error"
+                                })),
+                            });
+                            return self
+                                .finish_with_output(
+                                    sink,
+                                    out,
+                                    "prompt_cache_error",
+                                    event_step_idx + 1,
+                                )
                                 .await;
                         }
                         Err(CachedProviderError::Timeout) => {
@@ -1153,63 +1202,6 @@ impl ResumableRunner {
                     )
                     .await;
                     return out;
-                }
-                AgentStep::SkillCall {
-                    name,
-                    input,
-                    call_id,
-                } => {
-                    let call = SkillCall {
-                        name,
-                        input,
-                        call_id,
-                    };
-                    let calls = match self.expand_skill(call).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let out = finalize_run_output(RunOutput {
-                                status: RunStatus::Error,
-                                interrupts: Vec::new(),
-                                final_text: String::new(),
-                                tool_calls: self.tool_calls.clone(),
-                                tool_results: self.tool_results.clone(),
-                                state: self.state.clone(),
-                                error: Some(RuntimeError {
-                                    code: e.code,
-                                    message: e.message,
-                                }),
-                                structured_output: None,
-                                summarization_events: self
-                                    .state
-                                    .extra
-                                    .get("_summarization_events")
-                                    .cloned(),
-                                trace: Some(serde_json::json!({
-                                    "terminated_at_step": step_idx,
-                                    "reason": "skill_error"
-                                })),
-                            });
-                            return self
-                                .finish_with_output(sink, out, "skill_error", event_step_idx + 1)
-                                .await;
-                        }
-                    };
-                    if self
-                        .execute_calls(event_step_idx, calls, sink)
-                        .await
-                        .is_some()
-                    {
-                        let out = self.pending_output();
-                        self.emit_run_finished(
-                            sink,
-                            out.status,
-                            "interrupt",
-                            out.final_text.clone(),
-                            event_step_idx + 1,
-                        )
-                        .await;
-                        return out;
-                    }
                 }
                 AgentStep::ToolCalls { calls } => {
                     let calls = crate::runtime::patch_tool_calls::normalize_provider_tool_calls(
@@ -1591,20 +1583,107 @@ impl ResumableRunner {
         (output2, content2)
     }
 
-    async fn expand_skill(
-        &self,
-        call: SkillCall,
-    ) -> Result<Vec<AgentToolCall>, crate::skills::SkillError> {
-        for p in &self.skills {
-            let names: Vec<String> = p.list_skills().into_iter().map(|s| s.name).collect();
-            if names.iter().any(|n| n == &call.name) {
-                return p.call(call).await;
+    fn skill_names(&self, state: &AgentState) -> Vec<String> {
+        state
+            .extra
+            .get("skills_metadata")
+            .and_then(|value| {
+                serde_json::from_value::<Vec<crate::skills::SkillMetadata>>(value.clone()).ok()
+            })
+            .map(|skills| skills.into_iter().map(|skill| skill.name).collect())
+            .unwrap_or_default()
+    }
+
+    /// Runs middleware-backed tool handling after a `ToolCallStarted` event has
+    /// already been emitted for the call.
+    ///
+    /// Package skill tools live behind runtime middleware rather than the base
+    /// agent tool registry. Resumed HITL approvals must re-enter this path so a
+    /// deferred skill call executes exactly like it would during the original
+    /// run.
+    async fn try_handle_runtime_middleware_call(
+        &mut self,
+        step_index: usize,
+        call: &AgentToolCall,
+        call_id: &str,
+        sink: &mut dyn RunEventSink,
+    ) -> bool {
+        if self.runtime_middlewares.is_empty() {
+            return false;
+        }
+
+        let before_state = self.state.clone();
+        let mut ctx = ToolCallContext {
+            agent: &self.agent,
+            tool_call: call,
+            call_id,
+            messages: &mut self.messages,
+            state: &mut self.state,
+            root: &self.root,
+            mode: self.mode,
+            approval: self.approval.as_ref(),
+            audit: self.audit.as_ref(),
+            runtime_middlewares: &self.runtime_middlewares,
+            task_depth: self.task_depth,
+        };
+        let mut handled: Option<HandledToolCall> = None;
+        for mw in &self.runtime_middlewares {
+            match mw.handle_tool_call(&mut ctx).await {
+                Ok(Some(result)) => {
+                    handled = Some(result);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    handled = Some(HandledToolCall {
+                        output: serde_json::Value::Null,
+                        error: Some(format!("middleware_error: {e}")),
+                    });
+                    break;
+                }
             }
         }
-        Err(crate::skills::SkillError {
-            code: "skill_not_found".to_string(),
-            message: format!("skill not found: {}", call.name),
-        })
+
+        let Some(HandledToolCall { output, error }) = handled else {
+            return false;
+        };
+
+        let tool_name = call.tool_name.clone();
+        let status = if error.is_some() { "error" } else { "success" }.to_string();
+        let (error_code, error_message) = error
+            .as_deref()
+            .map(parse_tool_error_string)
+            .map(|(code, message)| (Some(code), Some(message)))
+            .unwrap_or((None, None));
+        let (output, content) = if let Some(err) = &error {
+            (output, err.clone())
+        } else {
+            ResumableRunner::maybe_offload_large_tool_result(
+                &self.agent,
+                &mut self.state,
+                &tool_name,
+                call_id,
+                output,
+            )
+            .await
+        };
+        self.push_tool_result_and_message(
+            step_index,
+            &before_state,
+            tool_name,
+            call_id.to_string(),
+            output,
+            error,
+            error_code,
+            error_message,
+            status,
+            content,
+            None,
+            sink,
+            None,
+        )
+        .await;
+        true
     }
 
     async fn execute_calls(
@@ -1876,77 +1955,11 @@ impl ResumableRunner {
             )
             .await;
 
-            if !self.runtime_middlewares.is_empty() {
-                let before_state = self.state.clone();
-                let mut ctx = ToolCallContext {
-                    agent: &self.agent,
-                    tool_call: &call,
-                    call_id: &call_id,
-                    messages: &mut self.messages,
-                    state: &mut self.state,
-                    root: &self.root,
-                    mode: self.mode,
-                    approval: self.approval.as_ref(),
-                    audit: self.audit.as_ref(),
-                    runtime_middlewares: &self.runtime_middlewares,
-                    task_depth: self.task_depth,
-                };
-                let mut handled: Option<HandledToolCall> = None;
-                for mw in &self.runtime_middlewares {
-                    match mw.handle_tool_call(&mut ctx).await {
-                        Ok(Some(h)) => {
-                            handled = Some(h);
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            handled = Some(HandledToolCall {
-                                output: serde_json::Value::Null,
-                                error: Some(format!("middleware_error: {e}")),
-                            });
-                            break;
-                        }
-                    }
-                }
-                if let Some(HandledToolCall { output, error }) = handled {
-                    let status = if error.is_some() { "error" } else { "success" }.to_string();
-                    let tool_name = tool_name.clone();
-                    let cid = call_id.clone();
-                    let (error_code, error_message) = error
-                        .as_deref()
-                        .map(parse_tool_error_string)
-                        .map(|(c, m)| (Some(c), Some(m)))
-                        .unwrap_or((None, None));
-                    let (output, content) = if let Some(e) = &error {
-                        (output, e.clone())
-                    } else {
-                        ResumableRunner::maybe_offload_large_tool_result(
-                            &self.agent,
-                            &mut self.state,
-                            &tool_name,
-                            &cid,
-                            output,
-                        )
-                        .await
-                    };
-                    self.push_tool_result_and_message(
-                        step_index,
-                        &before_state,
-                        tool_name.clone(),
-                        cid,
-                        output,
-                        error,
-                        error_code,
-                        error_message,
-                        status,
-                        content,
-                        None,
-                        sink,
-                        None,
-                    )
-                    .await;
-                    continue;
-                }
+            if self
+                .try_handle_runtime_middleware_call(step_index, &call, &call_id, sink)
+                .await
+            {
+                continue;
             }
 
             if call.tool_name == "execute" {
@@ -2265,6 +2278,13 @@ impl ResumableRunner {
             },
         )
         .await;
+
+        if self
+            .try_handle_runtime_middleware_call(step_index, &call, &call_id, sink)
+            .await
+        {
+            return;
+        }
 
         if tool_name == "execute" {
             if let Some(policy) = &self.approval {

@@ -92,7 +92,6 @@ async fn phase9_offload_writes_to_large_backend_and_replaces_tool_output() {
     let runtime = deepagents::runtime::simple::SimpleRuntime::new(
         agent,
         provider,
-        vec![],
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,
@@ -180,7 +179,6 @@ async fn phase9_offload_creates_large_tool_results_dir_in_workspace_backend() {
     let runtime = deepagents::runtime::simple::SimpleRuntime::new(
         agent,
         provider,
-        vec![],
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: deepagents::runtime::RuntimeConfig {
                 max_steps: 8,

@@ -5,7 +5,7 @@ use deepagents::provider::protocol::{AgentProvider, AgentProviderRequest, AgentS
 use deepagents::provider::AgentToolCall;
 use deepagents::runtime::simple::SimpleRuntime;
 use deepagents::runtime::skills_middleware::SkillsMiddleware;
-use deepagents::runtime::{Runtime, RuntimeConfig};
+use deepagents::runtime::{Runtime, RuntimeConfig, RuntimeMiddleware};
 use deepagents::skills::loader::{load_skills, SkillsLoadOptions};
 use deepagents::types::Message;
 
@@ -62,6 +62,112 @@ fn prompt_only_skill_has_no_tools() {
     assert!(loaded.tools.is_empty());
 }
 
+#[test]
+fn load_skills_canonicalizes_metadata_tools_and_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_a = temp.path().join("A");
+    let source_b = temp.path().join("B");
+
+    write_skill(
+        &source_a,
+        "zeta-skill",
+        "Zeta",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "shared-tool",
+                    "description": "Shared tool from zeta",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
+    write_skill(
+        &source_a,
+        "beta-skill",
+        "Beta from A",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "shared-tool",
+                    "description": "Shared tool from beta",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
+    write_skill(
+        &source_a,
+        "alpha-skill",
+        "Alpha from A",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "alpha-tool",
+                    "description": "Alpha tool from A",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
+    write_skill(
+        &source_b,
+        "alpha-skill",
+        "Alpha from B",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "alpha-tool",
+                    "description": "Alpha tool from B",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
+
+    let loaded = load_skills(
+        &[
+            source_a.to_string_lossy().to_string(),
+            source_b.to_string_lossy().to_string(),
+        ],
+        SkillsLoadOptions::default(),
+    )
+    .unwrap();
+
+    let metadata_names = loaded
+        .metadata
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metadata_names,
+        vec!["alpha-skill", "beta-skill", "zeta-skill"]
+    );
+
+    let tool_names = loaded
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, vec!["alpha-tool", "shared-tool"]);
+
+    let override_names = loaded
+        .diagnostics
+        .overrides
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(override_names, vec!["alpha-skill", "shared-tool"]);
+}
+
 #[tokio::test]
 async fn skills_tool_executes_steps() {
     let temp = tempfile::tempdir().unwrap();
@@ -109,7 +215,6 @@ async fn skills_tool_executes_steps() {
     let runtime = SimpleRuntime::new(
         agent,
         provider,
-        Vec::new(),
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: RuntimeConfig {
                 max_steps: 4,
@@ -149,16 +254,38 @@ async fn skills_tool_executes_steps() {
 async fn skills_tools_are_injected_into_tool_specs() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("skills");
-    let tools_json = r#"{
-        "tools": [{
-            "name": "echo-skill",
-            "description": "Echo",
-            "input_schema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] },
-            "steps": [{ "tool_name": "read_file", "arguments": { "file_path": "README.md", "limit": 1 } }],
-            "policy": { "allow_filesystem": true }
-        }]
-    }"#;
-    write_skill(&src, "echo-skill", "Echo", Some(tools_json));
+    write_skill(
+        &src,
+        "zeta-skill",
+        "Zeta",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "zeta-tool",
+                    "description": "Zeta",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
+    write_skill(
+        &src,
+        "alpha-skill",
+        "Alpha",
+        Some(
+            r#"{
+                "tools": [{
+                    "name": "alpha-tool",
+                    "description": "Alpha",
+                    "input_schema": { "type": "object", "properties": {}, "required": [] },
+                    "steps": [],
+                    "policy": {}
+                }]
+            }"#,
+        ),
+    );
     std::fs::write(
         temp.path().join("README.md"),
         "Project: DeepAgents\nhello\n",
@@ -180,7 +307,6 @@ async fn skills_tools_are_injected_into_tool_specs() {
     let runtime = SimpleRuntime::new(
         agent,
         provider,
-        Vec::new(),
         deepagents::runtime::simple::SimpleRuntimeOptions {
             config: RuntimeConfig {
                 max_steps: 1,
@@ -208,11 +334,170 @@ async fn skills_tools_are_injected_into_tool_specs() {
         .await;
 
     let req = captured.lock().unwrap().clone().unwrap();
-    assert!(req.tool_specs.iter().any(|t| t.name == "echo-skill"));
+    let skill_tool_names = req
+        .tool_specs
+        .iter()
+        .filter(|tool| tool.name == "alpha-tool" || tool.name == "zeta-tool")
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(skill_tool_names, vec!["alpha-tool", "zeta-tool"]);
+    assert_eq!(
+        req.messages
+            .iter()
+            .find(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+            .map(|message| message.content.as_str()),
+        Some(
+            "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- alpha-skill: Alpha (source: skills)\n- zeta-skill: Zeta (source: skills)\n"
+        )
+    );
     assert!(req
         .messages
         .iter()
         .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1")));
+}
+
+#[tokio::test]
+async fn skills_middleware_restores_and_rewrites_snapshot_deterministically() {
+    let middleware = SkillsMiddleware::new(
+        vec!["/definitely/missing".to_string()],
+        SkillsLoadOptions::default(),
+    );
+    let mut state = deepagents::state::AgentState::default();
+    state.extra.insert(
+        "skills_metadata".to_string(),
+        serde_json::json!([
+            {
+                "name": "zeta-skill",
+                "description": "Zeta",
+                "path": "/tmp/zeta",
+                "source": "restored",
+                "allowed_tools": []
+            },
+            {
+                "name": "alpha-skill",
+                "description": "Alpha",
+                "path": "/tmp/alpha",
+                "source": "restored",
+                "allowed_tools": []
+            }
+        ]),
+    );
+    state.extra.insert(
+        "skills_tools".to_string(),
+        serde_json::json!([
+            {
+                "name": "zeta-tool",
+                "description": "Zeta tool",
+                "input_schema": { "type": "object", "properties": {}, "required": [] },
+                "steps": [],
+                "policy": {
+                    "allow_filesystem": false,
+                    "allow_execute": false,
+                    "allow_network": false,
+                    "max_steps": 8,
+                    "timeout_ms": 1000,
+                    "max_output_chars": 12000
+                },
+                "skill_name": "zeta-skill",
+                "source": "restored"
+            },
+            {
+                "name": "alpha-tool",
+                "description": "Alpha tool",
+                "input_schema": { "type": "object", "properties": {}, "required": [] },
+                "steps": [],
+                "policy": {
+                    "allow_filesystem": false,
+                    "allow_execute": false,
+                    "allow_network": false,
+                    "max_steps": 8,
+                    "timeout_ms": 1000,
+                    "max_output_chars": 12000
+                },
+                "skill_name": "alpha-skill",
+                "source": "restored"
+            }
+        ]),
+    );
+
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content:
+                "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- zeta-skill: Zeta (source: restored)\n"
+                    .to_string(),
+            content_blocks: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            status: None,
+        },
+        Message {
+            role: "system".to_string(),
+            content: "DEEPAGENTS_SKILLS_INJECTED_V1\nduplicate".to_string(),
+            content_blocks: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            status: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: "ping".to_string(),
+            content_blocks: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            status: None,
+        },
+    ];
+
+    let messages =
+        <SkillsMiddleware as RuntimeMiddleware>::before_run(&middleware, messages, &mut state)
+            .await
+            .unwrap();
+
+    let markers = messages
+        .iter()
+        .filter(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(
+        markers[0].content,
+        "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- alpha-skill: Alpha (source: restored)\n- zeta-skill: Zeta (source: restored)\n"
+    );
+
+    let metadata = serde_json::from_value::<Vec<deepagents::skills::SkillMetadata>>(
+        state.extra.get("skills_metadata").cloned().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        metadata
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha-skill", "zeta-skill"]
+    );
+    let tools = serde_json::from_value::<Vec<deepagents::skills::SkillToolSpec>>(
+        state.extra.get("skills_tools").cloned().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha-tool", "zeta-tool"]
+    );
+    let diagnostics = serde_json::from_value::<deepagents::skills::SkillsDiagnostics>(
+        state.extra.get("skills_diagnostics").cloned().unwrap(),
+    )
+    .unwrap();
+    assert!(diagnostics.sources.is_empty());
+    assert!(diagnostics.overrides.is_empty());
 }
 
 struct CaptureProvider {
