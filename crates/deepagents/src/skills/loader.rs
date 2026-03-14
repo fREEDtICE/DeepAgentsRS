@@ -1,18 +1,26 @@
+//! Source-based skill package loading and compatibility views.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::skills::validator::{load_skill_dir, SkillPackage, SkillValidationOptions};
+use crate::skills::governance::review_skill_package;
+use crate::skills::validator::{load_skill_dir, SkillValidationOptions};
 use crate::skills::{
-    LoadedSkills, SkillMetadata, SkillOverrideRecord, SkillSourceDiagnostics, SkillToolSpec,
-    SkillsDiagnostics,
+    LoadedSkills, SkillDiagnosticRecord, SkillOverrideRecord, SkillPackage, SkillSourceDiagnostics,
+    SkillToolSpec, SkillsDiagnostics,
 };
 
-#[derive(Debug, Clone)]
+/// Controls source-based skill loading behavior.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillsLoadOptions {
+    /// Whether invalid source directories should be recorded and skipped.
     pub skip_invalid_sources: bool,
+    /// Whether unknown frontmatter and schema fields should fail fast.
     pub strict: bool,
+    /// Whether versionless packages should be normalized to `0.0.0-dev`.
+    pub allow_versionless_compat: bool,
 }
 
 impl Default for SkillsLoadOptions {
@@ -20,12 +28,24 @@ impl Default for SkillsLoadOptions {
         Self {
             skip_invalid_sources: false,
             strict: true,
+            allow_versionless_compat: true,
         }
     }
 }
 
+/// Loads fully parsed packages from one or more source roots.
+pub fn load_skill_packages_from_sources(
+    sources: &[String],
+    options: SkillsLoadOptions,
+) -> Result<Vec<SkillPackage>> {
+    let loaded = load_skills(sources, options)?;
+    Ok(loaded.packages)
+}
+
+/// Loads source-based skills and exposes both the new package view and the
+/// legacy metadata/tool mirrors used by older callers.
 pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<LoadedSkills> {
-    let mut skill_map: BTreeMap<String, SkillPackage> = BTreeMap::new();
+    let mut package_map: BTreeMap<String, SkillPackage> = BTreeMap::new();
     let mut diagnostics = SkillsDiagnostics::default();
 
     for src in sources {
@@ -36,6 +56,7 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
             skipped: 0,
             errors: Vec::new(),
         };
+
         if !source_path.exists() || !source_path.is_dir() {
             let err = format!("invalid_source: {}", src);
             if options.skip_invalid_sources {
@@ -61,36 +82,51 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
                 &source_name,
                 SkillValidationOptions {
                     strict: options.strict,
+                    allow_versionless_compat: options.allow_versionless_compat,
                 },
             ) {
-                Ok(pkg) => {
-                    if let Some(prev) = skill_map.get(&pkg.metadata.name) {
+                Ok(mut package) => {
+                    package.governance = review_skill_package(&package);
+                    let key = package.manifest.identity.as_key();
+                    if let Some(prev) = package_map.get(&key) {
                         diagnostics.overrides.push(SkillOverrideRecord {
-                            name: pkg.metadata.name.clone(),
-                            overridden_source: prev.metadata.source.clone(),
-                            source: pkg.metadata.source.clone(),
+                            name: package.manifest.identity.name.clone(),
+                            version: package.manifest.identity.version.clone(),
+                            overridden_source: prev.manifest.source.clone(),
+                            source: package.manifest.source.clone(),
                         });
                     }
-                    skill_map.insert(pkg.metadata.name.clone(), pkg);
+                    for finding in &package.governance.findings {
+                        diagnostics.records.push(SkillDiagnosticRecord {
+                            name: package.manifest.identity.name.clone(),
+                            version: package.manifest.identity.version.clone(),
+                            source: package.manifest.source.clone(),
+                            severity: format!("{:?}", finding.severity).to_ascii_lowercase(),
+                            code: finding.code.clone(),
+                            message: finding.message.clone(),
+                        });
+                    }
                     source_diag.loaded += 1;
+                    package_map.insert(key, package);
                 }
-                Err(e) => {
+                Err(error) => {
                     if options.strict {
-                        return Err(e);
+                        return Err(error);
                     }
                     source_diag.skipped += 1;
-                    source_diag.errors.push(e.to_string());
+                    source_diag.errors.push(error.to_string());
                 }
             }
         }
         diagnostics.sources.push(source_diag);
     }
 
-    let mut metadata: Vec<SkillMetadata> = Vec::new();
+    let mut loaded = LoadedSkills::default();
     let mut tool_map: BTreeMap<String, SkillToolSpec> = BTreeMap::new();
-    for (_, pkg) in skill_map {
-        metadata.push(pkg.metadata.clone());
-        for tool in pkg.tools {
+    for (_, package) in package_map {
+        loaded.metadata.push(package.metadata.clone());
+        loaded.packages.push(package.clone());
+        for tool in &package.tools {
             if is_core_tool(&tool.name) {
                 return Err(anyhow::anyhow!(
                     "tool_conflict_with_core: skill tool {} from skill {} conflicts with core tool",
@@ -99,37 +135,40 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
                 ));
             }
             if let Some(prev) = tool_map.get(&tool.name) {
-                diagnostics.overrides.push(SkillOverrideRecord {
+                loaded.diagnostics.overrides.push(SkillOverrideRecord {
                     name: tool.name.clone(),
+                    version: tool.skill_version.clone(),
                     overridden_source: prev.source.clone(),
                     source: tool.source.clone(),
                 });
             }
-            tool_map.insert(tool.name.clone(), tool);
+            tool_map.insert(tool.name.clone(), tool.clone());
         }
     }
 
-    let tools = tool_map.into_values().collect::<Vec<_>>();
-    let mut loaded = LoadedSkills {
-        metadata,
-        tools,
-        diagnostics,
-    };
+    loaded.tools = tool_map.into_values().collect::<Vec<_>>();
+    loaded.diagnostics.sources = diagnostics.sources;
+    loaded.diagnostics.records.extend(diagnostics.records);
+    loaded
+        .diagnostics
+        .overrides
+        .extend(diagnostics.overrides);
     loaded.canonicalize();
     Ok(loaded)
 }
 
 fn source_name(path: &Path) -> String {
     path.file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
         .unwrap_or_else(|| path.display().to_string())
 }
 
 fn is_core_tool(name: &str) -> bool {
     matches!(
         name,
-        "ls" | "read_file"
+        "ls"
+            | "read_file"
             | "write_file"
             | "edit_file"
             | "delete_file"
@@ -137,5 +176,6 @@ fn is_core_tool(name: &str) -> bool {
             | "grep"
             | "execute"
             | "task"
+            | "compact_conversation"
     )
 }

@@ -69,10 +69,33 @@ enum Cmd {
         #[arg(long)]
         thread_id: Option<String>,
         #[arg(long)]
+        state_file: Option<String>,
+        #[arg(long)]
         mock_script: Option<String>,
         /// Load skill packages from a source directory. Repeat to add multiple sources.
         #[arg(long = "skills-source")]
         skills_source: Vec<String>,
+        /// Use a file-backed skill registry directory.
+        #[arg(long = "skill-registry")]
+        skill_registry: Option<String>,
+        /// Explicitly pin one or more skills by `name` or `name@version`.
+        #[arg(long = "skill")]
+        skill: Vec<String>,
+        /// Explicitly disable one or more skills by `name` or `name@version`.
+        #[arg(long = "disable-skill")]
+        disable_skill: Vec<String>,
+        /// Skill selection mode: `auto`, `manual`, or `off`.
+        #[arg(long = "skill-select")]
+        skill_select: Option<String>,
+        /// Maximum number of active skills exposed to the provider.
+        #[arg(long = "skill-max-active")]
+        skill_max_active: Option<usize>,
+        /// Emit skill selection events to stderr alongside the normal run result.
+        #[arg(long, default_value_t = false)]
+        explain_skills: bool,
+        /// Recompute the sticky thread snapshot instead of reusing it.
+        #[arg(long, default_value_t = false)]
+        refresh_skill_snapshot: bool,
         /// Skip invalid skill sources or packages instead of failing fast.
         #[arg(long, default_value_t = false)]
         skills_skip_invalid: bool,
@@ -157,6 +180,127 @@ enum SkillCmd {
         /// Load skills from a source directory. Repeat to list multiple sources.
         #[arg(long = "source")]
         sources: Vec<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Install source packages into the local file-backed skill registry.
+    Install {
+        /// Load skills from a source directory. Repeat to install multiple sources.
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Show registry entries, lifecycle state, and governance diagnostics.
+    Status {
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Show all installed versions for a skill name.
+    Versions {
+        /// Skill name to inspect.
+        name: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Enable one or more installed skill versions.
+    Enable {
+        /// `name` or `name@version`.
+        identity: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Disable one or more installed skill versions.
+    Disable {
+        /// `name` or `name@version`.
+        identity: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Quarantine an installed skill version.
+    Quarantine {
+        /// `name@version`.
+        identity: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Optional quarantine reason recorded in the registry.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Remove one installed skill version from the registry.
+    Remove {
+        /// `name@version`.
+        identity: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Resolve the effective skill snapshot for one input without running the model.
+    Resolve {
+        /// Input text used for deterministic selection.
+        #[arg(long)]
+        input: String,
+        /// Override the registry path. Defaults to `<root>/.deepagents/skills`.
+        #[arg(long = "registry")]
+        registry: Option<String>,
+        /// Load source overlays for this resolution only.
+        #[arg(long = "source")]
+        sources: Vec<String>,
+        /// Explicitly pin one or more skills by `name` or `name@version`.
+        #[arg(long = "skill")]
+        skill: Vec<String>,
+        /// Explicitly disable one or more skills by `name` or `name@version`.
+        #[arg(long = "disable-skill")]
+        disable_skill: Vec<String>,
+        /// Skill selection mode: `auto`, `manual`, or `off`.
+        #[arg(long = "skill-select")]
+        skill_select: Option<String>,
+        /// Maximum number of active skills exposed to the provider.
+        #[arg(long = "skill-max-active")]
+        skill_max_active: Option<usize>,
+        /// Recompute the sticky snapshot instead of reusing prior state.
+        #[arg(long, default_value_t = false)]
+        refresh_skill_snapshot: bool,
+        /// Pretty-print the JSON result.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
+    },
+    /// Show the persisted skill audit record for one thread.
+    Audit {
+        /// Thread ID to inspect.
+        #[arg(long = "thread-id")]
+        thread_id: String,
+        /// Root directory containing `.deepagents/skills/audit`.
+        #[arg(long)]
+        root: Option<String>,
         /// Pretty-print the JSON result.
         #[arg(long, default_value_t = false)]
         pretty: bool,
@@ -515,8 +659,16 @@ async fn main() -> Result<()> {
             structured_output_name,
             structured_output_description,
             thread_id,
+            state_file,
             mock_script,
             skills_source,
+            skill_registry,
+            skill,
+            disable_skill,
+            skill_select,
+            skill_max_active,
+            explain_skills,
+            refresh_skill_snapshot,
             skills_skip_invalid,
             memory_source,
             memory_allow_host_paths,
@@ -639,16 +791,39 @@ async fn main() -> Result<()> {
                 );
             }
 
-            if !skills_source.is_empty() {
+            let skill_selection_mode = parse_skill_selection_mode(skill_select.as_deref())?;
+            let skill_registry_dir = resolve_run_skill_registry_dir(
+                &root,
+                skill_registry.as_deref(),
+                !skill.is_empty() || !disable_skill.is_empty(),
+            );
+            let enable_skill_runtime = !skills_source.is_empty()
+                || skill_registry_dir.is_some()
+                || !skill.is_empty()
+                || !disable_skill.is_empty()
+                || refresh_skill_snapshot
+                || skill_max_active.is_some()
+                || skill_selection_mode != deepagents::skills::selection::SkillSelectionMode::Off;
+            if enable_skill_runtime {
                 let options = deepagents::skills::loader::SkillsLoadOptions {
                     skip_invalid_sources: skills_skip_invalid,
                     strict: true,
+                    allow_versionless_compat: true,
                 };
+                let mut middleware =
+                    deepagents::runtime::SkillsMiddleware::new(skills_source, options)
+                        .with_explicit_skills(skill)
+                        .with_disabled_skills(disable_skill)
+                        .with_selection_mode(skill_selection_mode)
+                        .with_refresh_snapshot(refresh_skill_snapshot);
+                if let Some(skill_registry_dir) = skill_registry_dir {
+                    middleware = middleware.with_registry_dir(skill_registry_dir);
+                }
+                if let Some(skill_max_active) = skill_max_active {
+                    middleware = middleware.with_max_active(skill_max_active);
+                }
                 let skills_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
-                    std::sync::Arc::new(deepagents::runtime::SkillsMiddleware::new(
-                        skills_source,
-                        options,
-                    ));
+                    std::sync::Arc::new(middleware);
                 asm.push(
                     deepagents::runtime::RuntimeMiddlewareSlot::Skills,
                     "skills",
@@ -749,12 +924,11 @@ async fn main() -> Result<()> {
 
             let runtime_middlewares = asm.build()?;
 
-            let mut initial_state = deepagents::state::AgentState::default();
-            if let Some(tid) = thread_id {
-                initial_state
-                    .extra
-                    .insert("thread_id".to_string(), serde_json::Value::String(tid));
-            }
+            let mut initial_state = state_file
+                .as_deref()
+                .and_then(load_state)
+                .unwrap_or_default();
+            let thread_id = ensure_cli_thread_id(&mut initial_state, thread_id.as_deref());
 
             let mut interrupt_on_map = std::collections::BTreeMap::new();
             for t in interrupt_on {
@@ -789,11 +963,11 @@ async fn main() -> Result<()> {
             }
 
             runner.push_user_input(input);
-            let use_event_stream = events_jsonl.is_some() || stream_events;
+            let use_event_stream = events_jsonl.is_some() || stream_events || explain_skills;
             let mut event_sink = if use_event_stream {
                 Some(CliRunEventSink::new(
                     events_jsonl.as_deref(),
-                    stream_events,
+                    stream_events || explain_skills,
                 )?)
             } else {
                 None
@@ -862,6 +1036,15 @@ async fn main() -> Result<()> {
                     };
                 }
             } else if out.status == deepagents::runtime::RunStatus::Interrupted {
+                persist_run_state_and_skill_audit(
+                    state_file.as_deref(),
+                    &root,
+                    &thread_id,
+                    &out.state,
+                    out.trace.as_ref(),
+                    out.status,
+                    out.error.as_ref(),
+                )?;
                 if pretty {
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 } else {
@@ -871,6 +1054,15 @@ async fn main() -> Result<()> {
             }
 
             let ok = out.error.is_none() && out.status == deepagents::runtime::RunStatus::Completed;
+            persist_run_state_and_skill_audit(
+                state_file.as_deref(),
+                &root,
+                &thread_id,
+                &out.state,
+                out.trace.as_ref(),
+                out.status,
+                out.error.as_ref(),
+            )?;
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -898,6 +1090,133 @@ async fn main() -> Result<()> {
                     pretty,
                     load_skills_from_sources(&sources)
                         .map(|loaded| build_skill_report("list", loaded)),
+                )?;
+            }
+            SkillCmd::Install {
+                sources,
+                registry,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "install",
+                    pretty,
+                    skill_install_command(&root, registry.as_deref(), &sources),
+                )?;
+            }
+            SkillCmd::Status { registry, pretty } => {
+                handle_skill_command(
+                    "status",
+                    pretty,
+                    skill_status_command(&root, registry.as_deref()),
+                )?;
+            }
+            SkillCmd::Versions {
+                name,
+                registry,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "versions",
+                    pretty,
+                    skill_versions_command(&root, registry.as_deref(), &name),
+                )?;
+            }
+            SkillCmd::Enable {
+                identity,
+                registry,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "enable",
+                    pretty,
+                    skill_lifecycle_command(
+                        &root,
+                        registry.as_deref(),
+                        "enable",
+                        &identity,
+                        deepagents::skills::SkillLifecycleState::Enabled,
+                        None,
+                    ),
+                )?;
+            }
+            SkillCmd::Disable {
+                identity,
+                registry,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "disable",
+                    pretty,
+                    skill_lifecycle_command(
+                        &root,
+                        registry.as_deref(),
+                        "disable",
+                        &identity,
+                        deepagents::skills::SkillLifecycleState::Disabled,
+                        Some("disabled_by_cli".to_string()),
+                    ),
+                )?;
+            }
+            SkillCmd::Quarantine {
+                identity,
+                registry,
+                reason,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "quarantine",
+                    pretty,
+                    skill_quarantine_command(&root, registry.as_deref(), &identity, reason),
+                )?;
+            }
+            SkillCmd::Remove {
+                identity,
+                registry,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "remove",
+                    pretty,
+                    skill_remove_command(&root, registry.as_deref(), &identity),
+                )?;
+            }
+            SkillCmd::Resolve {
+                input,
+                registry,
+                sources,
+                skill,
+                disable_skill,
+                skill_select,
+                skill_max_active,
+                refresh_skill_snapshot,
+                pretty,
+            } => {
+                handle_skill_command(
+                    "resolve",
+                    pretty,
+                    skill_resolve_command(
+                        &root,
+                        registry.as_deref(),
+                        &input,
+                        &sources,
+                        &skill,
+                        &disable_skill,
+                        skill_select.as_deref(),
+                        skill_max_active,
+                        refresh_skill_snapshot,
+                    ),
+                )?;
+            }
+            SkillCmd::Audit {
+                thread_id,
+                root: audit_root,
+                pretty,
+            } => {
+                let audit_root = audit_root.unwrap_or(root.clone());
+                handle_skill_command(
+                    "audit",
+                    pretty,
+                    skill_audit_command(&audit_root, &thread_id),
                 )?;
             }
         },
@@ -1062,8 +1381,418 @@ fn load_skills_from_sources(sources: &[String]) -> Result<deepagents::skills::Lo
     let options = deepagents::skills::loader::SkillsLoadOptions {
         skip_invalid_sources: false,
         strict: true,
+        allow_versionless_compat: true,
     };
     deepagents::skills::loader::load_skills(sources, options)
+}
+
+/// Returns the default file-backed registry directory rooted under the current
+/// workspace.
+fn default_skill_registry_dir(root: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(root)
+        .join(".deepagents")
+        .join("skills")
+}
+
+/// Resolves the registry path for registry-manipulating CLI commands.
+fn resolve_skill_registry_dir(root: &str, registry: Option<&str>) -> std::path::PathBuf {
+    registry
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| default_skill_registry_dir(root))
+}
+
+/// Resolves the optional registry path for run-time skill resolution.
+fn resolve_run_skill_registry_dir(
+    root: &str,
+    registry: Option<&str>,
+    force_default: bool,
+) -> Option<String> {
+    let path = resolve_skill_registry_dir(root, registry);
+    if registry.is_some() || force_default || path.exists() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    None
+}
+
+/// Parses the CLI-facing selection mode onto the library enum.
+fn parse_skill_selection_mode(
+    value: Option<&str>,
+) -> Result<deepagents::skills::selection::SkillSelectionMode> {
+    match value.unwrap_or("auto") {
+        "auto" => Ok(deepagents::skills::selection::SkillSelectionMode::Auto),
+        "manual" => Ok(deepagents::skills::selection::SkillSelectionMode::Manual),
+        "off" => Ok(deepagents::skills::selection::SkillSelectionMode::Off),
+        other => Err(anyhow!(
+            "invalid_arguments: --skill-select must be one of auto|manual|off, got {other}"
+        )),
+    }
+}
+
+/// Builds a stable registry summary used by `skill install`, `skill status`,
+/// and `skill versions`.
+fn registry_summary_json(
+    entries: &[deepagents::skills::SkillRegistryEntry],
+    loaded: &deepagents::skills::LoadedSkills,
+) -> serde_json::Value {
+    let enabled = entries
+        .iter()
+        .filter(|entry| entry.lifecycle == deepagents::skills::SkillLifecycleState::Enabled)
+        .count();
+    let disabled = entries
+        .iter()
+        .filter(|entry| entry.lifecycle == deepagents::skills::SkillLifecycleState::Disabled)
+        .count();
+    let quarantined = entries
+        .iter()
+        .filter(|entry| entry.lifecycle == deepagents::skills::SkillLifecycleState::Quarantined)
+        .count();
+    serde_json::json!({
+        "entries": entries.len(),
+        "enabled": enabled,
+        "disabled": disabled,
+        "quarantined": quarantined,
+        "skills": loaded.metadata.len(),
+        "tools": loaded.tools.len(),
+        "diagnostics": loaded.diagnostics.records.len(),
+    })
+}
+
+/// Implements `skill install`.
+fn skill_install_command(
+    root: &str,
+    registry: Option<&str>,
+    sources: &[String],
+) -> Result<serde_json::Value> {
+    if sources.is_empty() {
+        return Err(anyhow!("invalid_arguments: --source is required"));
+    }
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let report = deepagents::skills::registry::install_sources_into_registry(
+        sources,
+        &registry_dir,
+        deepagents::skills::loader::SkillsLoadOptions {
+            skip_invalid_sources: false,
+            strict: true,
+            allow_versionless_compat: false,
+        },
+    )?;
+    let status = deepagents::skills::registry::registry_status(&registry_dir)?;
+    let loaded = deepagents::skills::registry::registry_loaded_skills(&registry_dir)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "install",
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "summary": registry_summary_json(&status, &loaded),
+        "installed": report.installed,
+        "unchanged": report.unchanged,
+        "entries": status,
+        "diagnostics": loaded.diagnostics,
+    }))
+}
+
+/// Implements `skill status`.
+fn skill_status_command(root: &str, registry: Option<&str>) -> Result<serde_json::Value> {
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let status = deepagents::skills::registry::registry_status(&registry_dir)?;
+    let loaded = deepagents::skills::registry::registry_loaded_skills(&registry_dir)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "status",
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "summary": registry_summary_json(&status, &loaded),
+        "entries": status,
+        "diagnostics": loaded.diagnostics,
+    }))
+}
+
+/// Implements `skill versions`.
+fn skill_versions_command(
+    root: &str,
+    registry: Option<&str>,
+    name: &str,
+) -> Result<serde_json::Value> {
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let versions = deepagents::skills::registry::registry_versions(&registry_dir, name)?;
+    let loaded = deepagents::skills::registry::registry_loaded_skills(&registry_dir)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "versions",
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "name": name,
+        "summary": registry_summary_json(&versions, &loaded),
+        "versions": versions,
+    }))
+}
+
+/// Blocks lifecycle transitions that would violate governance invariants.
+fn validate_registry_lifecycle_transition(
+    root: &str,
+    registry: Option<&str>,
+    identity: &(String, Option<String>),
+    lifecycle: deepagents::skills::SkillLifecycleState,
+) -> Result<()> {
+    if lifecycle != deepagents::skills::SkillLifecycleState::Enabled {
+        return Ok(());
+    }
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let entries = deepagents::skills::registry::registry_status(&registry_dir)?;
+    let violating = entries.into_iter().find(|entry| {
+        entry.identity.name == identity.0
+            && identity
+                .1
+                .as_deref()
+                .is_none_or(|value| value == entry.identity.version)
+            && entry.governance.status == deepagents::skills::SkillGovernanceStatus::Fail
+    });
+    if let Some(entry) = violating {
+        return Err(anyhow!(
+            "governance_blocked: {} cannot be enabled because semantic review failed",
+            entry.identity.as_key()
+        ));
+    }
+    Ok(())
+}
+
+/// Implements `skill enable` and `skill disable`.
+fn skill_lifecycle_command(
+    root: &str,
+    registry: Option<&str>,
+    command: &'static str,
+    identity: &str,
+    lifecycle: deepagents::skills::SkillLifecycleState,
+    reason: Option<String>,
+) -> Result<serde_json::Value> {
+    let parsed = deepagents::skills::registry::parse_identity_token(identity)?;
+    validate_registry_lifecycle_transition(root, registry, &parsed, lifecycle)?;
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let changed = deepagents::skills::registry::set_registry_lifecycle(
+        &registry_dir,
+        &parsed.0,
+        parsed.1.as_deref(),
+        lifecycle,
+        reason,
+    )?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": command,
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "changed": changed,
+    }))
+}
+
+/// Implements `skill quarantine`.
+fn skill_quarantine_command(
+    root: &str,
+    registry: Option<&str>,
+    identity: &str,
+    reason: Option<String>,
+) -> Result<serde_json::Value> {
+    let parsed = deepagents::skills::registry::parse_identity_token(identity)?;
+    let Some(version) = parsed.1.as_deref() else {
+        return Err(anyhow!(
+            "invalid_arguments: skill quarantine requires name@version"
+        ));
+    };
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let changed = deepagents::skills::registry::set_registry_lifecycle(
+        &registry_dir,
+        &parsed.0,
+        Some(version),
+        deepagents::skills::SkillLifecycleState::Quarantined,
+        Some(reason.unwrap_or_else(|| "quarantined_by_cli".to_string())),
+    )?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "quarantine",
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "changed": changed,
+    }))
+}
+
+/// Implements `skill remove`.
+fn skill_remove_command(
+    root: &str,
+    registry: Option<&str>,
+    identity: &str,
+) -> Result<serde_json::Value> {
+    let parsed = deepagents::skills::registry::parse_identity_token(identity)?;
+    let Some(version) = parsed.1.as_deref() else {
+        return Err(anyhow!("invalid_arguments: skill remove requires name@version"));
+    };
+    let registry_dir = resolve_skill_registry_dir(root, registry);
+    let removed =
+        deepagents::skills::registry::remove_registry_entry(&registry_dir, &parsed.0, version)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "remove",
+        "registry": registry_dir.to_string_lossy().to_string(),
+        "removed": removed,
+    }))
+}
+
+/// Implements `skill resolve`.
+fn skill_resolve_command(
+    root: &str,
+    registry: Option<&str>,
+    input: &str,
+    sources: &[String],
+    skills: &[String],
+    disabled_skills: &[String],
+    skill_select: Option<&str>,
+    skill_max_active: Option<usize>,
+    refresh_skill_snapshot: bool,
+) -> Result<serde_json::Value> {
+    let registry_dir =
+        resolve_run_skill_registry_dir(root, registry, !skills.is_empty() || !disabled_skills.is_empty());
+    let mut diagnostics = deepagents::skills::SkillsDiagnostics::default();
+    if let Some(registry_dir) = registry_dir.as_deref() {
+        let loaded =
+            deepagents::skills::registry::registry_loaded_skills(std::path::Path::new(registry_dir))?;
+        diagnostics.records.extend(loaded.diagnostics.records);
+        diagnostics.overrides.extend(loaded.diagnostics.overrides);
+    }
+    if !sources.is_empty() {
+        let loaded = load_skills_from_sources(sources)?;
+        diagnostics.sources.extend(loaded.diagnostics.sources);
+        diagnostics.records.extend(loaded.diagnostics.records);
+        diagnostics.overrides.extend(loaded.diagnostics.overrides);
+    }
+
+    let message = deepagents::types::Message {
+        role: "user".to_string(),
+        content: input.to_string(),
+        content_blocks: None,
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        status: None,
+    };
+    let snapshot = deepagents::skills::selection::resolve_skill_snapshot(
+        &[message],
+        &deepagents::state::AgentState::default(),
+        &deepagents::skills::selection::SkillResolverOptions {
+            registry_dir,
+            sources: sources.to_vec(),
+            source_options: deepagents::skills::loader::SkillsLoadOptions {
+                skip_invalid_sources: false,
+                strict: true,
+                allow_versionless_compat: true,
+            },
+            explicit_skills: skills.to_vec(),
+            disabled_skills: disabled_skills.to_vec(),
+            selection_mode: parse_skill_selection_mode(skill_select)?,
+            max_active: skill_max_active.unwrap_or(3).max(1),
+            refresh_snapshot: refresh_skill_snapshot,
+        },
+    )?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "resolve",
+        "summary": {
+            "selected": snapshot.as_ref().map(|value| value.selection.selected.len()).unwrap_or(0),
+            "skipped": snapshot.as_ref().map(|value| value.selection.skipped.len()).unwrap_or(0),
+            "candidates": snapshot.as_ref().map(|value| value.selection.candidates.len()).unwrap_or(0),
+        },
+        "snapshot": snapshot,
+        "diagnostics": diagnostics,
+    }))
+}
+
+/// Returns the persisted audit file path for one thread.
+fn skill_audit_path(root: &str, thread_id: &str) -> std::path::PathBuf {
+    default_skill_registry_dir(root)
+        .join("audit")
+        .join(format!("{thread_id}.json"))
+}
+
+/// Implements `skill audit`.
+fn skill_audit_command(root: &str, thread_id: &str) -> Result<serde_json::Value> {
+    let path = skill_audit_path(root, thread_id);
+    if !path.exists() {
+        return Err(anyhow!("audit_not_found: {}", path.display()));
+    }
+    let bytes = std::fs::read(&path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "command": "audit",
+        "thread_id": thread_id,
+        "path": path.to_string_lossy().to_string(),
+        "record": value,
+    }))
+}
+
+/// Ensures every CLI `run` invocation carries a stable thread ID in state.
+fn ensure_cli_thread_id(state: &mut deepagents::state::AgentState, explicit: Option<&str>) -> String {
+    if let Some(thread_id) = explicit {
+        state.extra.insert(
+            "thread_id".to_string(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        return thread_id.to_string();
+    }
+    if let Some(thread_id) = state.extra.get("thread_id").and_then(|value| value.as_str()) {
+        return thread_id.to_string();
+    }
+    let generated = format!("thread-{}", now_ms());
+    state.extra.insert(
+        "thread_id".to_string(),
+        serde_json::Value::String(generated.clone()),
+    );
+    generated
+}
+
+/// Persists run state and writes a thread-scoped skill audit record whenever a
+/// run produced skill-selection data.
+fn persist_run_state_and_skill_audit(
+    state_file: Option<&str>,
+    root: &str,
+    thread_id: &str,
+    state: &deepagents::state::AgentState,
+    trace: Option<&serde_json::Value>,
+    status: deepagents::runtime::RunStatus,
+    error: Option<&deepagents::runtime::RuntimeError>,
+) -> Result<()> {
+    if let Some(state_file) = state_file {
+        save_state(state_file, state)?;
+    }
+    let snapshot = state
+        .extra
+        .get(deepagents::skills::SKILLS_SNAPSHOT_KEY)
+        .cloned();
+    let selection = state
+        .extra
+        .get(deepagents::skills::SKILLS_SELECTION_KEY)
+        .cloned();
+    let diagnostics = state
+        .extra
+        .get(deepagents::skills::SKILLS_DIAGNOSTICS_KEY)
+        .cloned();
+    let trace_skills = trace.and_then(|trace| trace.get("skills")).cloned();
+    if snapshot.is_none() && selection.is_none() && diagnostics.is_none() && trace_skills.is_none() {
+        return Ok(());
+    }
+
+    let path = skill_audit_path(root, thread_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::json!({
+        "timestamp_ms": now_ms(),
+        "thread_id": thread_id,
+        "root": root,
+        "status": status,
+        "error": error,
+        "trace": {
+            "skills": trace_skills,
+        },
+        "snapshot": snapshot,
+        "selection": selection,
+        "diagnostics": diagnostics,
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(())
 }
 
 /// Prints a structured JSON result for a skill command and exits with a stable
@@ -1106,6 +1835,21 @@ fn classify_skill_command_error(error: &anyhow::Error) -> &'static str {
     }
     if message.starts_with("invalid_arguments:") {
         return "invalid_arguments";
+    }
+    if message.starts_with("invalid_identity:") {
+        return "invalid_identity";
+    }
+    if message.starts_with("registry_conflict:") {
+        return "registry_conflict";
+    }
+    if message.starts_with("registry_entry_not_found:") {
+        return "registry_entry_not_found";
+    }
+    if message.starts_with("audit_not_found:") {
+        return "audit_not_found";
+    }
+    if message.starts_with("governance_blocked:") {
+        return "governance_blocked";
     }
     if message.contains("tool_conflict_with_core:") {
         return "tool_conflict_with_core";
@@ -1173,7 +1917,7 @@ fn init_skill_template(dir: &str) -> Result<serde_json::Value> {
     }
     std::fs::create_dir_all(&path)?;
     let skill_md = format!(
-        "---\nname: {name}\ndescription: Describe what this skill does and when to use it.\n---\n\n# {name}\n\n## When to Use\n- \n\n## Steps\n- \n",
+        "---\nname: {name}\nversion: 0.1.0\ndescription: Describe what this skill does and when to use it.\nallowed-tools: []\ntriggers:\n  keywords: []\nrisk-level: low\ndefault-enabled: true\nrequires-isolation: false\n---\n\n# {name}\n\n## Role\nDescribe the role this skill should play.\n\n## When to Use\n- Describe the requests that should activate this skill.\n\n## Inputs\n- Describe required inputs and assumptions.\n\n## Constraints\n- Describe policy, safety, and correctness constraints.\n\n## Workflow\n1. Describe the ordered workflow.\n\n## Output\n- Describe the expected output contract.\n\n## Examples\n- Add short examples that improve routing.\n\n## References\n- Add optional reference notes or package assets.\n",
     );
     let tools_json = serde_json::json!({
         "tools": [{
@@ -1251,6 +1995,11 @@ fn load_state(path: &str) -> Option<deepagents::state::AgentState> {
 }
 
 fn save_state(path: &str, state: &deepagents::state::AgentState) -> Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let bytes = serde_json::to_vec_pretty(state)?;
     std::fs::write(path, bytes)?;
     Ok(())

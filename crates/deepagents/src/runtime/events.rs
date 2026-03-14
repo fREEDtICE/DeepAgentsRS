@@ -36,6 +36,24 @@ pub enum RunEvent {
     RunStarted {
         resumed_from_interrupt: bool,
     },
+    SkillSelectionStarted {
+        selected_count: usize,
+        skipped_count: usize,
+    },
+    SkillSelected {
+        name: String,
+        version: String,
+        execution_mode: String,
+    },
+    SkillSkipped {
+        name: String,
+        version: String,
+        reason: String,
+    },
+    SkillQuarantined {
+        name: String,
+        version: String,
+    },
     ModelRequestBuilt {
         step_index: usize,
         tool_names: Vec<String>,
@@ -61,6 +79,13 @@ pub enum RunEvent {
         tool_call_id: String,
         arguments_preview: Value,
     },
+    SkillToolCallStarted {
+        step_index: usize,
+        skill_name: String,
+        skill_version: String,
+        tool_name: String,
+        tool_call_id: String,
+    },
     ToolCallArgsDelta {
         step_index: usize,
         tool_call_id: String,
@@ -75,6 +100,15 @@ pub enum RunEvent {
         error: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+    },
+    SkillToolCallFinished {
+        step_index: usize,
+        skill_name: String,
+        skill_version: String,
+        tool_name: String,
+        tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     ToolMessageAppended {
         step_index: usize,

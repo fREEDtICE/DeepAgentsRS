@@ -4,39 +4,47 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use semver::Version;
 use serde::Deserialize;
+use walkdir::WalkDir;
 
-use crate::skills::{SkillMetadata, SkillToolPolicy, SkillToolSpec, SkillToolStep};
+use crate::skills::{
+    default_compat_skill_version, SkillFragmentSet, SkillGovernanceFinding, SkillGovernanceOutcome,
+    SkillGovernanceSeverity, SkillIdentity, SkillManifest, SkillMetadata, SkillPackage,
+    SkillRiskLevel, SkillToolPolicy, SkillToolSpec, SkillToolStep, SkillTriggerHints,
+};
 
 const MAX_SKILL_FILE_SIZE: u64 = 10 * 1024 * 1024;
 const RUNTIME_ONLY_PACKAGE_STEP_TOOLS: [&str; 3] = ["task", "compact_conversation", "write_todos"];
 
-#[derive(Debug, Clone)]
 /// Controls how strictly package frontmatter is validated during loading.
+#[derive(Debug, Clone)]
 pub struct SkillValidationOptions {
+    /// Whether unknown fields should fail fast.
     pub strict: bool,
+    /// Whether versionless packages should be normalized to `0.0.0-dev`.
+    pub allow_versionless_compat: bool,
 }
 
 impl Default for SkillValidationOptions {
     fn default() -> Self {
-        Self { strict: true }
+        Self {
+            strict: true,
+            allow_versionless_compat: true,
+        }
     }
-}
-
-#[derive(Debug, Clone)]
-/// Represents a validated package skill with metadata and executable tools.
-pub struct SkillPackage {
-    pub metadata: SkillMetadata,
-    pub tools: Vec<SkillToolSpec>,
 }
 
 /// Classifies a package-skill step according to the runtime policy boundary
 /// that must guard it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageSkillStepKind {
+    /// Tool is owned directly by the base agent tool registry.
     AgentOwned,
+    /// Tool touches the filesystem and requires `allow_filesystem`.
     Filesystem,
+    /// Tool is `execute` and requires `allow_execute`.
     Execute,
 }
 
@@ -83,39 +91,39 @@ pub fn load_skill_dir(
     source: &str,
     options: SkillValidationOptions,
 ) -> Result<SkillPackage> {
-    validate_dir_safety(path).map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error))?;
+    validate_dir_safety(path).map_err(|error| anyhow!("{}: {}", path.display(), error))?;
     let skill_md = path.join("SKILL.md");
     if !skill_md.exists() {
-        return Err(anyhow::anyhow!("{}: missing SKILL.md", skill_md.display()));
+        return Err(anyhow!("{}: missing SKILL.md", skill_md.display()));
     }
     let md_meta = std::fs::metadata(&skill_md)
-        .map_err(|error| anyhow::anyhow!("{}: {}", skill_md.display(), error))?;
+        .map_err(|error| anyhow!("{}: {}", skill_md.display(), error))?;
     if md_meta.len() > MAX_SKILL_FILE_SIZE {
-        return Err(anyhow::anyhow!(
-            "{}: SKILL.md too large",
-            skill_md.display()
-        ));
+        return Err(anyhow!("{}: SKILL.md too large", skill_md.display()));
     }
+
     let content = std::fs::read_to_string(&skill_md)
-        .map_err(|error| anyhow::anyhow!("{}: {}", skill_md.display(), error))?;
-    let frontmatter = parse_frontmatter(&content)
-        .map_err(|error| anyhow::anyhow!("{}: frontmatter: {}", skill_md.display(), error))?;
-    let metadata = build_metadata(frontmatter, path, source, options.strict)
-        .map_err(|error| anyhow::anyhow!("{}: {}", skill_md.display(), error))?;
+        .map_err(|error| anyhow!("{}: {}", skill_md.display(), error))?;
+    let (frontmatter, body) = parse_frontmatter_and_body(&content)
+        .map_err(|error| anyhow!("{}: frontmatter: {}", skill_md.display(), error))?;
+    let (manifest, compat_versionless) = build_manifest(frontmatter, path, source, &options)
+        .map_err(|error| anyhow!("{}: {}", skill_md.display(), error))?;
+    let mut fragments = extract_fragments(body);
+    fragments.assets = discover_asset_paths(path)?;
 
     let tools_json = path.join("tools.json");
     let tools = if tools_json.exists() {
         let raw = std::fs::read(&tools_json)
-            .map_err(|error| anyhow::anyhow!("{}: {}", tools_json.display(), error))?;
+            .map_err(|error| anyhow!("{}: {}", tools_json.display(), error))?;
         let file: ToolsFile = serde_json::from_slice(&raw)
-            .map_err(|error| anyhow::anyhow!("{}: {}", tools_json.display(), error))?;
+            .map_err(|error| anyhow!("{}: {}", tools_json.display(), error))?;
         file.tools
             .into_iter()
             .enumerate()
             .map(|(index, tool)| {
                 let tool_name = tool.name.clone();
-                to_tool_spec(tool, &metadata).map_err(|error| {
-                    anyhow::anyhow!(
+                to_tool_spec(tool, &manifest).map_err(|error| {
+                    anyhow!(
                         "{}: tools[{index}] ({tool_name}): {}",
                         tools_json.display(),
                         error
@@ -127,7 +135,24 @@ pub fn load_skill_dir(
         Vec::new()
     };
 
-    Ok(SkillPackage { metadata, tools })
+    let mut governance = SkillGovernanceOutcome::default();
+    if compat_versionless {
+        governance.findings.push(SkillGovernanceFinding {
+            code: "compat_versionless".to_string(),
+            message: "versionless package normalized to 0.0.0-dev in source compatibility mode"
+                .to_string(),
+            severity: SkillGovernanceSeverity::Warn,
+        });
+        governance.canonicalize();
+    }
+
+    Ok(SkillPackage {
+        metadata: SkillMetadata::from(&manifest),
+        manifest,
+        fragments,
+        tools,
+        governance,
+    })
 }
 
 /// Validates the supported subset of JSON Schema accepted for package-skill
@@ -135,20 +160,20 @@ pub fn load_skill_dir(
 pub fn validate_package_skill_input_schema(schema: &serde_json::Value) -> Result<()> {
     let schema_obj = schema
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("schema must be object"))?;
+        .ok_or_else(|| anyhow!("schema must be object"))?;
     let typ = schema_obj
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("object");
     if typ != "object" {
-        return Err(anyhow::anyhow!("schema type must be object"));
+        return Err(anyhow!("schema type must be object"));
     }
 
     let properties = match schema_obj.get("properties") {
         Some(value) => Some(
             value
                 .as_object()
-                .ok_or_else(|| anyhow::anyhow!("properties must be object"))?,
+                .ok_or_else(|| anyhow!("properties must be object"))?,
         ),
         None => None,
     };
@@ -161,23 +186,20 @@ pub fn validate_package_skill_input_schema(schema: &serde_json::Value) -> Result
     let required = parse_required_fields(schema_obj)?;
     if !required.is_empty() {
         let Some(properties) = properties else {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "required fields require properties definitions"
             ));
         };
         for key in required {
             if !properties.contains_key(&key) {
-                return Err(anyhow::anyhow!(
-                    "required field not declared in properties: {}",
-                    key
-                ));
+                return Err(anyhow!("required field not declared in properties: {}", key));
             }
         }
     }
 
     if let Some(value) = schema_obj.get("additionalProperties") {
         if !value.is_boolean() {
-            return Err(anyhow::anyhow!("additionalProperties must be boolean"));
+            return Err(anyhow!("additionalProperties must be boolean"));
         }
     }
 
@@ -194,17 +216,15 @@ pub fn validate_package_skill_input(
 
     let schema_obj = schema
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("schema must be object"))?;
+        .ok_or_else(|| anyhow!("schema must be object"))?;
     let input_obj = input
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("input must be object"))?;
-    let properties = schema_obj
-        .get("properties")
-        .and_then(|value| value.as_object());
+        .ok_or_else(|| anyhow!("input must be object"))?;
+    let properties = schema_obj.get("properties").and_then(|value| value.as_object());
     let required = parse_required_fields(schema_obj)?;
     for key in required {
         if !input_obj.contains_key(&key) {
-            return Err(anyhow::anyhow!("missing required field: {}", key));
+            return Err(anyhow!("missing required field: {}", key));
         }
     }
 
@@ -215,7 +235,7 @@ pub fn validate_package_skill_input(
     if !additional_properties {
         for key in input_obj.keys() {
             if properties.is_none_or(|properties| !properties.contains_key(key)) {
-                return Err(anyhow::anyhow!("unexpected field: {}", key));
+                return Err(anyhow!("unexpected field: {}", key));
             }
         }
     }
@@ -236,10 +256,10 @@ pub fn validate_package_skill_input(
 pub fn classify_package_skill_step_tool(name: &str) -> Result<PackageSkillStepKind> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(anyhow::anyhow!("step tool_name required"));
+        return Err(anyhow!("step tool_name required"));
     }
     if RUNTIME_ONLY_PACKAGE_STEP_TOOLS.contains(&name) {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "skill_step_not_supported: runtime-only tool {} cannot be used in package skills",
             name
         ));
@@ -258,358 +278,411 @@ pub fn classify_package_skill_step_tool(name: &str) -> Result<PackageSkillStepKi
 fn validate_dir_safety(path: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
-        return Err(anyhow::anyhow!("symlink not allowed"));
+        return Err(anyhow!("symlink not allowed"));
     }
     Ok(())
 }
 
-/// Extracts the YAML frontmatter used to define package skill metadata.
-fn parse_frontmatter(content: &str) -> Result<serde_yaml::Value> {
+fn parse_frontmatter_and_body(content: &str) -> Result<(serde_yaml::Value, &str)> {
     let mut lines = content.lines();
     let first = lines.next().unwrap_or("");
     if first.trim() != "---" {
-        return Err(anyhow::anyhow!("missing frontmatter"));
+        return Err(anyhow!("missing frontmatter"));
     }
     let mut yaml_lines = Vec::new();
+    let mut offset = first.len() + 1;
     for line in lines {
         if line.trim() == "---" {
             let yaml_str = yaml_lines.join("\n");
-            let v: serde_yaml::Value = serde_yaml::from_str(&yaml_str)?;
-            return Ok(v);
+            let value: serde_yaml::Value = serde_yaml::from_str(&yaml_str)?;
+            let body = &content[offset + line.len() + 1..];
+            return Ok((value, body));
         }
         yaml_lines.push(line.to_string());
+        offset += line.len() + 1;
     }
-    Err(anyhow::anyhow!("unterminated frontmatter"))
+    Err(anyhow!("unterminated frontmatter"))
 }
 
-/// Builds normalized skill metadata from parsed frontmatter.
-fn build_metadata(
+fn build_manifest(
     frontmatter: serde_yaml::Value,
     path: &Path,
     source: &str,
-    strict: bool,
-) -> Result<SkillMetadata> {
+    options: &SkillValidationOptions,
+) -> Result<(SkillManifest, bool)> {
     let map = frontmatter
         .as_mapping()
-        .ok_or_else(|| anyhow::anyhow!("frontmatter must be mapping"))?;
+        .ok_or_else(|| anyhow!("frontmatter must be mapping"))?;
 
     let name = get_str(map, "name")?;
+    validate_skill_name(&name)?;
+    let version = match get_opt_str(map, "version") {
+        Some(version) => {
+            Version::parse(&version).map_err(|error| anyhow!("invalid version: {error}"))?;
+            (version, false)
+        }
+        None if options.allow_versionless_compat => (default_compat_skill_version(), true),
+        None => return Err(anyhow!("missing required field: version")),
+    };
+
     let description = get_str(map, "description")?;
-    validate_skill_name(&name, path)?;
     validate_description(&description)?;
 
-    let license = get_opt_str(map, "license");
-    let compatibility = get_opt_str(map, "compatibility");
-    let metadata = get_metadata(map, "metadata")?;
-    let allowed_tools = get_allowed_tools(map, "allowed-tools")?;
-
-    if strict {
+    if options.strict {
         for key in map.keys() {
-            if let Some(k) = key.as_str() {
+            if let Some(key) = key.as_str() {
                 if !matches!(
-                    k,
+                    key,
                     "name"
+                        | "version"
                         | "description"
                         | "license"
                         | "compatibility"
                         | "metadata"
                         | "allowed-tools"
+                        | "triggers"
+                        | "risk-level"
+                        | "output-contract"
+                        | "default-enabled"
+                        | "requires-isolation"
                 ) {
-                    return Err(anyhow::anyhow!("unknown frontmatter field: {}", k));
+                    return Err(anyhow!("unknown frontmatter field: {}", key));
                 }
             }
         }
     }
 
-    Ok(SkillMetadata {
-        name,
+    let manifest = SkillManifest {
+        identity: SkillIdentity {
+            name,
+            version: version.0,
+        },
         description,
-        path: skill_md_path(path)?,
+        path: path.to_string_lossy().to_string(),
         source: source.to_string(),
-        license,
-        compatibility,
-        metadata,
-        allowed_tools,
+        license: get_opt_str(map, "license"),
+        compatibility: get_opt_str(map, "compatibility"),
+        metadata: get_metadata(map, "metadata")?,
+        allowed_tools: get_allowed_tools(map, "allowed-tools")?,
+        triggers: get_triggers(map, "triggers")?,
+        risk_level: get_risk_level(map, "risk-level")?,
+        output_contract: get_opt_str(map, "output-contract"),
+        default_enabled: get_opt_bool(map, "default-enabled").unwrap_or(true),
+        requires_isolation: get_opt_bool(map, "requires-isolation").unwrap_or(false),
+    };
+
+    Ok((manifest, version.1))
+}
+
+fn extract_fragments(body: &str) -> SkillFragmentSet {
+    let mut fragments = SkillFragmentSet::default();
+    let mut current: Option<&str> = None;
+    let mut buckets: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for line in body.lines() {
+        if let Some(section) = line.strip_prefix("## ") {
+            current = match section.trim() {
+                "Role" => Some("role"),
+                "When to Use" => Some("when_to_use"),
+                "Inputs" => Some("inputs"),
+                "Constraints" => Some("constraints"),
+                "Workflow" => Some("workflow"),
+                "Output" => Some("output"),
+                "Examples" => Some("examples"),
+                "References" => Some("references"),
+                _ => None,
+            };
+            continue;
+        }
+        if let Some(current) = current {
+            buckets.entry(current).or_default().push(line.to_string());
+        }
+    }
+    for (name, lines) in buckets {
+        let content = lines.join("\n").trim().to_string();
+        if content.is_empty() {
+            continue;
+        }
+        match name {
+            "role" => fragments.role = Some(content),
+            "when_to_use" => fragments.when_to_use = Some(content),
+            "inputs" => fragments.inputs = Some(content),
+            "constraints" => fragments.constraints = Some(content),
+            "workflow" => fragments.workflow = Some(content),
+            "output" => fragments.output = Some(content),
+            "examples" => fragments.examples = Some(content),
+            "references" => fragments.references = Some(content),
+            _ => {}
+        }
+    }
+    fragments
+}
+
+fn discover_asset_paths(root: &Path) -> Result<crate::skills::SkillAssetPaths> {
+    Ok(crate::skills::SkillAssetPaths {
+        references: collect_asset_dir(root, "references")?,
+        examples: collect_asset_dir(root, "examples")?,
+        templates: collect_asset_dir(root, "templates")?,
     })
 }
 
-/// Computes the canonical `SKILL.md` path recorded in metadata.
-fn skill_md_path(path: &Path) -> Result<String> {
-    Ok(path.join("SKILL.md").to_string_lossy().to_string())
-}
-
-/// Enforces the package skill naming rules and directory-name invariant.
-fn validate_skill_name(name: &str, path: &Path) -> Result<()> {
-    if name.is_empty() || name.len() > 64 {
-        return Err(anyhow::anyhow!("invalid name length"));
-    }
-    if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
-        return Err(anyhow::anyhow!("invalid name format"));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(anyhow::anyhow!("invalid name charset"));
-    }
-    let dir_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid skill dir"))?;
-    if dir_name != name {
-        return Err(anyhow::anyhow!("skill name must match directory"));
-    }
-    Ok(())
-}
-
-/// Enforces the package skill description length constraint.
-fn validate_description(desc: &str) -> Result<()> {
-    if desc.is_empty() || desc.len() > 1024 {
-        return Err(anyhow::anyhow!("invalid description length"));
-    }
-    Ok(())
-}
-
-/// Reads a required string field from package skill frontmatter.
-fn get_str(map: &serde_yaml::Mapping, key: &str) -> Result<String> {
-    let v = map
-        .get(serde_yaml::Value::String(key.to_string()))
-        .ok_or_else(|| anyhow::anyhow!("missing field: {}", key))?;
-    v.as_str()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("invalid field: {}", key))
-}
-
-/// Reads an optional trimmed string field from package skill frontmatter.
-fn get_opt_str(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(serde_yaml::Value::String(key.to_string()))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Parses the optional arbitrary metadata map from package skill frontmatter.
-fn get_metadata(map: &serde_yaml::Mapping, key: &str) -> Result<BTreeMap<String, String>> {
-    let Some(v) = map.get(serde_yaml::Value::String(key.to_string())) else {
-        return Ok(BTreeMap::new());
-    };
-    let Some(m) = v.as_mapping() else {
-        return Err(anyhow::anyhow!("metadata must be mapping"));
-    };
-    let mut out = BTreeMap::new();
-    for (k, v) in m {
-        let key = k
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("metadata key must be string"))?
-            .to_string();
-        let val = v
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("metadata value must be string"))?
-            .to_string();
-        out.insert(key, val);
-    }
-    Ok(out)
-}
-
-/// Parses the optional allowed-tools declaration into a normalized list.
-fn get_allowed_tools(map: &serde_yaml::Mapping, key: &str) -> Result<Vec<String>> {
-    let Some(v) = map.get(serde_yaml::Value::String(key.to_string())) else {
+fn collect_asset_dir(root: &Path, name: &str) -> Result<Vec<String>> {
+    let dir = root.join(name);
+    if !dir.exists() {
         return Ok(Vec::new());
-    };
-    if let Some(seq) = v.as_sequence() {
-        let mut out = Vec::new();
-        for item in seq {
-            let s = item
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("allowed-tools item must be string"))?;
-            out.push(s.to_string());
+    }
+    if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+        return Err(anyhow!("asset directory symlink not allowed: {}", dir.display()));
+    }
+    let mut out = WalkDir::new(&dir)
+        .follow_links(false)
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    out.sort_by(|a, b| a.path().cmp(b.path()));
+    let mut paths = Vec::new();
+    for entry in out {
+        if entry.file_type().is_dir() {
+            continue;
         }
-        return Ok(out);
+        if entry.file_type().is_symlink() {
+            return Err(anyhow!("asset symlink not allowed: {}", entry.path().display()));
+        }
+        let relative = entry.path().strip_prefix(root).map_err(|_| {
+            anyhow!("asset path escaped package root: {}", entry.path().display())
+        })?;
+        paths.push(relative.to_string_lossy().to_string());
     }
-    if let Some(s) = v.as_str() {
-        let parts = s
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        return Ok(parts);
-    }
-    Err(anyhow::anyhow!("allowed-tools must be list or string"))
+    Ok(paths)
 }
 
-/// Converts a parsed `tools.json` record into the runtime skill tool shape.
-fn to_tool_spec(tool: ToolFileSpec, metadata: &SkillMetadata) -> Result<SkillToolSpec> {
-    if tool.name.trim().is_empty() {
-        return Err(anyhow::anyhow!("tool name required"));
-    }
-    if tool.description.trim().is_empty() {
-        return Err(anyhow::anyhow!("tool description required"));
-    }
-    validate_package_skill_input_schema(&tool.input_schema)?;
-    let policy = resolve_policy(tool.policy);
-    let steps = tool
+fn to_tool_spec(file: ToolFileSpec, manifest: &SkillManifest) -> Result<SkillToolSpec> {
+    validate_package_skill_input_schema(&file.input_schema)?;
+
+    let policy = to_policy(file.policy);
+    let steps = file
         .steps
         .into_iter()
-        .map(|s| {
-            classify_package_skill_step_tool(&s.tool_name)?;
-            if !s.arguments.is_object() {
-                return Err(anyhow::anyhow!("step arguments must be object"));
+        .map(|step| {
+            classify_package_skill_step_tool(&step.tool_name)?;
+            if !step.arguments.is_object() {
+                return Err(anyhow!("step arguments must be object"));
             }
             Ok(SkillToolStep {
-                tool_name: s.tool_name.trim().to_string(),
-                arguments: s.arguments,
+                tool_name: step.tool_name,
+                arguments: step.arguments,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+
     Ok(SkillToolSpec {
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.input_schema,
+        name: file.name,
+        description: file.description,
+        input_schema: file.input_schema,
         steps,
         policy,
-        skill_name: metadata.name.clone(),
-        source: metadata.source.clone(),
+        skill_name: manifest.identity.name.clone(),
+        skill_version: manifest.identity.version.clone(),
+        source: manifest.source.clone(),
+        requires_isolation: manifest.requires_isolation,
+        subagent_type: manifest.metadata.get("subagent_type").cloned(),
     })
 }
 
-/// Applies package skill policy defaults and boundary normalization.
-fn resolve_policy(policy: Option<ToolPolicyFileSpec>) -> SkillToolPolicy {
-    let mut out = SkillToolPolicy::default();
-    if let Some(p) = policy {
-        if let Some(v) = p.allow_filesystem {
-            out.allow_filesystem = v;
+fn to_policy(value: Option<ToolPolicyFileSpec>) -> SkillToolPolicy {
+    let mut policy = SkillToolPolicy::default();
+    if let Some(value) = value {
+        if let Some(v) = value.allow_filesystem {
+            policy.allow_filesystem = v;
         }
-        if let Some(v) = p.allow_execute {
-            out.allow_execute = v;
+        if let Some(v) = value.allow_execute {
+            policy.allow_execute = v;
         }
-        if let Some(v) = p.allow_network {
-            out.allow_network = v;
+        if let Some(v) = value.allow_network {
+            policy.allow_network = v;
         }
-        if let Some(v) = p.max_steps {
-            out.max_steps = v.max(1);
+        if let Some(v) = value.max_steps {
+            policy.max_steps = v;
         }
-        if let Some(v) = p.timeout_ms {
-            out.timeout_ms = v.max(1);
+        if let Some(v) = value.timeout_ms {
+            policy.timeout_ms = v;
         }
-        if let Some(v) = p.max_output_chars {
-            out.max_output_chars = v.max(1);
+        if let Some(v) = value.max_output_chars {
+            policy.max_output_chars = v;
         }
     }
-    out
+    policy
 }
 
-/// Validates a single property schema inside the supported JSON Schema subset.
-fn validate_property_schema(name: &str, schema: &serde_json::Value) -> Result<()> {
-    let schema_obj = schema
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("property schema for {} must be object", name))?;
-    if let Some(typ) = schema_obj.get("type").and_then(|value| value.as_str()) {
-        validate_supported_schema_type(name, typ)?;
+fn validate_skill_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow!("name required"));
     }
-    if let Some(enum_values) = schema_obj.get("enum") {
-        let enum_values = enum_values
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("enum for {} must be array", name))?;
-        if enum_values.is_empty() {
-            return Err(anyhow::anyhow!("enum for {} must not be empty", name));
-        }
-        if let Some(typ) = schema_obj.get("type").and_then(|value| value.as_str()) {
-            for value in enum_values {
-                if !matches_schema_type(value, typ) {
-                    return Err(anyhow::anyhow!(
-                        "enum value for {} must match declared type {}",
-                        name,
-                        typ
-                    ));
-                }
-            }
-        }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(anyhow!(
+            "name must use lowercase ASCII letters, digits, and '-'"
+        ));
     }
     Ok(())
 }
 
-/// Parses the optional `required` array from an object schema.
-fn parse_required_fields(
-    schema_obj: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Vec<String>> {
-    let Some(required) = schema_obj.get("required") else {
-        return Ok(Vec::new());
+fn validate_description(description: &str) -> Result<()> {
+    if description.trim().is_empty() {
+        return Err(anyhow!("description required"));
+    }
+    Ok(())
+}
+
+fn get_str(map: &serde_yaml::Mapping, key: &str) -> Result<String> {
+    get_opt_str(map, key).ok_or_else(|| anyhow!("missing required field: {}", key))
+}
+
+fn get_opt_str(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    map.get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn get_opt_bool(map: &serde_yaml::Mapping, key: &str) -> Option<bool> {
+    map.get(serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_bool())
+}
+
+fn get_metadata(map: &serde_yaml::Mapping, key: &str) -> Result<BTreeMap<String, String>> {
+    let Some(value) = map.get(serde_yaml::Value::String(key.to_string())) else {
+        return Ok(BTreeMap::new());
     };
-    let required = required
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("required must be array"))?;
-    let mut out = Vec::with_capacity(required.len());
-    for item in required {
-        let item = item
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| anyhow!("{key} must be mapping"))?;
+    let mut out = BTreeMap::new();
+    for (key, value) in mapping {
+        let key = key
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("required must contain strings"))?;
-        out.push(item.to_string());
+            .ok_or_else(|| anyhow!("{key:?}: metadata key must be string"))?;
+        let value = match value {
+            serde_yaml::Value::String(value) => value.clone(),
+            serde_yaml::Value::Bool(value) => value.to_string(),
+            serde_yaml::Value::Number(value) => value.to_string(),
+            other => serde_yaml::to_string(other)?.trim().to_string(),
+        };
+        out.insert(key.to_string(), value);
     }
     Ok(out)
 }
 
-/// Validates a runtime input value against one property schema.
-fn validate_input_value(
-    name: &str,
-    property_schema: &serde_json::Value,
-    value: &serde_json::Value,
-) -> Result<()> {
-    let schema_obj = property_schema
+fn get_allowed_tools(map: &serde_yaml::Mapping, key: &str) -> Result<Vec<String>> {
+    let Some(value) = map.get(serde_yaml::Value::String(key.to_string())) else {
+        return Ok(Vec::new());
+    };
+    let sequence = value
+        .as_sequence()
+        .ok_or_else(|| anyhow!("{key} must be list"))?;
+    sequence
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(|value| value.to_string())
+                .ok_or_else(|| anyhow!("{key} entries must be strings"))
+        })
+        .collect()
+}
+
+fn get_triggers(map: &serde_yaml::Mapping, key: &str) -> Result<SkillTriggerHints> {
+    let Some(value) = map.get(serde_yaml::Value::String(key.to_string())) else {
+        return Ok(SkillTriggerHints::default());
+    };
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| anyhow!("{key} must be mapping"))?;
+    let keywords = mapping
+        .get(serde_yaml::Value::String("keywords".to_string()))
+        .map(|value| {
+            value
+                .as_sequence()
+                .ok_or_else(|| anyhow!("triggers.keywords must be list"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(|value| value.to_string())
+                        .ok_or_else(|| anyhow!("triggers.keywords entries must be strings"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(SkillTriggerHints { keywords })
+}
+
+fn get_risk_level(map: &serde_yaml::Mapping, key: &str) -> Result<SkillRiskLevel> {
+    let Some(value) = get_opt_str(map, key) else {
+        return Ok(SkillRiskLevel::Low);
+    };
+    SkillRiskLevel::parse(&value).ok_or_else(|| anyhow!("invalid risk-level: {}", value))
+}
+
+fn validate_property_schema(name: &str, schema: &serde_json::Value) -> Result<()> {
+    let schema_obj = schema
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("property schema for {} must be object", name))?;
-    if let Some(typ) = schema_obj
-        .get("type")
-        .and_then(|schema_type| schema_type.as_str())
-    {
-        if !matches_schema_type(value, typ) {
-            return Err(anyhow::anyhow!("field {} must be {}", name, typ));
-        }
-    }
-    if let Some(enum_values) = schema_obj.get("enum") {
-        let enum_values = enum_values
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("enum for {} must be array", name))?;
-        if !enum_values.iter().any(|candidate| candidate == value) {
-            return Err(anyhow::anyhow!(
-                "field {} must match one of the declared enum values",
-                name
-            ));
-        }
+        .ok_or_else(|| anyhow!("property schema for {} must be object", name))?;
+    let Some(typ) = schema_obj.get("type").and_then(|value| value.as_str()) else {
+        return Err(anyhow!("property {} missing type", name));
+    };
+    if !matches!(typ, "string" | "integer" | "number" | "boolean" | "object" | "array") {
+        return Err(anyhow!("property {} has unsupported type: {}", name, typ));
     }
     Ok(())
 }
 
-/// Validates that a declared JSON Schema type is part of the supported subset.
-fn validate_supported_schema_type(name: &str, typ: &str) -> Result<()> {
-    if matches!(
-        typ,
-        "string" | "number" | "integer" | "boolean" | "object" | "array" | "null"
-    ) {
-        return Ok(());
-    }
-    Err(anyhow::anyhow!(
-        "property {} uses unsupported schema type {}",
-        name,
-        typ
-    ))
-}
-
-/// Checks whether a runtime value matches one supported JSON Schema type.
-fn matches_schema_type(value: &serde_json::Value, typ: &str) -> bool {
-    match typ {
+fn validate_input_value(
+    name: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<()> {
+    let schema_obj = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("property schema for {} must be object", name))?;
+    let typ = schema_obj
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("string");
+    let ok = match typ {
         "string" => value.is_string(),
-        "number" => value.is_number(),
         "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
         "boolean" => value.is_boolean(),
         "object" => value.is_object(),
         "array" => value.is_array(),
-        "null" => value.is_null(),
         _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("invalid type for {}: expected {}", name, typ))
     }
 }
 
-/// Identifies filesystem tools that require explicit package-skill policy.
+fn parse_required_fields(schema_obj: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<String>> {
+    let Some(required) = schema_obj.get("required") else {
+        return Ok(Vec::new());
+    };
+    let sequence = required
+        .as_array()
+        .ok_or_else(|| anyhow!("required must be array"))?;
+    sequence
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(|value| value.to_string())
+                .ok_or_else(|| anyhow!("required entries must be strings"))
+        })
+        .collect()
+}
+
 fn is_filesystem_tool(name: &str) -> bool {
     matches!(
         name,

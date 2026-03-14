@@ -7,31 +7,83 @@ use tokio::time::{timeout, Duration};
 
 use crate::approval::{redact_command, ApprovalDecision, ApprovalRequest, ExecutionMode};
 use crate::audit::{AuditEvent, AuditSink};
+use crate::provider::AgentToolCall;
 use crate::runtime::{HandledToolCall, RuntimeMiddleware, ToolCallContext};
 use crate::skills::loader::{load_skills, SkillsLoadOptions};
+use crate::skills::selection::{resolve_skill_snapshot, SkillResolverOptions, SkillSelectionMode};
 use crate::skills::validator::{
     classify_package_skill_step_tool, validate_package_skill_input, PackageSkillStepKind,
 };
-use crate::skills::{LoadedSkills, SkillMetadata, SkillToolSpec, SkillsDiagnostics};
+use crate::skills::{
+    restore_resolved_snapshot, store_resolved_snapshot, store_skills_diagnostics, SkillExecutionMode,
+    SkillGovernanceSeverity, SkillPackage, SkillSelectedRecord, SkillToolPolicy, SkillToolSpec,
+    SkillsDiagnostics, ResolvedSkillSnapshot,
+};
 use crate::state::AgentState;
 use crate::types::Message;
 
+/// Runtime middleware that resolves selected skills into a per-run snapshot and
+/// intercepts calls to selected skill tools.
 pub struct SkillsMiddleware {
     sources: Vec<String>,
     options: SkillsLoadOptions,
-    state: Arc<RwLock<LoadedSkills>>,
+    resolver: SkillResolverOptions,
+    state: Arc<RwLock<Option<ResolvedSkillSnapshot>>>,
 }
 
 impl SkillsMiddleware {
+    /// Creates a middleware instance backed by source-based skill loading.
     pub fn new(sources: Vec<String>, options: SkillsLoadOptions) -> Self {
         Self {
+            resolver: SkillResolverOptions {
+                sources: sources.clone(),
+                source_options: options.clone(),
+                ..Default::default()
+            },
             sources,
             options,
-            state: Arc::new(RwLock::new(LoadedSkills::default())),
+            state: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub async fn loaded(&self) -> LoadedSkills {
+    /// Adds a registry root used for versioned lifecycle resolution.
+    pub fn with_registry_dir(mut self, registry_dir: impl Into<String>) -> Self {
+        self.resolver.registry_dir = Some(registry_dir.into());
+        self
+    }
+
+    /// Sets explicit pinned skills for manual or auto selection.
+    pub fn with_explicit_skills(mut self, explicit_skills: Vec<String>) -> Self {
+        self.resolver.explicit_skills = explicit_skills;
+        self
+    }
+
+    /// Sets explicitly disabled skills for the run.
+    pub fn with_disabled_skills(mut self, disabled_skills: Vec<String>) -> Self {
+        self.resolver.disabled_skills = disabled_skills;
+        self
+    }
+
+    /// Sets the selection mode used at run start.
+    pub fn with_selection_mode(mut self, selection_mode: SkillSelectionMode) -> Self {
+        self.resolver.selection_mode = selection_mode;
+        self
+    }
+
+    /// Sets the maximum number of active skills for one run.
+    pub fn with_max_active(mut self, max_active: usize) -> Self {
+        self.resolver.max_active = max_active.max(1);
+        self
+    }
+
+    /// Forces snapshot recomputation instead of using a sticky thread snapshot.
+    pub fn with_refresh_snapshot(mut self, refresh_snapshot: bool) -> Self {
+        self.resolver.refresh_snapshot = refresh_snapshot;
+        self
+    }
+
+    /// Returns the currently resolved snapshot for inspection in tests.
+    pub async fn loaded(&self) -> Option<ResolvedSkillSnapshot> {
         self.state.read().unwrap().clone()
     }
 }
@@ -43,18 +95,16 @@ impl RuntimeMiddleware for SkillsMiddleware {
         mut messages: Vec<Message>,
         state: &mut AgentState,
     ) -> Result<Vec<Message>> {
-        let loaded = if let Some(loaded) = restore_loaded_skills(state)? {
-            loaded
+        let snapshot = resolve_skill_snapshot(&messages, state, &self.resolver)?;
+        if let Some(snapshot) = snapshot {
+            store_resolved_snapshot(state, &snapshot)?;
+            let diagnostics = self.collect_diagnostics(&snapshot)?;
+            store_skills_diagnostics(state, &diagnostics)?;
+            *self.state.write().unwrap() = Some(snapshot.clone());
+            upsert_injection_message(&mut messages, snapshot.injection_block);
         } else {
-            let loaded = load_skills(&self.sources, self.options.clone())?;
-            store_loaded_skills_snapshot(state, &loaded)?;
-            loaded
-        };
-        *self.state.write().unwrap() = loaded.clone();
-
-        let block = build_skills_block(&loaded);
-        upsert_injection_message(&mut messages, block);
-
+            *self.state.write().unwrap() = None;
+        }
         Ok(messages)
     }
 
@@ -62,20 +112,52 @@ impl RuntimeMiddleware for SkillsMiddleware {
         &self,
         ctx: &mut ToolCallContext<'_>,
     ) -> Result<Option<HandledToolCall>> {
-        let loaded = self.state.read().unwrap().clone();
-        let tool = match loaded
+        let snapshot = self
+            .state
+            .read()
+            .unwrap()
+            .clone()
+            .or_else(|| restore_resolved_snapshot(ctx.state));
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let Some(tool) = snapshot
             .tools
             .iter()
-            .find(|t| t.name == ctx.tool_call.tool_name)
-        {
-            Some(t) => t.clone(),
-            None => return Ok(None),
+            .find(|tool| tool.name == ctx.tool_call.tool_name)
+            .cloned()
+        else {
+            return Ok(None);
         };
 
-        if let Err(e) = validate_package_skill_input(&tool.input_schema, &ctx.tool_call.arguments) {
+        if tool.requires_isolation {
+            let selected = selected_record_for_tool(&snapshot, &tool);
+            let package = snapshot
+                .packages
+                .iter()
+                .find(|package| {
+                    package.manifest.identity.name == tool.skill_name
+                        && package.manifest.identity.version == tool.skill_version
+                })
+                .cloned();
+            let out = execute_subagent_skill(ctx, &tool, selected, package.as_ref()).await;
+            return Ok(Some(match out {
+                Ok(value) => HandledToolCall {
+                    output: value,
+                    error: None,
+                },
+                Err(error) => HandledToolCall {
+                    output: serde_json::Value::Null,
+                    error: Some(error),
+                },
+            }));
+        }
+
+        if let Err(error) = validate_package_skill_input(&tool.input_schema, &ctx.tool_call.arguments)
+        {
             return Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
-                error: Some(format!("invalid_request: {}", e)),
+                error: Some(format!("invalid_request: {}", error)),
             }));
         }
 
@@ -89,8 +171,6 @@ impl RuntimeMiddleware for SkillsMiddleware {
             }));
         }
 
-        // Catch panics inside skill execution so a buggy package step is
-        // surfaced as a tool error instead of unwinding the whole runner.
         let result = timeout(
             Duration::from_millis(tool.policy.timeout_ms),
             AssertUnwindSafe(execute_skill_steps(ctx, &tool)).catch_unwind(),
@@ -101,9 +181,9 @@ impl RuntimeMiddleware for SkillsMiddleware {
                 output: out,
                 error: None,
             })),
-            Ok(Ok(Err(e))) => Ok(Some(HandledToolCall {
+            Ok(Ok(Err(error))) => Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
-                error: Some(e),
+                error: Some(error),
             })),
             Ok(Err(payload)) => Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
@@ -126,7 +206,7 @@ impl RuntimeMiddleware for SkillsMiddleware {
 async fn execute_skill_steps(
     ctx: &mut ToolCallContext<'_>,
     tool: &SkillToolSpec,
-) -> Result<serde_json::Value, String> {
+) -> std::result::Result<serde_json::Value, String> {
     let mut last_output = serde_json::Value::Null;
     for step in &tool.steps {
         validate_step_access(step, &tool.policy)?;
@@ -136,8 +216,7 @@ async fn execute_skill_steps(
                 step.tool_name
             ));
         }
-        let mut args = step.arguments.clone();
-        args = merge_args(args, &ctx.tool_call.arguments);
+        let args = merge_args(step.arguments.clone(), &ctx.tool_call.arguments);
         let output = if step.tool_name == "execute" {
             execute_with_approval(ctx, &args).await?
         } else {
@@ -145,20 +224,65 @@ async fn execute_skill_steps(
                 .call_tool_stateful(&step.tool_name, args, ctx.state)
                 .await
                 .map(|(out, _delta)| out.output)
-                .map_err(|e| format!("skill_step_failed: {}: {}", step.tool_name, e))?
+                .map_err(|error| format!("skill_step_failed: {}: {}", step.tool_name, error))?
         };
         last_output = truncate_output(output, tool.policy.max_output_chars);
     }
     Ok(last_output)
 }
 
+async fn execute_subagent_skill(
+    ctx: &mut ToolCallContext<'_>,
+    tool: &SkillToolSpec,
+    selected: Option<&SkillSelectedRecord>,
+    package: Option<&SkillPackage>,
+) -> std::result::Result<serde_json::Value, String> {
+    let description = build_context_capsule(tool, selected, package, &ctx.tool_call.arguments, ctx.messages);
+    let task_call = AgentToolCall {
+        tool_name: "task".to_string(),
+        arguments: serde_json::json!({
+            "description": description,
+            "subagent_type": tool.subagent_type.clone().unwrap_or_else(|| "general-purpose".to_string())
+        }),
+        call_id: ctx.tool_call.call_id.clone(),
+    };
+
+    for middleware in ctx.runtime_middlewares {
+        let mut sub_ctx = ToolCallContext {
+            agent: ctx.agent,
+            tool_call: &task_call,
+            call_id: ctx.call_id,
+            messages: ctx.messages,
+            state: ctx.state,
+            root: ctx.root,
+            mode: ctx.mode,
+            approval: ctx.approval,
+            audit: ctx.audit,
+            runtime_middlewares: ctx.runtime_middlewares,
+            task_depth: ctx.task_depth,
+        };
+        match middleware.handle_tool_call(&mut sub_ctx).await {
+            Ok(Some(handled)) => {
+                return match handled.error {
+                    Some(error) => Err(error),
+                    None => Ok(truncate_output(handled.output, tool.policy.max_output_chars)),
+                };
+            }
+            Ok(None) => continue,
+            Err(error) => return Err(format!("skill_subagent_failed: {}", error)),
+        }
+    }
+
+    Err("skill_subagent_failed: no runtime middleware handled task".to_string())
+}
+
 async fn execute_with_approval(
     ctx: &mut ToolCallContext<'_>,
     args: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> std::result::Result<serde_json::Value, String> {
     let cmd = args
         .get("command")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .unwrap_or("")
         .to_string();
     if let Some(policy) = ctx.approval {
@@ -181,6 +305,7 @@ async fn execute_with_approval(
                         let output = out.output;
                         record_audit(AuditRecordInput {
                             sink: ctx.audit,
+                            _state: ctx.state,
                             cmd: &cmd,
                             root: ctx.root,
                             mode: ctx.mode,
@@ -192,9 +317,10 @@ async fn execute_with_approval(
                         });
                         Ok(output)
                     }
-                    Err(e) => {
+                    Err(error) => {
                         record_audit(AuditRecordInput {
                             sink: ctx.audit,
+                            _state: ctx.state,
                             cmd: &cmd,
                             root: ctx.root,
                             mode: ctx.mode,
@@ -204,13 +330,14 @@ async fn execute_with_approval(
                             duration_ms,
                             output: None,
                         });
-                        Err(format!("skill_step_failed: execute: {}", e))
+                        Err(format!("skill_step_failed: execute: {}", error))
                     }
                 }
             }
             ApprovalDecision::Deny { code, reason } => {
                 record_audit(AuditRecordInput {
                     sink: ctx.audit,
+                    _state: ctx.state,
                     cmd: &cmd,
                     root: ctx.root,
                     mode: ctx.mode,
@@ -225,6 +352,7 @@ async fn execute_with_approval(
             ApprovalDecision::RequireApproval { code, reason } => {
                 record_audit(AuditRecordInput {
                     sink: ctx.audit,
+                    _state: ctx.state,
                     cmd: &cmd,
                     root: ctx.root,
                     mode: ctx.mode,
@@ -242,12 +370,13 @@ async fn execute_with_approval(
             .call_tool_stateful("execute", args.clone(), ctx.state)
             .await
             .map(|(out, _delta)| out.output)
-            .map_err(|e| format!("skill_step_failed: execute: {}", e))
+            .map_err(|error| format!("skill_step_failed: execute: {}", error))
     }
 }
 
 struct AuditRecordInput<'a> {
     sink: Option<&'a Arc<dyn AuditSink>>,
+    _state: &'a AgentState,
     cmd: &'a str,
     root: &'a str,
     mode: ExecutionMode,
@@ -261,6 +390,7 @@ struct AuditRecordInput<'a> {
 fn record_audit(input: AuditRecordInput<'_>) {
     let AuditRecordInput {
         sink,
+        _state,
         cmd,
         root,
         mode,
@@ -272,13 +402,14 @@ fn record_audit(input: AuditRecordInput<'_>) {
     } = input;
     let Some(sink) = sink else { return };
     let (exit_code, truncated) = output
-        .and_then(|v| v.as_object())
-        .map(|o| {
+        .and_then(|value| value.as_object())
+        .map(|object| {
             (
-                o.get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32),
-                o.get("truncated").and_then(|v| v.as_bool()),
+                object
+                    .get("exit_code")
+                    .and_then(|value| value.as_i64())
+                    .map(|value| value as i32),
+                object.get("truncated").and_then(|value| value.as_bool()),
             )
         })
         .unwrap_or((None, None));
@@ -303,11 +434,10 @@ fn mode_str(mode: ExecutionMode) -> String {
     }
 }
 
-/// Enforces the deny-by-default execution boundary for package skill steps.
 fn validate_step_access(
     step: &crate::skills::SkillToolStep,
-    policy: &crate::skills::SkillToolPolicy,
-) -> Result<(), String> {
+    policy: &SkillToolPolicy,
+) -> std::result::Result<(), String> {
     match classify_package_skill_step_tool(&step.tool_name).map_err(|error| error.to_string())? {
         PackageSkillStepKind::AgentOwned => Ok(()),
         PackageSkillStepKind::Filesystem => {
@@ -330,8 +460,6 @@ fn validate_step_access(
     }
 }
 
-/// Extracts a readable panic message so skill unwinds can be surfaced as
-/// regular tool errors.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         return (*message).to_string();
@@ -342,107 +470,76 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     "skill step panicked".to_string()
 }
 
-fn build_skills_block(loaded: &LoadedSkills) -> String {
+fn selected_record_for_tool<'a>(
+    snapshot: &'a ResolvedSkillSnapshot,
+    tool: &SkillToolSpec,
+) -> Option<&'a SkillSelectedRecord> {
+    snapshot.selection.selected.iter().find(|record| {
+        record.identity.name == tool.skill_name && record.identity.version == tool.skill_version
+    })
+}
+
+fn build_context_capsule(
+    tool: &SkillToolSpec,
+    selected: Option<&SkillSelectedRecord>,
+    package: Option<&SkillPackage>,
+    input: &serde_json::Value,
+    messages: &[Message],
+) -> String {
+    let objective = selected
+        .map(|record| record.description.clone())
+        .unwrap_or_else(|| tool.description.clone());
     let mut out = String::new();
-    out.push_str("DEEPAGENTS_SKILLS_INJECTED_V1\n");
-    out.push_str("## Skills\n");
-    for skill in &loaded.metadata {
-        out.push_str("- ");
-        out.push_str(&skill.name);
-        out.push_str(": ");
-        out.push_str(&skill.description);
-        out.push_str(" (source: ");
-        out.push_str(&skill.source);
-        out.push(')');
-        if !skill.allowed_tools.is_empty() {
-            out.push_str(" Allowed tools: ");
-            out.push_str(&skill.allowed_tools.join(", "));
+    out.push_str("Skill objective:\n");
+    out.push_str(&objective);
+    out.push_str("\n\nTool input:\n");
+    out.push_str(&serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()));
+    if let Some(selected) = selected {
+        out.push_str("\n\nSelected skill:\n");
+        out.push_str(&selected.identity.as_key());
+        out.push_str("\nExecution mode:\n");
+        out.push_str(match selected.execution_mode {
+            SkillExecutionMode::Inline => "inline",
+            SkillExecutionMode::Subagent => "subagent",
+        });
+        out.push_str("\nSelected fragments:\n");
+        out.push_str(&selected.fragments.join(", "));
+    }
+    if let Some(package) = package {
+        for fragment in ["role", "constraints", "workflow", "output"] {
+            if let Some(content) = package.fragments.get(fragment) {
+                out.push_str("\n\n");
+                out.push_str(fragment);
+                out.push_str(":\n");
+                out.push_str(content.trim());
+            }
         }
-        out.push('\n');
+    }
+    let recent_messages = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .take(2)
+        .collect::<Vec<_>>();
+    if !recent_messages.is_empty() {
+        out.push_str("\n\nRecent context:\n");
+        for message in recent_messages.into_iter().rev() {
+            out.push_str("- ");
+            out.push_str(message.content.trim());
+            out.push('\n');
+        }
     }
     out
 }
 
-fn has_injection_marker(messages: &[Message]) -> bool {
-    messages
-        .iter()
-        .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
-}
-
-fn restore_loaded_skills(state: &mut AgentState) -> Result<Option<LoadedSkills>> {
-    let Some(metadata) = state.extra.get("skills_metadata").cloned() else {
-        return Ok(None);
-    };
-    let Some(tools) = state.extra.get("skills_tools").cloned() else {
-        return Ok(None);
-    };
-
-    let metadata = match serde_json::from_value::<Vec<SkillMetadata>>(metadata) {
-        Ok(metadata) => metadata,
-        Err(_) => return Ok(None),
-    };
-    let tools = match serde_json::from_value::<Vec<SkillToolSpec>>(tools) {
-        Ok(tools) => tools,
-        Err(_) => return Ok(None),
-    };
-    let diagnostics = match state.extra.get("skills_diagnostics").cloned() {
-        Some(value) => match serde_json::from_value::<SkillsDiagnostics>(value) {
-            Ok(diagnostics) => diagnostics,
-            Err(_) => return Ok(None),
-        },
-        None => SkillsDiagnostics::default(),
-    };
-
-    let mut loaded = LoadedSkills {
-        metadata,
-        tools,
-        diagnostics,
-    };
-    loaded.canonicalize();
-    store_loaded_skills_snapshot(state, &loaded)?;
-    Ok(Some(loaded))
-}
-
-fn store_loaded_skills_snapshot(state: &mut AgentState, loaded: &LoadedSkills) -> Result<()> {
-    state.extra.insert(
-        "skills_metadata".to_string(),
-        serde_json::to_value(&loaded.metadata)?,
-    );
-    state.extra.insert(
-        "skills_tools".to_string(),
-        serde_json::to_value(&loaded.tools)?,
-    );
-    state.extra.insert(
-        "skills_diagnostics".to_string(),
-        serde_json::to_value(&loaded.diagnostics)?,
-    );
-    Ok(())
-}
-
 fn upsert_injection_message(messages: &mut Vec<Message>, block: String) {
-    if !has_injection_marker(messages) {
-        messages.insert(0, skills_injection_message(block));
-        return;
-    }
+    const MARKER_V1: &str = "DEEPAGENTS_SKILLS_INJECTED_V1";
+    const MARKER_V2: &str = "DEEPAGENTS_SKILLS_INJECTED_V2";
 
-    let mut seen_marker = false;
     messages.retain(|message| {
-        if !message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1") {
-            return true;
-        }
-        if !seen_marker {
-            seen_marker = true;
-            return true;
-        }
-        false
+        !message.content.contains(MARKER_V1) && !message.content.contains(MARKER_V2)
     });
-
-    if let Some(message) = messages
-        .iter_mut()
-        .find(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
-    {
-        *message = skills_injection_message(block);
-    }
+    messages.insert(0, skills_injection_message(block));
 }
 
 fn skills_injection_message(block: String) -> Message {
@@ -463,39 +560,39 @@ fn merge_args(base: serde_json::Value, overlay: &serde_json::Value) -> serde_jso
         return base;
     };
     let mut out = match base {
-        serde_json::Value::Object(m) => m,
+        serde_json::Value::Object(map) => map,
         other => return other,
     };
-    for (k, v) in overlay_map {
-        out.insert(k.clone(), v.clone());
+    for (key, value) in overlay_map {
+        out.insert(key.clone(), value.clone());
     }
     serde_json::Value::Object(out)
 }
 
 fn truncate_output(value: serde_json::Value, max: usize) -> serde_json::Value {
     match value {
-        serde_json::Value::String(s) => {
-            if s.len() > max {
-                serde_json::Value::String(s.chars().take(max).collect())
+        serde_json::Value::String(text) => {
+            if text.chars().count() > max {
+                serde_json::Value::String(text.chars().take(max).collect())
             } else {
-                serde_json::Value::String(s)
+                serde_json::Value::String(text)
             }
         }
-        serde_json::Value::Object(mut map) => {
-            if let Some(content) = map.get_mut("content") {
-                if let Some(s) = content.as_str() {
-                    if s.len() > max {
-                        *content = serde_json::Value::String(s.chars().take(max).collect());
-                        map.insert("truncated".to_string(), serde_json::Value::Bool(true));
-                        return serde_json::Value::Object(map);
+        serde_json::Value::Object(mut object) => {
+            if let Some(content) = object.get_mut("content") {
+                if let Some(text) = content.as_str() {
+                    if text.chars().count() > max {
+                        *content = serde_json::Value::String(text.chars().take(max).collect());
+                        object.insert("truncated".to_string(), serde_json::Value::Bool(true));
+                        return serde_json::Value::Object(object);
                     }
                 }
             }
-            serde_json::Value::Object(map)
+            serde_json::Value::Object(object)
         }
         other => {
             let raw = serde_json::to_string(&other).unwrap_or_default();
-            if raw.len() > max {
+            if raw.chars().count() > max {
                 serde_json::json!({
                     "content": raw.chars().take(max).collect::<String>(),
                     "truncated": true
@@ -504,5 +601,30 @@ fn truncate_output(value: serde_json::Value, max: usize) -> serde_json::Value {
                 other
             }
         }
+    }
+}
+
+impl SkillsMiddleware {
+    fn collect_diagnostics(&self, snapshot: &ResolvedSkillSnapshot) -> Result<SkillsDiagnostics> {
+        if !self.sources.is_empty() {
+            return Ok(load_skills(&self.sources, self.options.clone())?.diagnostics);
+        }
+        let mut diagnostics = SkillsDiagnostics::default();
+        for package in &snapshot.packages {
+            for finding in &package.governance.findings {
+                diagnostics.records.push(crate::skills::SkillDiagnosticRecord {
+                    name: package.manifest.identity.name.clone(),
+                    version: package.manifest.identity.version.clone(),
+                    source: package.manifest.source.clone(),
+                    severity: match finding.severity {
+                        SkillGovernanceSeverity::Warn => "warn".to_string(),
+                        SkillGovernanceSeverity::Fail => "fail".to_string(),
+                    },
+                    code: finding.code.clone(),
+                    message: finding.message.clone(),
+                });
+            }
+        }
+        Ok(diagnostics)
     }
 }

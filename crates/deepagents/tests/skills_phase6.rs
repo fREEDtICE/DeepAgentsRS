@@ -344,87 +344,130 @@ async fn skills_tools_are_injected_into_tool_specs() {
     assert_eq!(
         req.messages
             .iter()
-            .find(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+            .find(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V2"))
             .map(|message| message.content.as_str()),
         Some(
-            "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- alpha-skill: Alpha (source: skills)\n- zeta-skill: Zeta (source: skills)\n"
+            "DEEPAGENTS_SKILLS_INJECTED_V2\n## Skills\n- alpha-skill@0.0.0-dev: Alpha (source: skills)\n- zeta-skill@0.0.0-dev: Zeta (source: skills)\n"
         )
     );
     assert!(req
         .messages
         .iter()
-        .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1")));
+        .any(|m| m.content.contains("DEEPAGENTS_SKILLS_INJECTED_V2")));
 }
 
 #[tokio::test]
 async fn skills_middleware_restores_and_rewrites_snapshot_deterministically() {
-    let middleware = SkillsMiddleware::new(
-        vec!["/definitely/missing".to_string()],
-        SkillsLoadOptions::default(),
-    );
+    let middleware = SkillsMiddleware::new(Vec::new(), SkillsLoadOptions::default())
+        .with_registry_dir("/tmp/registry");
     let mut state = deepagents::state::AgentState::default();
-    state.extra.insert(
-        "skills_metadata".to_string(),
-        serde_json::json!([
-            {
-                "name": "zeta-skill",
-                "description": "Zeta",
-                "path": "/tmp/zeta",
-                "source": "restored",
-                "allowed_tools": []
-            },
-            {
-                "name": "alpha-skill",
-                "description": "Alpha",
-                "path": "/tmp/alpha",
-                "source": "restored",
-                "allowed_tools": []
-            }
-        ]),
-    );
-    state.extra.insert(
-        "skills_tools".to_string(),
-        serde_json::json!([
-            {
-                "name": "zeta-tool",
-                "description": "Zeta tool",
-                "input_schema": { "type": "object", "properties": {}, "required": [] },
-                "steps": [],
-                "policy": {
-                    "allow_filesystem": false,
-                    "allow_execute": false,
-                    "allow_network": false,
-                    "max_steps": 8,
-                    "timeout_ms": 1000,
-                    "max_output_chars": 12000
+    deepagents::skills::store_resolved_snapshot(
+        &mut state,
+        &deepagents::skills::ResolvedSkillSnapshot {
+            snapshot_id: "sha256:restored".to_string(),
+            metadata: vec![
+                deepagents::skills::SkillMetadata {
+                    name: "zeta-skill".to_string(),
+                    version: "0.0.0-dev".to_string(),
+                    description: "Zeta".to_string(),
+                    path: "/tmp/zeta".to_string(),
+                    source: "restored".to_string(),
+                    license: None,
+                    compatibility: None,
+                    metadata: Default::default(),
+                    allowed_tools: Vec::new(),
                 },
-                "skill_name": "zeta-skill",
-                "source": "restored"
-            },
-            {
-                "name": "alpha-tool",
-                "description": "Alpha tool",
-                "input_schema": { "type": "object", "properties": {}, "required": [] },
-                "steps": [],
-                "policy": {
-                    "allow_filesystem": false,
-                    "allow_execute": false,
-                    "allow_network": false,
-                    "max_steps": 8,
-                    "timeout_ms": 1000,
-                    "max_output_chars": 12000
+                deepagents::skills::SkillMetadata {
+                    name: "alpha-skill".to_string(),
+                    version: "0.0.0-dev".to_string(),
+                    description: "Alpha".to_string(),
+                    path: "/tmp/alpha".to_string(),
+                    source: "restored".to_string(),
+                    license: None,
+                    compatibility: None,
+                    metadata: Default::default(),
+                    allowed_tools: Vec::new(),
                 },
-                "skill_name": "alpha-skill",
-                "source": "restored"
-            }
-        ]),
-    );
+            ],
+            tools: vec![
+                deepagents::skills::SkillToolSpec {
+                    name: "zeta-tool".to_string(),
+                    description: "Zeta tool".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    steps: Vec::new(),
+                    policy: deepagents::skills::SkillToolPolicy::default(),
+                    skill_name: "zeta-skill".to_string(),
+                    skill_version: "0.0.0-dev".to_string(),
+                    source: "restored".to_string(),
+                    requires_isolation: false,
+                    subagent_type: None,
+                },
+                deepagents::skills::SkillToolSpec {
+                    name: "alpha-tool".to_string(),
+                    description: "Alpha tool".to_string(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    steps: Vec::new(),
+                    policy: deepagents::skills::SkillToolPolicy::default(),
+                    skill_name: "alpha-skill".to_string(),
+                    skill_version: "0.0.0-dev".to_string(),
+                    source: "restored".to_string(),
+                    requires_isolation: false,
+                    subagent_type: None,
+                },
+            ],
+            packages: Vec::new(),
+            selection: deepagents::skills::SkillSelectionReport {
+                candidates: Vec::new(),
+                selected: vec![
+                    deepagents::skills::SkillSelectedRecord {
+                        identity: deepagents::skills::SkillIdentity {
+                            name: "zeta-skill".to_string(),
+                            version: "0.0.0-dev".to_string(),
+                        },
+                        description: "Zeta".to_string(),
+                        source: "restored".to_string(),
+                        reasons: vec!["restored".to_string()],
+                        fragments: Vec::new(),
+                        tool_names: vec!["zeta-tool".to_string()],
+                        execution_mode: deepagents::skills::SkillExecutionMode::Inline,
+                        governance: Default::default(),
+                        content_hash: None,
+                    },
+                    deepagents::skills::SkillSelectedRecord {
+                        identity: deepagents::skills::SkillIdentity {
+                            name: "alpha-skill".to_string(),
+                            version: "0.0.0-dev".to_string(),
+                        },
+                        description: "Alpha".to_string(),
+                        source: "restored".to_string(),
+                        reasons: vec!["restored".to_string()],
+                        fragments: Vec::new(),
+                        tool_names: vec!["alpha-tool".to_string()],
+                        execution_mode: deepagents::skills::SkillExecutionMode::Inline,
+                        governance: Default::default(),
+                        content_hash: None,
+                    },
+                ],
+                skipped: Vec::new(),
+            },
+            injection_block: "DEEPAGENTS_SKILLS_INJECTED_V2\n## Skills\n- alpha-skill@0.0.0-dev: Alpha (source: restored)\n- zeta-skill@0.0.0-dev: Zeta (source: restored)\n".to_string(),
+        },
+    )
+    .unwrap();
 
     let messages = vec![
         Message {
             role: "system".to_string(),
             content:
-                "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- zeta-skill: Zeta (source: restored)\n"
+                "DEEPAGENTS_SKILLS_INJECTED_V2\n## Skills\n- zeta-skill@0.0.0-dev: Zeta (source: restored)\n"
                     .to_string(),
             content_blocks: None,
             reasoning_content: None,
@@ -435,7 +478,7 @@ async fn skills_middleware_restores_and_rewrites_snapshot_deterministically() {
         },
         Message {
             role: "system".to_string(),
-            content: "DEEPAGENTS_SKILLS_INJECTED_V1\nduplicate".to_string(),
+            content: "DEEPAGENTS_SKILLS_INJECTED_V2\nduplicate".to_string(),
             content_blocks: None,
             reasoning_content: None,
             tool_calls: None,
@@ -462,12 +505,12 @@ async fn skills_middleware_restores_and_rewrites_snapshot_deterministically() {
 
     let markers = messages
         .iter()
-        .filter(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V1"))
+        .filter(|message| message.content.contains("DEEPAGENTS_SKILLS_INJECTED_V2"))
         .collect::<Vec<_>>();
     assert_eq!(markers.len(), 1);
     assert_eq!(
         markers[0].content,
-        "DEEPAGENTS_SKILLS_INJECTED_V1\n## Skills\n- alpha-skill: Alpha (source: restored)\n- zeta-skill: Zeta (source: restored)\n"
+        "DEEPAGENTS_SKILLS_INJECTED_V2\n## Skills\n- alpha-skill@0.0.0-dev: Alpha (source: restored)\n- zeta-skill@0.0.0-dev: Zeta (source: restored)\n"
     );
 
     let metadata = serde_json::from_value::<Vec<deepagents::skills::SkillMetadata>>(

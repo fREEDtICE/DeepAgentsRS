@@ -18,6 +18,7 @@ use crate::runtime::events::{
     diff_state_keys, preview_json, preview_text, provider_step_kind, summarize_messages, RunEvent,
     RunEventSink,
 };
+use crate::skills::attach_skills_trace_to_trace;
 use crate::runtime::filesystem_runtime_middleware::{
     LargeToolResultOffloadOptions, LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY,
 };
@@ -73,6 +74,7 @@ fn preview_head_tail_lines(text: &str, max_lines: usize) -> (String, String) {
 
 fn finalize_run_output(mut out: RunOutput) -> RunOutput {
     out.trace = attach_provider_cache_events_to_trace(out.trace, &mut out.state);
+    out.trace = attach_skills_trace_to_trace(out.trace, &out.state);
     out.summarization_events = out.state.extra.get("_summarization_events").cloned();
     out
 }
@@ -540,6 +542,14 @@ impl ResumableRunner {
             },
         )
         .await;
+        self.emit_skill_tool_finished_if_needed(
+            step_index,
+            &tool_name,
+            &call_id,
+            error.clone(),
+            sink,
+        )
+        .await;
 
         let content_json = custom_message.unwrap_or_else(|| {
             let error_json = match (error_code.clone(), error_message.clone(), error.clone()) {
@@ -669,6 +679,7 @@ impl ResumableRunner {
             }
             self.tool_results = tool_results_from_messages(&self.messages);
             self.initialized = true;
+            self.emit_skill_selection_events(sink).await;
         }
 
         for step_idx in 0..self.config.max_steps {
@@ -1594,6 +1605,115 @@ impl ResumableRunner {
             .unwrap_or_default()
     }
 
+    fn skill_identity_for_tool(
+        &self,
+        state: &AgentState,
+        tool_name: &str,
+    ) -> Option<(String, String)> {
+        let snapshot = crate::skills::restore_resolved_snapshot(state)?;
+        let tool = snapshot.tools.into_iter().find(|tool| tool.name == tool_name)?;
+        Some((tool.skill_name, tool.skill_version))
+    }
+
+    async fn emit_skill_selection_events(&self, sink: &mut dyn RunEventSink) {
+        let Some(snapshot) = crate::skills::restore_resolved_snapshot(&self.state) else {
+            return;
+        };
+        self.emit_event(
+            sink,
+            RunEvent::SkillSelectionStarted {
+                selected_count: snapshot.selection.selected.len(),
+                skipped_count: snapshot.selection.skipped.len(),
+            },
+        )
+        .await;
+        for selected in &snapshot.selection.selected {
+            self.emit_event(
+                sink,
+                RunEvent::SkillSelected {
+                    name: selected.identity.name.clone(),
+                    version: selected.identity.version.clone(),
+                    execution_mode: match selected.execution_mode {
+                        crate::skills::SkillExecutionMode::Inline => "inline".to_string(),
+                        crate::skills::SkillExecutionMode::Subagent => "subagent".to_string(),
+                    },
+                },
+            )
+            .await;
+        }
+        for skipped in &snapshot.selection.skipped {
+            self.emit_event(
+                sink,
+                RunEvent::SkillSkipped {
+                    name: skipped.identity.name.clone(),
+                    version: skipped.identity.version.clone(),
+                    reason: skipped.reason.clone(),
+                },
+            )
+            .await;
+            if skipped.reason == "quarantined" {
+                self.emit_event(
+                    sink,
+                    RunEvent::SkillQuarantined {
+                        name: skipped.identity.name.clone(),
+                        version: skipped.identity.version.clone(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn emit_skill_tool_started_if_needed(
+        &self,
+        step_index: usize,
+        tool_name: &str,
+        tool_call_id: &str,
+        sink: &mut dyn RunEventSink,
+    ) {
+        let Some((skill_name, skill_version)) = self.skill_identity_for_tool(&self.state, tool_name)
+        else {
+            return;
+        };
+        self.emit_event(
+            sink,
+            RunEvent::SkillToolCallStarted {
+                step_index,
+                skill_name,
+                skill_version,
+                tool_name: tool_name.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+            },
+        )
+        .await;
+    }
+
+    async fn emit_skill_tool_finished_if_needed(
+        &self,
+        step_index: usize,
+        tool_name: &str,
+        tool_call_id: &str,
+        error: Option<String>,
+        sink: &mut dyn RunEventSink,
+    ) {
+        let Some((skill_name, skill_version)) = self.skill_identity_for_tool(&self.state, tool_name)
+        else {
+            return;
+        };
+        self.emit_event(
+            sink,
+            RunEvent::SkillToolCallFinished {
+                step_index,
+                skill_name,
+                skill_version,
+                tool_name: tool_name.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                error,
+            },
+        )
+        .await;
+    }
+
     /// Runs middleware-backed tool handling after a `ToolCallStarted` event has
     /// already been emitted for the call.
     ///
@@ -1726,6 +1846,8 @@ impl ResumableRunner {
                     },
                 )
                 .await;
+                self.emit_skill_tool_started_if_needed(step_index, &tool_name, &call_id, sink)
+                    .await;
                 let before_state = self.state.clone();
                 self.push_tool_result_and_message(
                     step_index,
@@ -1765,6 +1887,8 @@ impl ResumableRunner {
                     },
                 )
                 .await;
+                self.emit_skill_tool_started_if_needed(step_index, &tool_name, &call_id, sink)
+                    .await;
                 let before_state = self.state.clone();
                 self.push_tool_result_and_message(
                     step_index,
@@ -1954,6 +2078,8 @@ impl ResumableRunner {
                 },
             )
             .await;
+            self.emit_skill_tool_started_if_needed(step_index, &tool_name, &call_id, sink)
+                .await;
 
             if self
                 .try_handle_runtime_middleware_call(step_index, &call, &call_id, sink)
@@ -2278,6 +2404,8 @@ impl ResumableRunner {
             },
         )
         .await;
+        self.emit_skill_tool_started_if_needed(step_index, &tool_name, &call_id, sink)
+            .await;
 
         if self
             .try_handle_runtime_middleware_call(step_index, &call, &call_id, sink)
@@ -2603,6 +2731,8 @@ impl ResumableRunner {
             },
         )
         .await;
+        self.emit_skill_tool_started_if_needed(step_index, &tool_name, &call_id, sink)
+            .await;
         self.push_tool_result_and_message(
             step_index,
             &before_state,
