@@ -90,15 +90,14 @@ pub fn install_sources_into_registry(
             )?;
             package.governance = review_skill_package(&package);
             let hash = compute_package_hash(&path)?;
-            let lifecycle = if package.governance.status
-                == crate::skills::SkillGovernanceStatus::Fail
-            {
-                SkillLifecycleState::Quarantined
-            } else if package.manifest.default_enabled {
-                SkillLifecycleState::Enabled
-            } else {
-                SkillLifecycleState::Disabled
-            };
+            let lifecycle =
+                if package.governance.status == crate::skills::SkillGovernanceStatus::Fail {
+                    SkillLifecycleState::Quarantined
+                } else if package.manifest.default_enabled {
+                    SkillLifecycleState::Enabled
+                } else {
+                    SkillLifecycleState::Disabled
+                };
 
             match registry
                 .entries
@@ -155,7 +154,9 @@ pub fn install_sources_into_registry(
 
 /// Loads installed registry packages together with the registry metadata that
 /// controls lifecycle behavior.
-pub fn load_registry_packages(registry_dir: &Path) -> Result<Vec<(SkillRegistryEntry, SkillPackage)>> {
+pub fn load_registry_packages(
+    registry_dir: &Path,
+) -> Result<Vec<(SkillRegistryEntry, SkillPackage)>> {
     let registry = load_registry(registry_dir)?;
     let mut out = Vec::new();
     for entry in registry.entries {
@@ -243,7 +244,11 @@ pub fn set_registry_lifecycle(
 }
 
 /// Removes a versioned package from the registry and deletes the installed files.
-pub fn remove_registry_entry(registry_dir: &Path, name: &str, version: &str) -> Result<SkillRegistryEntry> {
+pub fn remove_registry_entry(
+    registry_dir: &Path,
+    name: &str,
+    version: &str,
+) -> Result<SkillRegistryEntry> {
     let mut registry = load_registry(registry_dir)?;
     let Some(index) = registry
         .entries
@@ -272,14 +277,17 @@ pub fn registry_loaded_skills(registry_dir: &Path) -> Result<LoadedSkills> {
         }
         loaded.packages.push(package.clone());
         for finding in &package.governance.findings {
-            loaded.diagnostics.records.push(crate::skills::SkillDiagnosticRecord {
-                name: package.manifest.identity.name.clone(),
-                version: package.manifest.identity.version.clone(),
-                source: package.manifest.source.clone(),
-                severity: format!("{:?}", finding.severity).to_ascii_lowercase(),
-                code: finding.code.clone(),
-                message: finding.message.clone(),
-            });
+            loaded
+                .diagnostics
+                .records
+                .push(crate::skills::SkillDiagnosticRecord {
+                    name: package.manifest.identity.name.clone(),
+                    version: package.manifest.identity.version.clone(),
+                    source: package.manifest.source.clone(),
+                    severity: format!("{:?}", finding.severity).to_ascii_lowercase(),
+                    code: finding.code.clone(),
+                    message: finding.message.clone(),
+                });
         }
     }
     loaded.canonicalize();
@@ -317,7 +325,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(anyhow!("registry_install_symlink_not_allowed: {}", entry.path().display()));
+            return Err(anyhow!(
+                "registry_install_symlink_not_allowed: {}",
+                entry.path().display()
+            ));
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -339,7 +350,10 @@ fn compute_package_hash(root: &Path) -> Result<String> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(anyhow!("registry_install_symlink_not_allowed: {}", entry.path().display()));
+            return Err(anyhow!(
+                "registry_install_symlink_not_allowed: {}",
+                entry.path().display()
+            ));
         }
         let relative = entry.path().strip_prefix(root)?.to_string_lossy();
         hasher.update(relative.as_bytes());

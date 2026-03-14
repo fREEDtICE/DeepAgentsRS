@@ -186,13 +186,14 @@ pub fn validate_package_skill_input_schema(schema: &serde_json::Value) -> Result
     let required = parse_required_fields(schema_obj)?;
     if !required.is_empty() {
         let Some(properties) = properties else {
-            return Err(anyhow!(
-                "required fields require properties definitions"
-            ));
+            return Err(anyhow!("required fields require properties definitions"));
         };
         for key in required {
             if !properties.contains_key(&key) {
-                return Err(anyhow!("required field not declared in properties: {}", key));
+                return Err(anyhow!(
+                    "required field not declared in properties: {}",
+                    key
+                ));
             }
         }
     }
@@ -220,7 +221,9 @@ pub fn validate_package_skill_input(
     let input_obj = input
         .as_object()
         .ok_or_else(|| anyhow!("input must be object"))?;
-    let properties = schema_obj.get("properties").and_then(|value| value.as_object());
+    let properties = schema_obj
+        .get("properties")
+        .and_then(|value| value.as_object());
     let required = parse_required_fields(schema_obj)?;
     for key in required {
         if !input_obj.contains_key(&key) {
@@ -431,7 +434,10 @@ fn collect_asset_dir(root: &Path, name: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
-        return Err(anyhow!("asset directory symlink not allowed: {}", dir.display()));
+        return Err(anyhow!(
+            "asset directory symlink not allowed: {}",
+            dir.display()
+        ));
     }
     let mut out = WalkDir::new(&dir)
         .follow_links(false)
@@ -444,10 +450,16 @@ fn collect_asset_dir(root: &Path, name: &str) -> Result<Vec<String>> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(anyhow!("asset symlink not allowed: {}", entry.path().display()));
+            return Err(anyhow!(
+                "asset symlink not allowed: {}",
+                entry.path().display()
+            ));
         }
         let relative = entry.path().strip_prefix(root).map_err(|_| {
-            anyhow!("asset path escaped package root: {}", entry.path().display())
+            anyhow!(
+                "asset path escaped package root: {}",
+                entry.path().display()
+            )
         })?;
         paths.push(relative.to_string_lossy().to_string());
     }
@@ -631,7 +643,10 @@ fn validate_property_schema(name: &str, schema: &serde_json::Value) -> Result<()
     let Some(typ) = schema_obj.get("type").and_then(|value| value.as_str()) else {
         return Err(anyhow!("property {} missing type", name));
     };
-    if !matches!(typ, "string" | "integer" | "number" | "boolean" | "object" | "array") {
+    if !matches!(
+        typ,
+        "string" | "integer" | "number" | "boolean" | "object" | "array"
+    ) {
         return Err(anyhow!("property {} has unsupported type: {}", name, typ));
     }
     Ok(())
@@ -665,7 +680,9 @@ fn validate_input_value(
     }
 }
 
-fn parse_required_fields(schema_obj: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<String>> {
+fn parse_required_fields(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>> {
     let Some(required) = schema_obj.get("required") else {
         return Ok(Vec::new());
     };

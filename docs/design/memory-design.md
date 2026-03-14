@@ -1,3 +1,25 @@
+# Memory Design (Target State)
+
+- Status: Target-state design
+- Current implementation baseline: [`memory-architecture-rfc.md`](./memory-architecture-rfc.md)
+
+## Status and scope
+
+This document is intentionally aspirational. It describes the memory architecture DeepAgentsRS could
+evolve toward after the current root-scoped, file-backed memory baseline is hardened.
+
+The current repository does **not** yet implement:
+
+* canonical `User` / `ChannelAccount` / `Thread` / `Workspace` identity graphs
+* durable `thread` / `user` / `workspace` scope fields on stored memory entries
+* typed long-term memory records such as `profile`, `episodic`, `semantic`, `procedural`, and `pinned`
+* hybrid relational + vector retrieval with ranked memory packs
+* automatic extraction, consolidation, or permissioned workspace sharing
+
+For shipped behavior, constraints, and current guarantees, treat
+[`memory-architecture-rfc.md`](./memory-architecture-rfc.md) as authoritative. Read the rest of
+this document as a target-state design, not as the current repository contract.
+
 ## 1. Design goals
 
 This memory system should support five things at once:
@@ -498,7 +520,7 @@ This is much better for retrieval than dragging many raw episodes into the promp
 
 ## 12. Suggested system components
 
-A practical service split:
+A practical future service split:
 
 ### 12.1 Services
 
@@ -677,9 +699,9 @@ You should make explicit decisions on these:
 
 ---
 
-## 17. My recommended architecture choice
+## 17. Recommended target architecture
 
-For your scenario, I would recommend:
+The recommended target architecture is:
 
 * **Canonical identity layer**
 
@@ -747,11 +769,5 @@ System stores:
 
 **Treat memory as scoped, typed, permissioned knowledge that is selectively written, continuously retrieved, and continuously consolidated.**
 
-If you want, I can turn this into a more formal **technical design document** with:
-
-* architecture diagram
-* database schema
-* retrieval/write APIs
-* memory ranking formula
-* edge cases and failure modes.
-
+Future RFCs should adopt pieces of this design incrementally while preserving the current baseline
+guarantees documented in [`memory-architecture-rfc.md`](./memory-architecture-rfc.md).

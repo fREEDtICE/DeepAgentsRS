@@ -101,6 +101,54 @@ default = 30000
 min = 1
 
 [[fields]]
+key = "memory.file.max_source_bytes"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 10485760
+min = 1
+
+[[fields]]
+key = "memory.file.strict"
+kind = "boolean"
+scopes = ["global", "workspace"]
+default = true
+
+[[fields]]
+key = "memory.file.runtime_mode"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "compatibility"
+enum_values = ["compatibility", "scoped"]
+
+[[fields]]
+key = "memory.file.max_entries"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 200
+min = 1
+
+[[fields]]
+key = "memory.file.max_bytes_total"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 200000
+min = 1
+
+[[fields]]
+key = "memory.file.eviction"
+kind = "enum"
+scopes = ["global", "workspace"]
+default = "lru"
+enum_values = ["lru", "fifo", "ttl"]
+
+[[fields]]
+key = "memory.file.ttl_secs"
+kind = "integer"
+scopes = ["global", "workspace"]
+default = 86400
+min = 1
+
+[[fields]]
 key = "runtime.max_steps"
 kind = "integer"
 scopes = ["global", "workspace"]

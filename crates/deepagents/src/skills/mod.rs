@@ -559,7 +559,12 @@ impl LoadedSkills {
                 .identity
                 .name
                 .cmp(&b.manifest.identity.name)
-                .then_with(|| a.manifest.identity.version.cmp(&b.manifest.identity.version))
+                .then_with(|| {
+                    a.manifest
+                        .identity
+                        .version
+                        .cmp(&b.manifest.identity.version)
+                })
                 .then_with(|| a.manifest.source.cmp(&b.manifest.source))
                 .then_with(|| a.manifest.path.cmp(&b.manifest.path))
         });
@@ -577,7 +582,9 @@ impl LoadedSkills {
                 .then_with(|| a.skill_version.cmp(&b.skill_version))
                 .then_with(|| a.source.cmp(&b.source))
         });
-        self.diagnostics.sources.sort_by(|a, b| a.source.cmp(&b.source));
+        self.diagnostics
+            .sources
+            .sort_by(|a, b| a.source.cmp(&b.source));
         self.diagnostics.overrides.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
@@ -723,7 +730,12 @@ impl ResolvedSkillSnapshot {
                 .identity
                 .name
                 .cmp(&b.manifest.identity.name)
-                .then_with(|| a.manifest.identity.version.cmp(&b.manifest.identity.version))
+                .then_with(|| {
+                    a.manifest
+                        .identity
+                        .version
+                        .cmp(&b.manifest.identity.version)
+                })
                 .then_with(|| a.manifest.source.cmp(&b.manifest.source))
         });
         self.selection.candidates.sort_by(|a, b| {
@@ -766,7 +778,10 @@ impl ResolvedSkillSnapshot {
 }
 
 /// Stores the resolved snapshot and compatibility mirrors in the agent state.
-pub fn store_resolved_snapshot(state: &mut AgentState, snapshot: &ResolvedSkillSnapshot) -> Result<()> {
+pub fn store_resolved_snapshot(
+    state: &mut AgentState,
+    snapshot: &ResolvedSkillSnapshot,
+) -> Result<()> {
     let mut snapshot = snapshot.clone();
     snapshot.canonicalize();
     state.extra.insert(
@@ -795,14 +810,15 @@ pub fn restore_resolved_snapshot(state: &AgentState) -> Option<ResolvedSkillSnap
 }
 
 /// Stores aggregated diagnostics in both the new and legacy state keys.
-pub fn store_skills_diagnostics(state: &mut AgentState, diagnostics: &SkillsDiagnostics) -> Result<()> {
+pub fn store_skills_diagnostics(
+    state: &mut AgentState,
+    diagnostics: &SkillsDiagnostics,
+) -> Result<()> {
     let value = serde_json::to_value(diagnostics)?;
     state
         .extra
         .insert(SKILLS_DIAGNOSTICS_KEY.to_string(), value.clone());
-    state
-        .extra
-        .insert("skills_diagnostics".to_string(), value);
+    state.extra.insert("skills_diagnostics".to_string(), value);
     Ok(())
 }
 

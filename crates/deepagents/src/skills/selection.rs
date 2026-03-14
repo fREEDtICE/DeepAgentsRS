@@ -146,7 +146,9 @@ pub fn resolve_skill_snapshot(
             });
             continue;
         }
-        if entry.lifecycle == SkillLifecycleState::Disabled && !matches_pin(&entry.package.manifest.identity, &pins) {
+        if entry.lifecycle == SkillLifecycleState::Disabled
+            && !matches_pin(&entry.package.manifest.identity, &pins)
+        {
             report.skipped.push(SkillSkippedRecord {
                 identity: entry.package.manifest.identity.clone(),
                 source: entry.package.manifest.source.clone(),
@@ -180,8 +182,10 @@ pub fn resolve_skill_snapshot(
                 }
             }
             SkillSelectionMode::Auto => {
-                if options.registry_dir.is_none() && !options.sources.is_empty() && pins.is_empty() {
-                    selected_entries.push((entry.clone(), vec!["source_compat_default".to_string()]));
+                if options.registry_dir.is_none() && !options.sources.is_empty() && pins.is_empty()
+                {
+                    selected_entries
+                        .push((entry.clone(), vec!["source_compat_default".to_string()]));
                 } else if score > 0 {
                     selected_entries.push((entry.clone(), reasons));
                 } else {
@@ -241,16 +245,12 @@ pub fn resolve_skill_snapshot(
             SkillExecutionMode::Inline
         };
         snapshot.metadata.push(entry.package.metadata.clone());
-        snapshot.tools.extend(
-            entry.package
-                .tools
-                .iter()
-                .cloned()
-                .map(|mut tool| {
-                    tool.requires_isolation = execution_mode == SkillExecutionMode::Subagent;
-                    tool
-                }),
-        );
+        snapshot
+            .tools
+            .extend(entry.package.tools.iter().cloned().map(|mut tool| {
+                tool.requires_isolation = execution_mode == SkillExecutionMode::Subagent;
+                tool
+            }));
         snapshot.packages.push(entry.package.clone());
         report.selected.push(SkillSelectedRecord {
             identity: entry.package.manifest.identity.clone(),
@@ -258,7 +258,12 @@ pub fn resolve_skill_snapshot(
             source: entry.package.manifest.source.clone(),
             reasons,
             fragments,
-            tool_names: entry.package.tools.iter().map(|tool| tool.name.clone()).collect(),
+            tool_names: entry
+                .package
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
             execution_mode,
             governance: entry.package.governance.clone(),
             content_hash: entry.content_hash.clone(),
@@ -300,7 +305,9 @@ fn build_catalog(options: &SkillResolverOptions) -> Result<BTreeMap<String, Cata
     }
 
     if !options.sources.is_empty() {
-        for package in load_skill_packages_from_sources(&options.sources, options.source_options.clone())? {
+        for package in
+            load_skill_packages_from_sources(&options.sources, options.source_options.clone())?
+        {
             out.insert(
                 package.manifest.identity.as_key(),
                 CatalogEntry {
@@ -462,13 +469,19 @@ fn build_injection_block(snapshot: &ResolvedSkillSnapshot) -> String {
 
 fn matches_pin(identity: &SkillIdentity, pins: &[(String, Option<String>)]) -> bool {
     pins.iter().any(|(name, version)| {
-        identity.name == *name && version.as_deref().is_none_or(|value| value == identity.version)
+        identity.name == *name
+            && version
+                .as_deref()
+                .is_none_or(|value| value == identity.version)
     })
 }
 
 fn matches_disable(identity: &SkillIdentity, disables: &[(String, Option<String>)]) -> bool {
     disables.iter().any(|(name, version)| {
-        identity.name == *name && version.as_deref().is_none_or(|value| value == identity.version)
+        identity.name == *name
+            && version
+                .as_deref()
+                .is_none_or(|value| value == identity.version)
     })
 }
 

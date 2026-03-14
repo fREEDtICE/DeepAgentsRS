@@ -18,7 +18,6 @@ use crate::runtime::events::{
     diff_state_keys, preview_json, preview_text, provider_step_kind, summarize_messages, RunEvent,
     RunEventSink,
 };
-use crate::skills::attach_skills_trace_to_trace;
 use crate::runtime::filesystem_runtime_middleware::{
     LargeToolResultOffloadOptions, LARGE_TOOL_RESULT_OFFLOAD_OPTIONS_KEY,
 };
@@ -34,6 +33,7 @@ use crate::runtime::structured_output::parse_structured_output;
 use crate::runtime::tool_compat::{
     normalize_tool_call_for_execution, tool_results_from_messages, NormalizedToolCall,
 };
+use crate::skills::attach_skills_trace_to_trace;
 use crate::state::AgentState;
 use crate::types::{Message, ToolCall};
 use crate::DeepAgent;
@@ -1611,7 +1611,10 @@ impl ResumableRunner {
         tool_name: &str,
     ) -> Option<(String, String)> {
         let snapshot = crate::skills::restore_resolved_snapshot(state)?;
-        let tool = snapshot.tools.into_iter().find(|tool| tool.name == tool_name)?;
+        let tool = snapshot
+            .tools
+            .into_iter()
+            .find(|tool| tool.name == tool_name)?;
         Some((tool.skill_name, tool.skill_version))
     }
 
@@ -1671,7 +1674,8 @@ impl ResumableRunner {
         tool_call_id: &str,
         sink: &mut dyn RunEventSink,
     ) {
-        let Some((skill_name, skill_version)) = self.skill_identity_for_tool(&self.state, tool_name)
+        let Some((skill_name, skill_version)) =
+            self.skill_identity_for_tool(&self.state, tool_name)
         else {
             return;
         };
@@ -1696,7 +1700,8 @@ impl ResumableRunner {
         error: Option<String>,
         sink: &mut dyn RunEventSink,
     ) {
-        let Some((skill_name, skill_version)) = self.skill_identity_for_tool(&self.state, tool_name)
+        let Some((skill_name, skill_version)) =
+            self.skill_identity_for_tool(&self.state, tool_name)
         else {
             return;
         };

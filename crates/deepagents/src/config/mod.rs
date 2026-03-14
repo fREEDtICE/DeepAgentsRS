@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::approval::ExecutionMode;
+use crate::memory::{MemoryEvictionPolicy, MemoryPolicy, MemoryRuntimeMode};
 use crate::provider::catalog::ProviderSurfaceKind;
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -619,6 +620,22 @@ pub struct MemoryConfig {
     pub sources: Vec<String>,
     pub allow_host_paths: bool,
     pub max_injected_chars: usize,
+    pub max_source_bytes: usize,
+    pub strict: bool,
+    pub runtime_mode: MemoryRuntimeMode,
+    pub max_entries: usize,
+    pub max_bytes_total: usize,
+    pub eviction: MemoryEvictionPolicy,
+}
+
+impl MemoryConfig {
+    pub fn store_policy(&self) -> MemoryPolicy {
+        MemoryPolicy {
+            max_entries: self.max_entries,
+            max_bytes_total: self.max_bytes_total,
+            eviction: self.eviction.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,6 +1027,46 @@ impl ConfigManager {
                         .get("memory.file.max_injected_chars")
                         .and_then(|value| value.as_i64())
                         .unwrap_or(30_000),
+                )?,
+                max_source_bytes: value_to_usize(
+                    values
+                        .get("memory.file.max_source_bytes")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(10 * 1024 * 1024),
+                )?,
+                strict: values
+                    .get("memory.file.strict")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+                runtime_mode: parse_memory_runtime_mode(
+                    values
+                        .get("memory.file.runtime_mode")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("compatibility"),
+                )?,
+                max_entries: value_to_usize(
+                    values
+                        .get("memory.file.max_entries")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(200),
+                )?,
+                max_bytes_total: value_to_usize(
+                    values
+                        .get("memory.file.max_bytes_total")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or(200_000),
+                )?,
+                eviction: parse_memory_eviction(
+                    values
+                        .get("memory.file.eviction")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("lru"),
+                    value_to_u64(
+                        values
+                            .get("memory.file.ttl_secs")
+                            .and_then(|value| value.as_i64())
+                            .unwrap_or(86_400),
+                    )?,
                 )?,
             },
             runtime: RuntimeConfig {
@@ -1504,6 +1561,27 @@ fn parse_memory_backend(input: &str) -> Result<MemoryBackendKind, ConfigError> {
         "file" => Ok(MemoryBackendKind::File),
         other => Err(ConfigError::invalid_value(format!(
             "unknown memory backend: {other}"
+        ))),
+    }
+}
+
+fn parse_memory_runtime_mode(input: &str) -> Result<MemoryRuntimeMode, ConfigError> {
+    match input {
+        "compatibility" => Ok(MemoryRuntimeMode::Compatibility),
+        "scoped" => Ok(MemoryRuntimeMode::Scoped),
+        other => Err(ConfigError::invalid_value(format!(
+            "unknown memory runtime mode: {other}"
+        ))),
+    }
+}
+
+fn parse_memory_eviction(input: &str, ttl_secs: u64) -> Result<MemoryEvictionPolicy, ConfigError> {
+    match input {
+        "lru" => Ok(MemoryEvictionPolicy::Lru),
+        "fifo" => Ok(MemoryEvictionPolicy::Fifo),
+        "ttl" => Ok(MemoryEvictionPolicy::Ttl { ttl_secs }),
+        other => Err(ConfigError::invalid_value(format!(
+            "unknown memory eviction policy: {other}"
         ))),
     }
 }

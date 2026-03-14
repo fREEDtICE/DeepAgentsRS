@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
 use deepagents::config::{ConfigKey, ConfigManager, ConfigOverrides, ConfigScope, ConfigValue};
+use deepagents::memory::{MemoryEvictionPolicy, MemoryRuntimeMode};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -109,4 +110,76 @@ fn workspace_config_is_written_with_secure_permissions() {
         assert_eq!(file_mode, 0o600);
         assert_eq!(dir_mode, 0o700);
     }
+}
+
+#[test]
+fn effective_config_reads_memory_loader_fields() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::env::set_var("DEEPAGENTS_CONFIG_HOME", global_dir.path());
+
+    let manager = ConfigManager::new(workspace.path()).unwrap();
+    manager
+        .set(
+            ConfigScope::Workspace,
+            &ConfigKey::parse("memory.file.max_source_bytes").unwrap(),
+            ConfigValue::Integer(4096),
+        )
+        .unwrap();
+    manager
+        .set(
+            ConfigScope::Workspace,
+            &ConfigKey::parse("memory.file.strict").unwrap(),
+            ConfigValue::Boolean(false),
+        )
+        .unwrap();
+    manager
+        .set(
+            ConfigScope::Workspace,
+            &ConfigKey::parse("memory.file.runtime_mode").unwrap(),
+            ConfigValue::String("scoped".to_string()),
+        )
+        .unwrap();
+
+    let effective = manager.resolve_effective(&ConfigOverrides::new()).unwrap();
+    assert_eq!(effective.memory.max_source_bytes, 4096);
+    assert!(!effective.memory.strict);
+    assert_eq!(effective.memory.runtime_mode, MemoryRuntimeMode::Scoped);
+}
+
+#[test]
+fn effective_config_reads_memory_store_policy_fields() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let global_dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::env::set_var("DEEPAGENTS_CONFIG_HOME", global_dir.path());
+
+    let manager = ConfigManager::new(workspace.path()).unwrap();
+    for (key, value) in [
+        ("memory.file.max_entries", ConfigValue::Integer(7)),
+        ("memory.file.max_bytes_total", ConfigValue::Integer(3210)),
+        (
+            "memory.file.eviction",
+            ConfigValue::String("ttl".to_string()),
+        ),
+        ("memory.file.ttl_secs", ConfigValue::Integer(42)),
+    ] {
+        manager
+            .set(
+                ConfigScope::Workspace,
+                &ConfigKey::parse(key).unwrap(),
+                value,
+            )
+            .unwrap();
+    }
+
+    let effective = manager.resolve_effective(&ConfigOverrides::new()).unwrap();
+    assert_eq!(effective.memory.max_entries, 7);
+    assert_eq!(effective.memory.max_bytes_total, 3210);
+    assert_eq!(
+        effective.memory.eviction,
+        MemoryEvictionPolicy::Ttl { ttl_secs: 42 }
+    );
+    assert_eq!(effective.memory.store_policy().max_entries, 7);
 }

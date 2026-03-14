@@ -15,9 +15,9 @@ use crate::skills::validator::{
     classify_package_skill_step_tool, validate_package_skill_input, PackageSkillStepKind,
 };
 use crate::skills::{
-    restore_resolved_snapshot, store_resolved_snapshot, store_skills_diagnostics, SkillExecutionMode,
-    SkillGovernanceSeverity, SkillPackage, SkillSelectedRecord, SkillToolPolicy, SkillToolSpec,
-    SkillsDiagnostics, ResolvedSkillSnapshot,
+    restore_resolved_snapshot, store_resolved_snapshot, store_skills_diagnostics,
+    ResolvedSkillSnapshot, SkillExecutionMode, SkillGovernanceSeverity, SkillPackage,
+    SkillSelectedRecord, SkillToolPolicy, SkillToolSpec, SkillsDiagnostics,
 };
 use crate::state::AgentState;
 use crate::types::Message;
@@ -153,7 +153,8 @@ impl RuntimeMiddleware for SkillsMiddleware {
             }));
         }
 
-        if let Err(error) = validate_package_skill_input(&tool.input_schema, &ctx.tool_call.arguments)
+        if let Err(error) =
+            validate_package_skill_input(&tool.input_schema, &ctx.tool_call.arguments)
         {
             return Ok(Some(HandledToolCall {
                 output: serde_json::Value::Null,
@@ -237,7 +238,13 @@ async fn execute_subagent_skill(
     selected: Option<&SkillSelectedRecord>,
     package: Option<&SkillPackage>,
 ) -> std::result::Result<serde_json::Value, String> {
-    let description = build_context_capsule(tool, selected, package, &ctx.tool_call.arguments, ctx.messages);
+    let description = build_context_capsule(
+        tool,
+        selected,
+        package,
+        &ctx.tool_call.arguments,
+        ctx.messages,
+    );
     let task_call = AgentToolCall {
         tool_name: "task".to_string(),
         arguments: serde_json::json!({
@@ -265,7 +272,10 @@ async fn execute_subagent_skill(
             Ok(Some(handled)) => {
                 return match handled.error {
                     Some(error) => Err(error),
-                    None => Ok(truncate_output(handled.output, tool.policy.max_output_chars)),
+                    None => Ok(truncate_output(
+                        handled.output,
+                        tool.policy.max_output_chars,
+                    )),
                 };
             }
             Ok(None) => continue,
@@ -612,17 +622,19 @@ impl SkillsMiddleware {
         let mut diagnostics = SkillsDiagnostics::default();
         for package in &snapshot.packages {
             for finding in &package.governance.findings {
-                diagnostics.records.push(crate::skills::SkillDiagnosticRecord {
-                    name: package.manifest.identity.name.clone(),
-                    version: package.manifest.identity.version.clone(),
-                    source: package.manifest.source.clone(),
-                    severity: match finding.severity {
-                        SkillGovernanceSeverity::Warn => "warn".to_string(),
-                        SkillGovernanceSeverity::Fail => "fail".to_string(),
-                    },
-                    code: finding.code.clone(),
-                    message: finding.message.clone(),
-                });
+                diagnostics
+                    .records
+                    .push(crate::skills::SkillDiagnosticRecord {
+                        name: package.manifest.identity.name.clone(),
+                        version: package.manifest.identity.version.clone(),
+                        source: package.manifest.source.clone(),
+                        severity: match finding.severity {
+                            SkillGovernanceSeverity::Warn => "warn".to_string(),
+                            SkillGovernanceSeverity::Fail => "fail".to_string(),
+                        },
+                        code: finding.code.clone(),
+                        message: finding.message.clone(),
+                    });
             }
         }
         Ok(diagnostics)

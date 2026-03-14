@@ -40,9 +40,8 @@ fn write_skill_package(
 ) {
     let skill_dir = source_root.join(name);
     std::fs::create_dir_all(&skill_dir).unwrap();
-    let mut skill_md = format!(
-        "---\nname: {name}\nversion: {version}\ndescription: {description}\n"
-    );
+    let mut skill_md =
+        format!("---\nname: {name}\nversion: {version}\ndescription: {description}\n");
     if !frontmatter_extra.is_empty() {
         skill_md.push_str(frontmatter_extra);
         if !frontmatter_extra.ends_with('\n') {
@@ -239,10 +238,8 @@ fn phase7_skill_registry_install_status_versions_and_lifecycle_are_scriptable() 
         Some("0.2.0")
     );
 
-    let (status, disable_json, stderr) = run_cli(
-        root,
-        &["skill", "disable", "math-helper@0.2.0", "--pretty"],
-    );
+    let (status, disable_json, stderr) =
+        run_cli(root, &["skill", "disable", "math-helper@0.2.0", "--pretty"]);
     assert!(status.success(), "stderr={stderr}");
     assert_eq!(
         disable_json
@@ -403,7 +400,10 @@ fn phase7_run_sticky_snapshot_requires_refresh_and_writes_audit() {
     ];
     let (status, first_run, stderr) = run_cli(root, &run_args);
     assert!(status.success(), "stderr={stderr}");
-    assert_eq!(selected_skill_names_from_run(&first_run), vec!["zeta-helper"]);
+    assert_eq!(
+        selected_skill_names_from_run(&first_run),
+        vec!["zeta-helper"]
+    );
     let thread_id = first_run
         .get("state")
         .and_then(|state| state.get("extra"))
@@ -435,7 +435,10 @@ fn phase7_run_sticky_snapshot_requires_refresh_and_writes_audit() {
 
     let (status, second_run, stderr) = run_cli(root, &run_args);
     assert!(status.success(), "stderr={stderr}");
-    assert_eq!(selected_skill_names_from_run(&second_run), vec!["zeta-helper"]);
+    assert_eq!(
+        selected_skill_names_from_run(&second_run),
+        vec!["zeta-helper"]
+    );
 
     let refresh_args = [
         "run",
@@ -453,17 +456,14 @@ fn phase7_run_sticky_snapshot_requires_refresh_and_writes_audit() {
     ];
     let (status, refreshed_run, stderr) = run_cli(root, &refresh_args);
     assert!(status.success(), "stderr={stderr}");
-    assert_eq!(selected_skill_names_from_run(&refreshed_run), vec!["alpha-helper"]);
+    assert_eq!(
+        selected_skill_names_from_run(&refreshed_run),
+        vec!["alpha-helper"]
+    );
 
     let (status, audit_json, stderr) = run_cli(
         root,
-        &[
-            "skill",
-            "audit",
-            "--thread-id",
-            &thread_id,
-            "--pretty",
-        ],
+        &["skill", "audit", "--thread-id", &thread_id, "--pretty"],
     );
     assert!(status.success(), "stderr={stderr}");
     assert_eq!(
@@ -521,16 +521,8 @@ fn phase7_quarantined_skill_is_skipped_and_cannot_be_enabled() {
         Some("quarantined")
     );
 
-    let (status, resolve_json, stderr) = run_cli(
-        root,
-        &[
-            "skill",
-            "resolve",
-            "--input",
-            "danger",
-            "--pretty",
-        ],
-    );
+    let (status, resolve_json, stderr) =
+        run_cli(root, &["skill", "resolve", "--input", "danger", "--pretty"]);
     assert!(status.success(), "stderr={stderr}");
     assert!(selected_skill_names_from_resolve(&resolve_json).is_empty());
     assert!(skipped_reasons_from_resolve(&resolve_json)
@@ -539,12 +531,7 @@ fn phase7_quarantined_skill_is_skipped_and_cannot_be_enabled() {
 
     let (status, enable_json, stderr) = run_cli(
         root,
-        &[
-            "skill",
-            "enable",
-            "danger-helper@0.1.0",
-            "--pretty",
-        ],
+        &["skill", "enable", "danger-helper@0.1.0", "--pretty"],
     );
     assert!(!status.success(), "stderr={stderr}");
     assert_eq!(
@@ -722,7 +709,8 @@ fn phase7_isolated_skill_uses_subagent_capsule() {
         ],
     );
     assert!(status.success(), "stderr={stderr}");
-    let payload: serde_json::Value = serde_json::from_str(&tool_result_content(&run_json, 0)).unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&tool_result_content(&run_json, 0)).unwrap();
     assert_eq!(
         payload
             .get("messages_len")

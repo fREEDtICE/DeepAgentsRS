@@ -149,10 +149,7 @@ pub fn load_skills(sources: &[String], options: SkillsLoadOptions) -> Result<Loa
     loaded.tools = tool_map.into_values().collect::<Vec<_>>();
     loaded.diagnostics.sources = diagnostics.sources;
     loaded.diagnostics.records.extend(diagnostics.records);
-    loaded
-        .diagnostics
-        .overrides
-        .extend(diagnostics.overrides);
+    loaded.diagnostics.overrides.extend(diagnostics.overrides);
     loaded.canonicalize();
     Ok(loaded)
 }
@@ -167,8 +164,7 @@ fn source_name(path: &Path) -> String {
 fn is_core_tool(name: &str) -> bool {
     matches!(
         name,
-        "ls"
-            | "read_file"
+        "ls" | "read_file"
             | "write_file"
             | "edit_file"
             | "delete_file"

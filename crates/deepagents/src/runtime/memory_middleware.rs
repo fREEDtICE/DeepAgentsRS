@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
-use crate::memory::protocol::MemoryDiagnostics;
+use crate::memory::{
+    build_memory_pack, FileMemoryStore, MemoryActorInput, MemoryDiagnostics,
+    MemoryIdentityResolver, MemoryPolicy, MemoryRetrievalDiagnostics, MemoryRuntimeMode,
+    MemoryStore,
+};
 use crate::runtime::RuntimeMiddleware;
 use crate::state::AgentState;
 use crate::types::Message;
@@ -15,6 +19,10 @@ pub struct MemoryLoadOptions {
     pub max_injected_chars: usize,
     pub max_source_bytes: usize,
     pub strict: bool,
+    pub runtime_mode: MemoryRuntimeMode,
+    pub store_path: PathBuf,
+    pub store_policy: MemoryPolicy,
+    pub actor: MemoryActorInput,
 }
 
 impl Default for MemoryLoadOptions {
@@ -24,6 +32,10 @@ impl Default for MemoryLoadOptions {
             max_injected_chars: 30_000,
             max_source_bytes: 10 * 1024 * 1024,
             strict: true,
+            runtime_mode: MemoryRuntimeMode::Compatibility,
+            store_path: PathBuf::from(".deepagents/memory_store.json"),
+            store_policy: MemoryPolicy::default(),
+            actor: MemoryActorInput::default(),
         }
     }
 }
@@ -37,7 +49,8 @@ pub struct MemoryMiddleware {
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadedMemory {
-    pub diagnostics: MemoryDiagnostics,
+    pub compatibility: Option<MemoryDiagnostics>,
+    pub retrieval: Option<MemoryRetrievalDiagnostics>,
 }
 
 impl MemoryMiddleware {
@@ -66,43 +79,96 @@ impl RuntimeMiddleware for MemoryMiddleware {
             return Ok(messages);
         }
 
-        let (contents, diagnostics) = load_sources(&self.root, &self.sources, &self.options)?;
-        state.private.memory_loaded = true;
-        state.private.memory_contents = Some(contents.clone());
-        state.extra.insert(
-            "memory_diagnostics".to_string(),
-            serde_json::to_value(&diagnostics)?,
-        );
-        *self.state.write().unwrap() = LoadedMemory {
-            diagnostics: diagnostics.clone(),
-        };
+        match self.options.runtime_mode {
+            MemoryRuntimeMode::Compatibility => {
+                let (contents, diagnostics) =
+                    load_sources(&self.root, &self.sources, &self.options)?;
+                let block = build_memory_block(&contents, &self.sources, &diagnostics);
+                state.private.memory_loaded = true;
+                state.private.memory_contents = Some(contents);
+                state.extra.insert(
+                    "memory_diagnostics".to_string(),
+                    serde_json::to_value(&diagnostics)?,
+                );
+                *self.state.write().unwrap() = LoadedMemory {
+                    compatibility: Some(diagnostics.clone()),
+                    retrieval: None,
+                };
 
-        if !has_injection_marker(&messages) {
-            let block = build_memory_block(&contents, &self.sources, &diagnostics);
-            messages.insert(
-                0,
-                Message {
-                    role: "system".to_string(),
-                    content: block,
-                    content_blocks: None,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    status: None,
-                },
-            );
+                if !has_injection_marker(&messages) {
+                    messages.insert(0, system_message(block));
+                }
+            }
+            MemoryRuntimeMode::Scoped => {
+                let (rendered, diagnostics) =
+                    load_scoped_memory(&self.root, &self.options, &messages).await?;
+                state.private.memory_loaded = true;
+                state.private.memory_contents = Some(BTreeMap::from([(
+                    "__memory_pack__".to_string(),
+                    rendered.clone(),
+                )]));
+                state.extra.insert(
+                    "memory_retrieval".to_string(),
+                    serde_json::to_value(&diagnostics)?,
+                );
+                *self.state.write().unwrap() = LoadedMemory {
+                    compatibility: None,
+                    retrieval: Some(diagnostics.clone()),
+                };
+
+                if !has_injection_marker(&messages) {
+                    messages.insert(0, system_message(rendered));
+                }
+            }
         }
 
         Ok(messages)
     }
 }
 
+fn system_message(content: String) -> Message {
+    Message {
+        role: "system".to_string(),
+        content,
+        content_blocks: None,
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        status: None,
+    }
+}
+
 fn has_injection_marker(messages: &[Message]) -> bool {
     messages
         .iter()
-        .filter(|m| m.role == "system")
-        .any(|m| m.content.contains("DEEPAGENTS_MEMORY_INJECTED_V1"))
+        .filter(|message| message.role == "system")
+        .any(|message| message.content.contains("DEEPAGENTS_MEMORY_INJECTED_V"))
+}
+
+async fn load_scoped_memory(
+    root: &Path,
+    options: &MemoryLoadOptions,
+    messages: &[Message],
+) -> Result<(String, MemoryRetrievalDiagnostics)> {
+    let store_path = resolve_store_path(root, &options.store_path);
+    let store = FileMemoryStore::new(store_path);
+    store.load().await?;
+    store.set_policy(options.store_policy.clone()).await?;
+
+    let resolver = crate::memory::LocalIdentityResolver::new(root.to_string_lossy().to_string());
+    let actor = resolver.resolve_actor(&options.actor);
+    let (_, diagnostics, rendered) =
+        build_memory_pack(&store, &actor, messages, options.max_injected_chars).await?;
+    Ok((rendered, diagnostics))
+}
+
+fn resolve_store_path(root: &Path, store_path: &Path) -> PathBuf {
+    if store_path.is_absolute() {
+        store_path.to_path_buf()
+    } else {
+        root.join(store_path)
+    }
 }
 
 fn build_memory_block(
@@ -134,9 +200,9 @@ fn build_memory_block(
     }
 
     let mut sections: Vec<String> = Vec::new();
-    for s in sources {
-        if let Some(c) = contents.get(s) {
-            sections.push(format!("{s}\n{c}"));
+    for source in sources {
+        if let Some(content) = contents.get(source) {
+            sections.push(format!("{source}\n{content}"));
         }
     }
     let body = if sections.is_empty() {
@@ -175,27 +241,30 @@ fn load_sources(
     let mut diagnostics = MemoryDiagnostics::default();
     let mut out: BTreeMap<String, String> = BTreeMap::new();
 
-    for s in sources {
-        match load_one_source(root, s, options) {
+    for source in sources {
+        match load_one_source(root, source, options) {
             Ok(Some(content)) => {
                 diagnostics.loaded_sources += 1;
-                out.insert(s.clone(), content);
+                out.insert(source.clone(), content);
             }
             Ok(None) => {
                 diagnostics.skipped_not_found += 1;
             }
-            Err(e) => {
+            Err(error) => {
                 if options.strict {
-                    return Err(e);
+                    return Err(error);
                 }
-                diagnostics.errors.push(e.to_string());
+                diagnostics.errors.push(error.to_string());
             }
         }
     }
 
     let combined = sources
         .iter()
-        .filter_map(|s| out.get(s).map(|c| format!("{s}\n{c}")))
+        .filter_map(|source| {
+            out.get(source)
+                .map(|content| format!("{source}\n{content}"))
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     diagnostics.combined_chars = combined.chars().count();
@@ -236,17 +305,17 @@ fn load_one_source(
     source: &str,
     options: &MemoryLoadOptions,
 ) -> Result<Option<String>> {
-    let p = resolve_source_path(root, source, options)?;
-    if p.file_name().and_then(|n| n.to_str()) != Some("AGENTS.md") {
+    let path = resolve_source_path(root, source, options)?;
+    if path.file_name().and_then(|name| name.to_str()) != Some("AGENTS.md") {
         anyhow::bail!(
             "invalid_request: memory source must be AGENTS.md: {}",
             source
         );
     }
-    let meta = match std::fs::symlink_metadata(&p) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("memory_io_error: {}: {}", source, e)),
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(anyhow::anyhow!("memory_io_error: {}: {}", source, error)),
     };
     if meta.file_type().is_symlink() {
         anyhow::bail!("permission_denied: symlink not allowed: {}", source);
@@ -254,42 +323,46 @@ fn load_one_source(
     if meta.len() as usize > options.max_source_bytes {
         anyhow::bail!("memory_quota_exceeded: source too large: {}", source);
     }
-    let content = match std::fs::read_to_string(&p) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("memory_io_error: {}: {}", source, e)),
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(anyhow::anyhow!("memory_io_error: {}: {}", source, error)),
     };
     Ok(Some(content))
 }
 
 fn resolve_source_path(root: &Path, source: &str, options: &MemoryLoadOptions) -> Result<PathBuf> {
-    let root_canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let root_raw = root.to_path_buf();
-
-    if source.starts_with("~/") || source.starts_with("~\\") {
+    let source_path = Path::new(source);
+    let absolute = if source_path.is_absolute() {
         if !options.allow_host_paths {
-            anyhow::bail!("permission_denied: host paths disabled: {}", source);
+            anyhow::bail!(
+                "permission_denied: absolute host path not allowed: {}",
+                source
+            );
         }
-        let home =
-            std::env::var("HOME").map_err(|_| anyhow::anyhow!("memory_io_error: HOME not set"))?;
-        let rest = &source[2..];
-        return Ok(PathBuf::from(home).join(rest));
+        source_path.to_path_buf()
+    } else {
+        root.join(source_path)
+    };
+
+    if !source_path.is_absolute() {
+        let relative = absolute
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("permission_denied: outside root: {}", source))?;
+        let mut prefix = PathBuf::new();
+        for component in relative.components() {
+            if matches!(component, Component::ParentDir) {
+                anyhow::bail!("permission_denied: outside root: {}", source);
+            }
+            prefix.push(component.as_os_str());
+            let candidate = root.join(&prefix);
+            if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!("permission_denied: symlink not allowed: {}", source);
+                }
+            }
+        }
     }
 
-    let p = PathBuf::from(source);
-    if p.is_absolute() {
-        if options.allow_host_paths {
-            return Ok(p);
-        }
-        let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if p_canon.starts_with(&root_canon)
-            || p.starts_with(&root_raw)
-            || p.starts_with(&root_canon)
-        {
-            return Ok(p_canon);
-        }
-        anyhow::bail!("permission_denied: outside root: {}", source);
-    }
-
-    Ok(root_canon.join(p))
+    Ok(absolute)
 }
