@@ -140,22 +140,26 @@
 - `snapshot.selection.selected/skipped/reasons`
 - 错误码 `governance_blocked`
 
-## 4.5 配置与密钥模块（config + memory）
+## 4.5 配置与记忆模块（config + memory）
 
 关注点：
 - workspace/global 配置读取优先级
 - 密钥状态可见但值不可泄漏
-- memory store_path 配置生效
+- memory store 策略与 runtime_mode 配置生效
+- memory 生命周期命令与跨作用域访问控制
 
 核心用例：
 - `config set/get/doctor` 联动
 - run 读取 workspace provider 默认参数
-- memory put/get 使用定制 store_path
+- memory `put/remember/get/explain/edit/pin/unpin/delete/query/compact` 全链路
+- actor 上下文（user/thread/workspace）下的读写权限与可见性
+- `memory.file.eviction/ttl/max_entries/max_bytes_total/runtime_mode` 覆盖
 
 关键断言：
 - `secret_status == set` 且 stdout 不含明文 key
 - provider 请求参数符合配置
 - store 文件实际落盘路径正确
+- scoped/compatibility 运行模式注入字段符合预期
 
 ## 4.6 Provider 协议兼容模块（openai-compatible）
 
@@ -331,7 +335,11 @@
 | `--memory-max-injected-chars` | 小值/大值 | 注入文本长度受限 |
 | `--memory-max-source-bytes` | 小值触发截断 | 大源读取受限并有可观察结果 |
 | `--memory-strict` | true/false | true 下错误直接失败；false 下降级处理 |
-| `--memory-disable` | 开关 | 关闭后 memory middleware 不注入内容 |
+| `--memory-runtime-mode` | `compatibility/scoped/非法值` | compatibility 注入 `memory_diagnostics`；scoped 注入 `memory_retrieval`；非法值报错 |
+| `--memory-disable` | 开关 | 关闭后 memory middleware 不注入内容（当前建议补测） |
+| `--actor-user-id` | 设置/不设置 | user scope 读写可见性符合 actor 身份 |
+| `--actor-thread-id` | thread A/thread B | thread scope 严格线程隔离 |
+| `--actor-workspace-id` | 单值/多值 | workspace scope 访问按工作区白名单控制 |
 
 #### 10.3.5 Runtime 保护与缓存参数
 
@@ -418,26 +426,70 @@
 
 ### 10.5 `memory` 命令族
 
-#### 10.5.1 `memory put`
+#### 10.5.1 `memory put` 与 `memory remember`
 
 | 参数 | 关键场景 | 断言要点 |
 |---|---|---|
 | `--key` | 普通键/重复键 | 重复写入更新行为符合预期 |
 | `--value` | 普通文本/空串/大文本 | 写入成功且可读取 |
+| `--title` | 传/不传 | 元数据保存正确 |
+| `--scope` | `user/thread/workspace` | 作用域写入正确 |
+| `--scope-id` | 显式传入/由 actor 推导 | scope_id 解析与持久化正确 |
+| `--type` | `semantic/procedural/episodic/pinned` | memory_type 保存正确 |
+| `--pinned`（put） | 开/关 | pinned 标记生效 |
 | `--tag` | 0/1/多标签 | 查询按 tag 命中 |
+| `--actor-user-id` | 传/不传 | user scope 写权限校验正确 |
+| `--actor-thread-id` | 传/不传 | thread scope 写权限校验正确 |
+| `--actor-workspace-id` | 单值/多值 | workspace scope 写权限校验正确 |
 | `--store` | 默认/自定义路径 | 文件落盘路径正确 |
 | `--pretty` | 开关 | 输出结构不变 |
+| `remember` 默认行为 | 无 `--scope/--type` | 默认 scope=user 且 pinned=true，符合“长期记忆”语义 |
 
-#### 10.5.2 `memory get`、`query`、`compact`
+#### 10.5.2 `memory get` 与 `memory explain`
 
 | 参数 | 关键场景 | 断言要点 |
 |---|---|---|
-| `--key`（get） | 存在/不存在 | 存在返回 entry；不存在返回 null/空记录 |
+| `--key` | 存在/不存在/已删除 | get 的可见性与 explain 的诊断字段一致 |
+| `--actor-user-id` | 不同用户读取同 key | 跨用户不可见 |
+| `--actor-thread-id` | 不同线程读取同 key | thread scope 隔离生效 |
+| `--actor-workspace-id` | 不同工作区读取同 key | workspace scope 隔离生效 |
+| `--store` | 默认/自定义 | 数据源路径正确 |
+| `--pretty` | 开关 | 输出结构不变 |
+
+#### 10.5.3 `memory edit`、`pin`、`unpin`、`delete`
+
+| 参数 | 关键场景 | 断言要点 |
+|---|---|---|
+| `edit --value/--title` | 更新部分字段 | `updated=true` 且字段变更正确 |
+| `edit --scope/--scope-id` | 跨 scope 迁移 | 迁移后读写权限与可见性符合新 scope |
+| `edit --type` | 类型切换 | memory_type 更新正确 |
+| `edit --confidence/--salience` | 合法值/越界值 | 合法值生效；越界报 `invalid_arguments` |
+| `edit --clear-tags` + `--tag` | 清空后重建标签 | 标签结果与输入一致 |
+| `pin/unpin --key` | 激活项/已删除项 | 激活项可更新；已删除项不可更新 |
+| `delete --key` | 命中/未命中 | 命中 `deleted=true` 且 status=deleted；未命中 `deleted=false` |
+| actor 参数 | 非授权 actor 执行变更 | 写入被拒绝 |
+
+#### 10.5.4 `memory query` 与 `memory compact`
+
+| 参数 | 关键场景 | 断言要点 |
+|---|---|---|
 | `--prefix`（query） | 匹配/不匹配 | entries 过滤正确 |
 | `--tag`（query） | 匹配/不匹配 | tag 过滤正确 |
+| `--scope` / `--scope-id`（query） | 按作用域过滤 | 只返回目标 scope |
+| `--type`（query） | 类型过滤 | memory_type 过滤正确 |
+| `--pinned`（query） | true/false | pinned 过滤正确 |
+| `--status`（query） | active/deleted | 状态过滤正确 |
+| `--include-inactive`（query） | 开/关 | deleted/inactive 是否返回符合预期 |
+| actor 参数（query） | 跨作用域查询 | 仅返回 actor 可读记录 |
 | `--limit`（query） | 默认 `50`、`1`、大值 | 返回数量受限且稳定 |
 | `--store` | 默认/自定义 | 数据源路径正确 |
 | `--pretty` | 开关 | 输出结构不变 |
+| `compact`（策略） | `lru/fifo/ttl` 配置下执行 | evicted 数与剩余条目符合策略预期 |
+
+#### 10.5.5 memory E2E 覆盖状态（建议同步）
+
+- 已覆盖：scoped 注入、strict 降级、生命周期命令、actor 访问控制、LRU/FIFO/TTL 策略。
+- 建议补测：`run --memory-disable`（当前未见稳定 E2E 用例）。
 
 ### 10.6 `config` 命令族
 
