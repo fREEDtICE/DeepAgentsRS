@@ -233,9 +233,10 @@ fn phase2_run_path_does_not_bypass_policy_allow() {
     );
 
     let lines = read_audit_lines(&audit_file);
-    assert_eq!(lines.len(), 1);
+    let decision_lines: Vec<_> = lines.iter().filter(|v| v.get("decision").is_some()).collect();
+    assert_eq!(decision_lines.len(), 1);
     assert_eq!(
-        lines[0].get("decision").and_then(|v| v.as_str()),
+        decision_lines[0].get("decision").and_then(|v| v.as_str()),
         Some("allow")
     );
 }
@@ -281,9 +282,10 @@ fn phase2_run_path_does_not_bypass_policy_deny() {
     assert!(err.unwrap_or("").contains("command_not_allowed"));
 
     let lines = read_audit_lines(&audit_file);
-    assert_eq!(lines.len(), 1);
+    let decision_lines: Vec<_> = lines.iter().filter(|v| v.get("decision").is_some()).collect();
+    assert_eq!(decision_lines.len(), 1);
     assert_eq!(
-        lines[0].get("decision").and_then(|v| v.as_str()),
+        decision_lines[0].get("decision").and_then(|v| v.as_str()),
         Some("require_approval")
     );
 }

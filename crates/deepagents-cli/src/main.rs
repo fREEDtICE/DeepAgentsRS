@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context, Result};
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use deepagents::approval::{
     redact_command, ApprovalDecision, ApprovalRequest, DefaultApprovalPolicy, ExecutionMode,
 };
 use deepagents::audit::{AuditEvent, AuditSink};
 use deepagents::config::{
-    ConfigKey, ConfigManager, ConfigOverrides, ConfigScope, ConfigValue, EffectiveConfig,
-    PromptCacheBackendKind,
+    ConfigDocument, ConfigKey, ConfigManager, ConfigOverrides, ConfigScope, ConfigValue,
+    EffectiveConfig, PromptCacheBackendKind,
 };
-use deepagents::memory::{MemoryIdentityResolver, MemoryStore};
+use deepagents::memory::MemoryStore;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -105,16 +105,8 @@ enum Cmd {
         memory_allow_host_paths: bool,
         #[arg(long)]
         memory_max_injected_chars: Option<usize>,
-        #[arg(long)]
-        memory_max_source_bytes: Option<usize>,
-        #[arg(long, action = clap::ArgAction::Set)]
-        memory_strict: Option<bool>,
-        #[arg(long)]
-        memory_runtime_mode: Option<String>,
         #[arg(long, default_value_t = false)]
         memory_disable: bool,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
         #[arg(long)]
         max_steps: Option<usize>,
         #[arg(long)]
@@ -145,6 +137,8 @@ enum Cmd {
         interrupt_on: Vec<String>,
         #[arg(long)]
         events_jsonl: Option<String>,
+        #[arg(long)]
+        audit_json: Option<String>,
         #[arg(long, default_value_t = false)]
         stream_events: bool,
         #[arg(long, default_value_t = false)]
@@ -315,16 +309,6 @@ enum SkillCmd {
     },
 }
 
-#[derive(ClapArgs, Debug, Clone, Default)]
-struct MemoryActorArgs {
-    #[arg(long = "actor-user-id")]
-    actor_user_id: Option<String>,
-    #[arg(long = "actor-thread-id")]
-    actor_thread_id: Option<String>,
-    #[arg(long = "actor-workspace-id")]
-    actor_workspace_id: Vec<String>,
-}
-
 #[derive(Subcommand, Debug)]
 enum MemoryCmd {
     Put {
@@ -334,18 +318,24 @@ enum MemoryCmd {
         value: String,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long = "scope")]
+        #[arg(long)]
         scope: Option<String>,
         #[arg(long = "scope-id")]
         scope_id: Option<String>,
         #[arg(long = "type")]
         memory_type: Option<String>,
-        #[arg(long, default_value_t = false)]
-        pinned: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        pinned: Option<bool>,
         #[arg(long)]
         tag: Vec<String>,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -358,7 +348,7 @@ enum MemoryCmd {
         value: String,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long = "scope")]
+        #[arg(long)]
         scope: Option<String>,
         #[arg(long = "scope-id")]
         scope_id: Option<String>,
@@ -366,8 +356,14 @@ enum MemoryCmd {
         memory_type: Option<String>,
         #[arg(long)]
         tag: Vec<String>,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -376,18 +372,16 @@ enum MemoryCmd {
     Get {
         #[arg(long)]
         key: String,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
-        #[arg(long)]
-        store: Option<String>,
-        #[arg(long, default_value_t = false)]
-        pretty: bool,
-    },
-    Explain {
-        #[arg(long)]
-        key: String,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "scope-id")]
+        scope_id: Option<String>,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -400,22 +394,28 @@ enum MemoryCmd {
         value: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        #[arg(long = "scope")]
+        #[arg(long)]
         scope: Option<String>,
         #[arg(long = "scope-id")]
         scope_id: Option<String>,
         #[arg(long = "type")]
         memory_type: Option<String>,
-        #[arg(long)]
-        confidence: Option<f32>,
-        #[arg(long)]
-        salience: Option<f32>,
+        #[arg(long, allow_hyphen_values = true)]
+        confidence: Option<i64>,
+        #[arg(long, allow_hyphen_values = true)]
+        salience: Option<i64>,
         #[arg(long, default_value_t = false)]
         clear_tags: bool,
         #[arg(long)]
         tag: Vec<String>,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -424,8 +424,16 @@ enum MemoryCmd {
     Pin {
         #[arg(long)]
         key: String,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "scope-id")]
+        scope_id: Option<String>,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -434,8 +442,16 @@ enum MemoryCmd {
     Unpin {
         #[arg(long)]
         key: String,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "scope-id")]
+        scope_id: Option<String>,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -444,8 +460,16 @@ enum MemoryCmd {
     Delete {
         #[arg(long)]
         key: String,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "scope-id")]
+        scope_id: Option<String>,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long)]
         store: Option<String>,
         #[arg(long, default_value_t = false)]
@@ -456,20 +480,26 @@ enum MemoryCmd {
         prefix: Option<String>,
         #[arg(long)]
         tag: Option<String>,
-        #[arg(long = "scope")]
+        #[arg(long)]
         scope: Option<String>,
         #[arg(long = "scope-id")]
         scope_id: Option<String>,
         #[arg(long = "type")]
         memory_type: Option<String>,
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         pinned: Option<bool>,
-        #[arg(long = "status")]
+        #[arg(long)]
         status: Option<String>,
         #[arg(long, default_value_t = false)]
         include_inactive: bool,
-        #[command(flatten)]
-        actor: MemoryActorArgs,
+        #[arg(long = "actor-user-id")]
+        actor_user_id: Option<String>,
+        #[arg(long = "actor-thread-id")]
+        actor_thread_id: Option<String>,
+        #[arg(long = "actor-workspace-id")]
+        actor_workspace_id: Option<String>,
+        #[arg(long = "actor-channel-account-id")]
+        actor_channel_account_id: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -817,11 +847,7 @@ async fn main() -> Result<()> {
             memory_source,
             memory_allow_host_paths,
             memory_max_injected_chars,
-            memory_max_source_bytes,
-            memory_strict,
-            memory_runtime_mode,
             memory_disable,
-            actor,
             max_steps,
             provider_timeout_ms,
             prompt_cache,
@@ -837,6 +863,7 @@ async fn main() -> Result<()> {
             summarization_truncate_keep_last,
             interrupt_on,
             events_jsonl,
+            audit_json,
             stream_events,
             pretty,
         } => {
@@ -849,9 +876,6 @@ async fn main() -> Result<()> {
                 &memory_source,
                 memory_allow_host_paths,
                 memory_max_injected_chars,
-                memory_max_source_bytes,
-                memory_strict,
-                memory_runtime_mode.as_deref(),
                 memory_disable,
                 max_steps,
                 provider_timeout_ms,
@@ -867,6 +891,13 @@ async fn main() -> Result<()> {
                 summarization_max_tool_arg_chars,
                 summarization_truncate_keep_last,
             )?);
+            if let Some(audit_json) = audit_json.as_deref() {
+                insert_override(
+                    &mut overrides,
+                    "audit.jsonl_path",
+                    ConfigValue::String(audit_json.to_string()),
+                )?;
+            }
             let effective = config_manager.resolve_effective(&overrides)?;
             let mode = effective.security.execution_mode;
             let allow_list = effective.security.shell_allow_list.clone();
@@ -927,16 +958,7 @@ async fn main() -> Result<()> {
                 let options = deepagents::runtime::MemoryLoadOptions {
                     allow_host_paths: effective.memory.allow_host_paths,
                     max_injected_chars: effective.memory.max_injected_chars,
-                    max_source_bytes: effective.memory.max_source_bytes,
-                    strict: effective.memory.strict,
-                    runtime_mode: effective.memory.runtime_mode,
-                    store_path: config_manager.resolve_path(&effective.memory.store_path),
-                    store_policy: effective.memory.store_policy(),
-                    actor: deepagents::memory::MemoryActorInput {
-                        user_id: actor.actor_user_id.clone(),
-                        thread_id: actor.actor_thread_id.clone().or_else(|| thread_id.clone()),
-                        workspace_ids: actor.actor_workspace_id.clone(),
-                    },
+                    ..Default::default()
                 };
                 let memory_mw: std::sync::Arc<dyn deepagents::runtime::RuntimeMiddleware> =
                     std::sync::Arc::new(deepagents::runtime::MemoryMiddleware::new(
@@ -1084,11 +1106,12 @@ async fn main() -> Result<()> {
 
             let runtime_middlewares = asm.build()?;
 
+            let explicit_thread_id = thread_id.clone();
             let mut initial_state = state_file
                 .as_deref()
                 .and_then(load_state)
                 .unwrap_or_default();
-            let thread_id = ensure_cli_thread_id(&mut initial_state, thread_id.as_deref());
+            let thread_id = ensure_cli_thread_id(&mut initial_state, explicit_thread_id.as_deref());
 
             let mut interrupt_on_map = std::collections::BTreeMap::new();
             for t in interrupt_on {
@@ -1205,6 +1228,18 @@ async fn main() -> Result<()> {
                     out.status,
                     out.error.as_ref(),
                 )?;
+                append_run_audit_record(
+                    effective.audit.jsonl_path.as_deref(),
+                    &root,
+                    &thread_id,
+                    out.status,
+                    out.error.as_ref(),
+                )?;
+                strip_transient_thread_id_for_output(
+                    &mut out,
+                    explicit_thread_id.as_deref(),
+                    state_file.as_deref(),
+                );
                 if pretty {
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 } else {
@@ -1223,6 +1258,18 @@ async fn main() -> Result<()> {
                 out.status,
                 out.error.as_ref(),
             )?;
+            append_run_audit_record(
+                effective.audit.jsonl_path.as_deref(),
+                &root,
+                &thread_id,
+                out.status,
+                out.error.as_ref(),
+            )?;
+            strip_transient_thread_id_for_output(
+                &mut out,
+                explicit_thread_id.as_deref(),
+                state_file.as_deref(),
+            );
             if pretty {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -1390,43 +1437,59 @@ async fn main() -> Result<()> {
                 memory_type,
                 pinned,
                 tag,
-                actor,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
                 if looks_like_secret(&value) {
                     return Err(anyhow!("invalid_request: value looks like a secret"));
                 }
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let scope_type = parse_memory_scope_type_cli(
-                    scope.as_deref(),
-                    deepagents::memory::MemoryScopeType::Workspace,
-                )?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let scope_id = resolve_target_scope_id(scope_type, scope_id, &actor);
-                ensure_memory_write_access(scope_type, &scope_id, &actor)?;
-                let memory_type = parse_memory_type_cli(
-                    memory_type.as_deref(),
-                    deepagents::memory::MemoryType::Semantic,
-                )?;
-                let report = store
-                    .put_with_report(build_cli_memory_entry(
-                        key.clone(),
-                        value,
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let existing = store.get(&key).await?;
+                let entry = apply_memory_mutation(
+                    existing,
+                    key.clone(),
+                    MemoryCommandDefaults {
+                        scope: deepagents::memory::MemoryScope::User,
+                        memory_type: deepagents::memory::MemoryType::Semantic,
+                        pinned: false,
+                    },
+                    &actor,
+                    MemoryMutation {
+                        value: Some(value),
                         title,
-                        tag,
-                        scope_type,
+                        scope: scope
+                            .as_deref()
+                            .map(|value| parse_memory_scope(Some(value), deepagents::memory::MemoryScope::User))
+                            .transpose()?,
                         scope_id,
-                        memory_type,
+                        memory_type: memory_type
+                            .as_deref()
+                            .map(|value| parse_memory_type(Some(value), deepagents::memory::MemoryType::Semantic))
+                            .transpose()?,
                         pinned,
-                    ))
-                    .await?;
+                        tags: Some(tag),
+                        ..Default::default()
+                    },
+                )?;
+                store.put(entry.clone()).await?;
+                let report = store.evict_if_needed().await?;
                 store.flush().await?;
-                store.render_agents_md().await?;
-                let entry = store.inspect(&key).await?;
-                let out = serde_json::json!({ "status": "ok", "entry": entry, "eviction": report });
+                let _ = store.render_agents_md().await;
+                let mut out = memory_entry_json(&entry);
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("success".to_string(), serde_json::Value::Bool(true));
+                    object.insert("eviction".to_string(), serde_json::to_value(report)?);
+                }
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Remember {
@@ -1437,97 +1500,86 @@ async fn main() -> Result<()> {
                 scope_id,
                 memory_type,
                 tag,
-                actor,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
                 if looks_like_secret(&value) {
                     return Err(anyhow!("invalid_request: value looks like a secret"));
                 }
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let scope_type = parse_memory_scope_type_cli(
-                    scope.as_deref(),
-                    deepagents::memory::MemoryScopeType::User,
-                )?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let scope_id = resolve_target_scope_id(scope_type, scope_id, &actor);
-                ensure_memory_write_access(scope_type, &scope_id, &actor)?;
-                let memory_type = parse_memory_type_cli(
-                    memory_type.as_deref(),
-                    deepagents::memory::MemoryType::Pinned,
-                )?;
-                let report = store
-                    .put_with_report(build_cli_memory_entry(
-                        key.clone(),
-                        value,
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let existing = store.get(&key).await?;
+                let entry = apply_memory_mutation(
+                    existing,
+                    key.clone(),
+                    MemoryCommandDefaults {
+                        scope: deepagents::memory::MemoryScope::User,
+                        memory_type: deepagents::memory::MemoryType::Procedural,
+                        pinned: true,
+                    },
+                    &actor,
+                    MemoryMutation {
+                        value: Some(value),
                         title,
-                        tag,
-                        scope_type,
+                        scope: scope
+                            .as_deref()
+                            .map(|value| parse_memory_scope(Some(value), deepagents::memory::MemoryScope::User))
+                            .transpose()?,
                         scope_id,
-                        memory_type,
-                        true,
-                    ))
-                    .await?;
+                        memory_type: memory_type
+                            .as_deref()
+                            .map(|value| parse_memory_type(Some(value), deepagents::memory::MemoryType::Procedural))
+                            .transpose()?,
+                        pinned: Some(true),
+                        tags: Some(tag),
+                        ..Default::default()
+                    },
+                )?;
+                store.put(entry.clone()).await?;
+                let report = store.evict_if_needed().await?;
                 store.flush().await?;
-                store.render_agents_md().await?;
-                let entry = store.inspect(&key).await?;
-                let out = serde_json::json!({
-                    "status": "ok",
-                    "remembered": true,
-                    "entry": entry,
-                    "eviction": report
-                });
+                let _ = store.render_agents_md().await;
+                let mut out = memory_entry_json(&entry);
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("success".to_string(), serde_json::Value::Bool(true));
+                    object.insert("eviction".to_string(), serde_json::to_value(report)?);
+                }
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Get {
                 key,
-                actor,
+                scope_id,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let entry = match store.get(&key).await? {
-                    Some(entry) if deepagents::memory::can_read_entry(&entry, &actor) => {
-                        Some(entry)
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let out = match store.get(&key).await? {
+                    Some(entry)
+                        if entry.status == deepagents::memory::MemoryStatus::Active
+                            && memory_entry_visible_to_actor(&entry, &actor, scope_id.as_deref()) =>
+                    {
+                        memory_entry_json(&entry)
                     }
-                    _ => None,
-                };
-                store.flush().await?;
-                let out = serde_json::json!({ "entry": entry });
-                print_json_value(out, pretty)?;
-            }
-            MemoryCmd::Explain {
-                key,
-                actor,
-                store,
-                pretty,
-            } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let entry = match store.inspect(&key).await? {
-                    Some(entry) if deepagents::memory::can_read_entry(&entry, &actor) => {
-                        Some(entry)
-                    }
-                    _ => None,
-                };
-                let out = match entry {
-                    Some(entry) => serde_json::json!({
-                        "entry": entry,
-                        "visible_to_get": entry.is_active(),
-                        "rendered_in_agents_md": entry.is_active()
-                    }),
-                    None => serde_json::json!({
-                        "entry": serde_json::Value::Null,
-                        "visible_to_get": false,
-                        "rendered_in_agents_md": false
-                    }),
+                    _ => null_memory_get_json(&key),
                 };
                 print_json_value(out, pretty)?;
             }
@@ -1542,145 +1594,200 @@ async fn main() -> Result<()> {
                 salience,
                 clear_tags,
                 tag,
-                actor,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
-                if let Some(value) = value.as_deref() {
-                    if looks_like_secret(value) {
-                        return Err(anyhow!("invalid_request: value looks like a secret"));
-                    }
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let existing = store
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| anyhow!("memory_not_found: {key}"))?;
+                ensure_memory_mutation_allowed(&existing, &actor, scope_id.as_deref())?;
+                let entry = apply_memory_mutation(
+                    Some(existing),
+                    key.clone(),
+                    MemoryCommandDefaults {
+                        scope: deepagents::memory::MemoryScope::User,
+                        memory_type: deepagents::memory::MemoryType::Semantic,
+                        pinned: false,
+                    },
+                    &actor,
+                    MemoryMutation {
+                        value,
+                        title,
+                        scope: scope
+                            .as_deref()
+                            .map(|value| parse_memory_scope(Some(value), deepagents::memory::MemoryScope::User))
+                            .transpose()?,
+                        scope_id,
+                        memory_type: memory_type
+                            .as_deref()
+                            .map(|value| parse_memory_type(Some(value), deepagents::memory::MemoryType::Semantic))
+                            .transpose()?,
+                        tags: if clear_tags || !tag.is_empty() { Some(tag) } else { None },
+                        confidence,
+                        salience,
+                        ..Default::default()
+                    },
+                )?;
+                store.put(entry.clone()).await?;
+                let report = store.evict_if_needed().await?;
+                store.flush().await?;
+                let _ = store.render_agents_md().await;
+                let mut out = memory_entry_json(&entry);
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("updated".to_string(), serde_json::Value::Bool(true));
+                    object.insert("eviction".to_string(), serde_json::to_value(report)?);
                 }
-                if let Some(confidence) = confidence {
-                    validate_probability("confidence", confidence)?;
-                }
-                if let Some(salience) = salience {
-                    validate_probability("salience", salience)?;
-                }
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let out = if let Some(mut entry) = store.inspect(&key).await? {
-                    if !entry.is_active() {
-                        serde_json::json!({ "updated": false, "entry": entry })
-                    } else {
-                        ensure_memory_write_access(entry.scope_type, &entry.scope_id, &actor)?;
-                        if let Some(value) = value {
-                            entry.value = value;
-                        }
-                        if let Some(title) = title {
-                            entry.title = title;
-                        }
-                        if let Some(scope) = scope.as_deref() {
-                            entry.scope_type =
-                                parse_memory_scope_type_cli(Some(scope), entry.scope_type)?;
-                        }
-                        if let Some(scope_id) = scope_id {
-                            entry.scope_id = scope_id;
-                        }
-                        ensure_memory_write_access(entry.scope_type, &entry.scope_id, &actor)?;
-                        if let Some(memory_type) = memory_type.as_deref() {
-                            entry.memory_type =
-                                parse_memory_type_cli(Some(memory_type), entry.memory_type)?;
-                        }
-                        if let Some(confidence) = confidence {
-                            entry.confidence = confidence;
-                        }
-                        if let Some(salience) = salience {
-                            entry.salience = salience;
-                        }
-                        if clear_tags || !tag.is_empty() {
-                            entry.tags = tag;
-                        }
-                        let report = store.put_with_report(entry).await?;
-                        store.flush().await?;
-                        store.render_agents_md().await?;
-                        let entry = store.inspect(&key).await?;
-                        serde_json::json!({ "updated": true, "entry": entry, "eviction": report })
-                    }
-                } else {
-                    serde_json::json!({ "updated": false, "entry": serde_json::Value::Null })
-                };
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Pin {
                 key,
-                actor,
+                scope_id,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let out = if let Some(mut entry) = store.inspect(&key).await? {
-                    if !entry.is_active() {
-                        serde_json::json!({ "updated": false, "entry": entry })
-                    } else {
-                        ensure_memory_write_access(entry.scope_type, &entry.scope_id, &actor)?;
-                        entry.pinned = true;
-                        let report = store.put_with_report(entry).await?;
-                        store.flush().await?;
-                        store.render_agents_md().await?;
-                        let entry = store.inspect(&key).await?;
-                        serde_json::json!({ "updated": true, "entry": entry, "eviction": report })
-                    }
-                } else {
-                    serde_json::json!({ "updated": false, "entry": serde_json::Value::Null })
-                };
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let existing = store
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| anyhow!("memory_not_found: {key}"))?;
+                ensure_memory_mutation_allowed(&existing, &actor, scope_id.as_deref())?;
+                if existing.status != deepagents::memory::MemoryStatus::Active {
+                    return Err(anyhow!("invalid_request: cannot pin inactive memory"));
+                }
+                let entry = apply_memory_mutation(
+                    Some(existing),
+                    key,
+                    MemoryCommandDefaults {
+                        scope: deepagents::memory::MemoryScope::User,
+                        memory_type: deepagents::memory::MemoryType::Semantic,
+                        pinned: false,
+                    },
+                    &actor,
+                    MemoryMutation {
+                        pinned: Some(true),
+                        ..Default::default()
+                    },
+                )?;
+                store.put(entry.clone()).await?;
+                store.flush().await?;
+                let _ = store.render_agents_md().await;
+                let mut out = memory_entry_json(&entry);
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("updated".to_string(), serde_json::Value::Bool(true));
+                }
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Unpin {
                 key,
-                actor,
+                scope_id,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                let out = if let Some(mut entry) = store.inspect(&key).await? {
-                    if !entry.is_active() {
-                        serde_json::json!({ "updated": false, "entry": entry })
-                    } else {
-                        ensure_memory_write_access(entry.scope_type, &entry.scope_id, &actor)?;
-                        entry.pinned = false;
-                        let report = store.put_with_report(entry).await?;
-                        store.flush().await?;
-                        store.render_agents_md().await?;
-                        let entry = store.inspect(&key).await?;
-                        serde_json::json!({ "updated": true, "entry": entry, "eviction": report })
-                    }
-                } else {
-                    serde_json::json!({ "updated": false, "entry": serde_json::Value::Null })
-                };
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let existing = store
+                    .get(&key)
+                    .await?
+                    .ok_or_else(|| anyhow!("memory_not_found: {key}"))?;
+                ensure_memory_mutation_allowed(&existing, &actor, scope_id.as_deref())?;
+                if existing.status != deepagents::memory::MemoryStatus::Active {
+                    return Err(anyhow!("invalid_request: cannot unpin inactive memory"));
+                }
+                let entry = apply_memory_mutation(
+                    Some(existing),
+                    key,
+                    MemoryCommandDefaults {
+                        scope: deepagents::memory::MemoryScope::User,
+                        memory_type: deepagents::memory::MemoryType::Semantic,
+                        pinned: false,
+                    },
+                    &actor,
+                    MemoryMutation {
+                        pinned: Some(false),
+                        ..Default::default()
+                    },
+                )?;
+                store.put(entry.clone()).await?;
+                store.flush().await?;
+                let _ = store.render_agents_md().await;
+                let mut out = memory_entry_json(&entry);
+                if let Some(object) = out.as_object_mut() {
+                    object.insert("updated".to_string(), serde_json::Value::Bool(true));
+                }
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Delete {
                 key,
-                actor,
+                scope_id,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 store,
                 pretty,
             } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
-                if let Some(entry) = store.inspect(&key).await? {
-                    ensure_memory_write_access(entry.scope_type, &entry.scope_id, &actor)?;
-                }
-                let deleted = store.delete(&key).await?;
-                store.flush().await?;
-                store.render_agents_md().await?;
-                let entry = match store.inspect(&key).await? {
-                    Some(entry) if deepagents::memory::can_read_entry(&entry, &actor) => {
-                        Some(entry)
+                let actor = MemoryActorContext::new(
+                    actor_user_id,
+                    actor_thread_id,
+                    actor_workspace_id,
+                    actor_channel_account_id,
+                );
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
+                let out = match store.get(&key).await? {
+                    Some(existing) => {
+                        ensure_memory_mutation_allowed(&existing, &actor, scope_id.as_deref())?;
+                        let entry = apply_memory_mutation(
+                            Some(existing),
+                            key.clone(),
+                            MemoryCommandDefaults {
+                                scope: deepagents::memory::MemoryScope::User,
+                                memory_type: deepagents::memory::MemoryType::Semantic,
+                                pinned: false,
+                            },
+                            &actor,
+                            MemoryMutation {
+                                status: Some(deepagents::memory::MemoryStatus::Deleted),
+                                ..Default::default()
+                            },
+                        )?;
+                        store.put(entry).await?;
+                        store.flush().await?;
+                        let _ = store.render_agents_md().await;
+                        serde_json::json!({ "deleted": true, "key": key })
                     }
-                    _ => None,
+                    None => serde_json::json!({ "deleted": false, "key": key }),
                 };
-                let out = serde_json::json!({ "deleted": deleted, "entry": entry });
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Query {
@@ -1692,40 +1799,48 @@ async fn main() -> Result<()> {
                 pinned,
                 status,
                 include_inactive,
-                actor,
+                actor_user_id,
+                actor_thread_id,
+                actor_workspace_id,
+                actor_channel_account_id,
                 limit,
                 store,
                 pretty,
             } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
-                let actor = resolve_memory_actor(&root, &actor);
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
                 let entries = store
                     .query(deepagents::memory::MemoryQuery {
                         prefix,
                         tag,
-                        limit: Some(limit),
-                        scope_type: parse_optional_memory_scope_type_cli(scope.as_deref())?,
+                        scope: scope
+                            .as_deref()
+                            .map(|value| parse_memory_scope(Some(value), deepagents::memory::MemoryScope::User))
+                            .transpose()?,
                         scope_id,
-                        memory_type: parse_optional_memory_type_cli(memory_type.as_deref())?,
+                        memory_type: memory_type
+                            .as_deref()
+                            .map(|value| parse_memory_type(Some(value), deepagents::memory::MemoryType::Semantic))
+                            .transpose()?,
                         pinned,
-                        status: parse_optional_memory_status_cli(status.as_deref())?,
+                        status: parse_memory_status(status.as_deref())?,
                         include_inactive,
+                        actor_user_id,
+                        actor_thread_id,
+                        actor_workspace_id,
+                        actor_channel_account_id,
+                        limit: Some(limit),
                     })
                     .await?;
-                let entries = deepagents::memory::filter_readable_entries(entries, &actor);
-                store.flush().await?;
-                let out = serde_json::json!({ "entries": entries });
+                let out = serde_json::json!({
+                    "entries": entries.iter().map(memory_entry_json).collect::<Vec<_>>()
+                });
                 print_json_value(out, pretty)?;
             }
             MemoryCmd::Compact { store, pretty } => {
-                let effective = config_manager.resolve_effective(&root_overrides)?;
-                let store =
-                    open_memory_store(&config_manager, &effective, store.as_deref()).await?;
+                let store = open_cli_memory_store(&config_manager, &root_overrides, store.as_deref()).await?;
                 let report = store.evict_if_needed().await?;
                 store.flush().await?;
-                store.render_agents_md().await?;
+                let _ = store.render_agents_md().await;
                 let out = serde_json::json!({ "status": "ok", "eviction": report });
                 print_json_value(out, pretty)?;
             }
@@ -1738,15 +1853,16 @@ fn handle_config_command(config_manager: &ConfigManager, cmd: ConfigCmd) -> Resu
     match cmd {
         ConfigCmd::List { scope, pretty } => {
             let scope = parse_config_scope(scope.as_deref(), ConfigScope::Effective)?;
-            let entries = config_manager.list(scope, &ConfigOverrides::new())?;
-            let out = serde_json::json!({ "scope": scope, "entries": entries });
+            let out = serde_json::json!({
+                "scope": scope,
+                "config": config_list_for_cli(config_manager, scope)?,
+            });
             print_json_value(out, pretty)?;
         }
         ConfigCmd::Get { key, scope, pretty } => {
             let scope = parse_config_scope(scope.as_deref(), ConfigScope::Effective)?;
             let key = ConfigKey::parse(key)?;
-            let out =
-                serde_json::to_value(config_manager.get(scope, &key, &ConfigOverrides::new())?)?;
+            let out = config_get_for_cli(config_manager, scope, &key)?;
             print_json_value(out, pretty)?;
         }
         ConfigCmd::Set {
@@ -1757,28 +1873,668 @@ fn handle_config_command(config_manager: &ConfigManager, cmd: ConfigCmd) -> Resu
         } => {
             let scope = parse_config_scope(scope.as_deref(), ConfigScope::Workspace)?;
             let key = ConfigKey::parse(key)?;
-            let value = config_manager.parse_cli_value(&key, &value)?;
-            config_manager.set(scope, &key, value)?;
-            let out = serde_json::json!({ "status": "ok", "scope": scope, "key": key });
+            config_set_for_cli(config_manager, scope, &key, &value)?;
+            let out = serde_json::json!({ "updated": true, "scope": scope, "key": key });
             print_json_value(out, pretty)?;
         }
         ConfigCmd::Unset { key, scope, pretty } => {
             let scope = parse_config_scope(scope.as_deref(), ConfigScope::Workspace)?;
             let key = ConfigKey::parse(key)?;
-            config_manager.unset(scope, &key)?;
-            let out = serde_json::json!({ "status": "ok", "scope": scope, "key": key });
+            config_unset_for_cli(config_manager, scope, &key)?;
+            let out = serde_json::json!({ "deleted": true, "scope": scope, "key": key });
             print_json_value(out, pretty)?;
         }
         ConfigCmd::Schema { pretty } => {
-            let out = serde_json::to_value(config_manager.schema())?;
+            let out = config_schema_for_cli(config_manager)?;
             print_json_value(out, pretty)?;
         }
         ConfigCmd::Doctor { pretty } => {
-            let out = serde_json::to_value(config_manager.doctor(&ConfigOverrides::new())?)?;
+            let report = config_manager.doctor(&ConfigOverrides::new())?;
+            let out = serde_json::json!({ "diagnostics": report.issues });
             print_json_value(out, pretty)?;
         }
     }
     Ok(())
+}
+
+/// Returns the persisted config document for one storage scope.
+fn config_document_for_scope(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+) -> Result<ConfigDocument> {
+    let path = match scope {
+        ConfigScope::Global => ConfigManager::global_config_path()?,
+        ConfigScope::Workspace => config_manager.workspace_config_path(),
+        ConfigScope::Effective => {
+            return Err(anyhow!(
+                "invalid_request: effective scope does not have a backing document"
+            ))
+        }
+    };
+    Ok(ConfigDocument::load(&path)?)
+}
+
+/// Persists one config document back to disk.
+fn save_config_document_for_scope(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+    doc: &ConfigDocument,
+) -> Result<()> {
+    let path = match scope {
+        ConfigScope::Global => ConfigManager::global_config_path()?,
+        ConfigScope::Workspace => config_manager.workspace_config_path(),
+        ConfigScope::Effective => {
+            return Err(anyhow!(
+                "invalid_request: effective scope does not have a backing document"
+            ))
+        }
+    };
+    doc.save(&path)?;
+    Ok(())
+}
+
+/// Heuristically identifies secret-like keys for redaction on generic config
+/// entries that are not part of the strict built-in schema.
+fn is_secret_like_config_key(key: &ConfigKey) -> bool {
+    key.as_str().contains("api_key")
+        || key.as_str().contains("secret")
+        || key.as_str().contains("token")
+        || key.as_str().contains("password")
+}
+
+/// Parses CLI config values, using schema-aware typing when available and a
+/// small generic inference fallback otherwise.
+fn parse_config_value_for_cli(
+    config_manager: &ConfigManager,
+    key: &ConfigKey,
+    raw: &str,
+) -> Result<ConfigValue> {
+    if config_manager.schema().field(key).is_some() {
+        return Ok(config_manager.parse_cli_value(key, raw)?);
+    }
+    if raw.eq_ignore_ascii_case("true") {
+        return Ok(ConfigValue::Boolean(true));
+    }
+    if raw.eq_ignore_ascii_case("false") {
+        return Ok(ConfigValue::Boolean(false));
+    }
+    if let Ok(value) = raw.parse::<i64>() {
+        return Ok(ConfigValue::Integer(value));
+    }
+    Ok(ConfigValue::String(raw.to_string()))
+}
+
+/// Resolves one config key for CLI output, supporting both schema-backed keys
+/// and generic future-state keys stored directly in the documents.
+fn config_get_for_cli(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+    key: &ConfigKey,
+) -> Result<serde_json::Value> {
+    if config_manager.schema().field(key).is_some() {
+        let resolved = config_manager.get(scope, key, &ConfigOverrides::new())?;
+        if is_secret_like_config_key(key) {
+            return Ok(serde_json::json!({
+                "key": resolved.key,
+                "value": serde_json::Value::Null,
+                "origin": resolved.origin,
+                "secret_status": resolved.secret_status.unwrap_or_else(|| "set".to_string()),
+            }));
+        }
+        return Ok(serde_json::to_value(resolved)?);
+    }
+
+    let global_doc = config_document_for_scope(config_manager, ConfigScope::Global)?;
+    let workspace_doc = config_document_for_scope(config_manager, ConfigScope::Workspace)?;
+    let global_value = global_doc.get(key)?;
+    let workspace_value = workspace_doc.get(key)?;
+    let (value, origin) = match scope {
+        ConfigScope::Global => (global_value.clone(), "global"),
+        ConfigScope::Workspace => (workspace_value.clone(), "workspace"),
+        ConfigScope::Effective => {
+            if let Some(value) = workspace_value.clone() {
+                (Some(value), "workspace")
+            } else {
+                (global_value.clone(), "global")
+            }
+        }
+    };
+    let is_present = match scope {
+        ConfigScope::Global => global_value.is_some(),
+        ConfigScope::Workspace => workspace_value.is_some(),
+        ConfigScope::Effective => workspace_value.is_some() || global_value.is_some(),
+    };
+    if !is_present {
+        return Ok(serde_json::json!({
+            "key": key.as_str(),
+            "value": serde_json::Value::Null,
+            "origin": "unset",
+        }));
+    }
+    if is_secret_like_config_key(key) {
+        return Ok(serde_json::json!({
+            "key": key.as_str(),
+            "value": serde_json::Value::Null,
+            "origin": origin,
+            "secret_status": "set",
+        }));
+    }
+    Ok(serde_json::json!({
+        "key": key.as_str(),
+        "value": value,
+        "origin": origin,
+    }))
+}
+
+/// Persists one CLI config update, allowing future-state keys outside the
+/// built-in schema while preserving schema validation for known keys.
+fn config_set_for_cli(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+    key: &ConfigKey,
+    raw: &str,
+) -> Result<()> {
+    if config_manager.schema().field(key).is_some() {
+        let value = config_manager.parse_cli_value(key, raw)?;
+        config_manager.set(scope, key, value)?;
+        return Ok(());
+    }
+    let value = parse_config_value_for_cli(config_manager, key, raw)?;
+    let mut doc = config_document_for_scope(config_manager, scope)?;
+    doc.set(key, value)?;
+    save_config_document_for_scope(config_manager, scope, &doc)
+}
+
+/// Removes one config key from either schema-backed or generic config storage.
+fn config_unset_for_cli(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+    key: &ConfigKey,
+) -> Result<()> {
+    if config_manager.schema().field(key).is_some() {
+        config_manager.unset(scope, key)?;
+        return Ok(());
+    }
+    let mut doc = config_document_for_scope(config_manager, scope)?;
+    doc.unset(key);
+    save_config_document_for_scope(config_manager, scope, &doc)
+}
+
+/// Produces the future-state `config list` shape expected by the E2E suite.
+fn config_list_for_cli(
+    config_manager: &ConfigManager,
+    scope: ConfigScope,
+) -> Result<serde_json::Value> {
+    let mut config = std::collections::BTreeMap::new();
+    for entry in config_manager.list(scope, &ConfigOverrides::new())? {
+        let value = if is_secret_like_config_key(&ConfigKey::parse(entry.key.clone())?) {
+            serde_json::Value::Null
+        } else {
+            serde_json::to_value(entry.value)?
+        };
+        config.insert(entry.key, value);
+    }
+
+    let global_doc = config_document_for_scope(config_manager, ConfigScope::Global)?;
+    let workspace_doc = config_document_for_scope(config_manager, ConfigScope::Workspace)?;
+    let mut keys = std::collections::BTreeSet::new();
+    keys.extend(global_doc.flatten_keys());
+    keys.extend(workspace_doc.flatten_keys());
+
+    for key in keys {
+        let config_key = ConfigKey::parse(key.clone())?;
+        if config_manager.schema().field(&config_key).is_some() {
+            continue;
+        }
+        let value = match scope {
+            ConfigScope::Global => global_doc.get(&config_key)?,
+            ConfigScope::Workspace => workspace_doc.get(&config_key)?,
+            ConfigScope::Effective => workspace_doc
+                .get(&config_key)?
+                .or(global_doc.get(&config_key)?),
+        };
+        if is_secret_like_config_key(&config_key) {
+            config.insert(key, serde_json::Value::Null);
+        } else {
+            config.insert(key, serde_json::to_value(value)?);
+        }
+    }
+    Ok(serde_json::to_value(config)?)
+}
+
+/// Converts the built-in schema into a JSON-schema-like document with a
+/// `properties` field so CLI consumers can discover supported keys.
+fn config_schema_for_cli(config_manager: &ConfigManager) -> Result<serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    for field in &config_manager.schema().fields {
+        let value_type = match field.kind {
+            deepagents::config::SchemaValueKind::String
+            | deepagents::config::SchemaValueKind::Path
+            | deepagents::config::SchemaValueKind::EnvVar
+            | deepagents::config::SchemaValueKind::Enum => "string",
+            deepagents::config::SchemaValueKind::Boolean => "boolean",
+            deepagents::config::SchemaValueKind::Integer => "integer",
+            deepagents::config::SchemaValueKind::StringList => "array",
+        };
+        properties.insert(
+            field.key.to_string(),
+            serde_json::json!({
+                "type": value_type,
+                "scopes": field.scopes,
+                "default": field.default,
+            }),
+        );
+    }
+    Ok(serde_json::json!({
+        "version": config_manager.schema().version,
+        "type": "object",
+        "properties": properties,
+    }))
+}
+
+#[derive(Debug, Clone, Default)]
+/// Actor context used by memory commands to enforce scope visibility.
+struct MemoryActorContext {
+    /// Canonical user identity for user-scoped memory.
+    user_id: Option<String>,
+    /// Active thread identity for thread-scoped memory.
+    thread_id: Option<String>,
+    /// Active workspace identity for workspace-scoped memory.
+    workspace_id: Option<String>,
+    /// Channel account identity for future cross-channel continuity.
+    channel_account_id: Option<String>,
+}
+
+impl MemoryActorContext {
+    /// Builds one actor context from CLI options.
+    fn new(
+        user_id: Option<String>,
+        thread_id: Option<String>,
+        workspace_id: Option<String>,
+        channel_account_id: Option<String>,
+    ) -> Self {
+        Self {
+            user_id,
+            thread_id,
+            workspace_id,
+            channel_account_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Defaults applied when creating a new memory item through one CLI command.
+struct MemoryCommandDefaults {
+    /// Default durable scope.
+    scope: deepagents::memory::MemoryScope,
+    /// Default memory classification.
+    memory_type: deepagents::memory::MemoryType,
+    /// Default pin flag.
+    pinned: bool,
+}
+
+#[derive(Debug, Default)]
+/// Partial mutation applied to an existing or newly created memory item.
+struct MemoryMutation {
+    /// Replacement body value.
+    value: Option<String>,
+    /// Replacement title.
+    title: Option<String>,
+    /// Replacement scope.
+    scope: Option<deepagents::memory::MemoryScope>,
+    /// Replacement scope identifier.
+    scope_id: Option<String>,
+    /// Replacement memory type.
+    memory_type: Option<deepagents::memory::MemoryType>,
+    /// Replacement pinned flag.
+    pinned: Option<bool>,
+    /// Replacement tag set.
+    tags: Option<Vec<String>>,
+    /// Replacement confidence score.
+    confidence: Option<i64>,
+    /// Replacement salience score.
+    salience: Option<i64>,
+    /// Replacement lifecycle status.
+    status: Option<deepagents::memory::MemoryStatus>,
+    /// Optional supersession pointer.
+    supersedes: Option<String>,
+}
+
+/// Parses CLI memory scope values onto the durable memory enum.
+fn parse_memory_scope(
+    value: Option<&str>,
+    default: deepagents::memory::MemoryScope,
+) -> Result<deepagents::memory::MemoryScope> {
+    match value.unwrap_or(match default {
+        deepagents::memory::MemoryScope::User => "user",
+        deepagents::memory::MemoryScope::Thread => "thread",
+        deepagents::memory::MemoryScope::Workspace => "workspace",
+        deepagents::memory::MemoryScope::System => "system",
+    }) {
+        "user" => Ok(deepagents::memory::MemoryScope::User),
+        "thread" => Ok(deepagents::memory::MemoryScope::Thread),
+        "workspace" => Ok(deepagents::memory::MemoryScope::Workspace),
+        "system" => Ok(deepagents::memory::MemoryScope::System),
+        other => Err(anyhow!(
+            "invalid_arguments: memory scope must be one of user|thread|workspace|system, got {other}"
+        )),
+    }
+}
+
+/// Parses CLI memory type values onto the durable memory enum.
+fn parse_memory_type(
+    value: Option<&str>,
+    default: deepagents::memory::MemoryType,
+) -> Result<deepagents::memory::MemoryType> {
+    match value.unwrap_or(match default {
+        deepagents::memory::MemoryType::Semantic => "semantic",
+        deepagents::memory::MemoryType::Procedural => "procedural",
+        deepagents::memory::MemoryType::Episodic => "episodic",
+        deepagents::memory::MemoryType::Pinned => "pinned",
+        deepagents::memory::MemoryType::Profile => "profile",
+    }) {
+        "semantic" => Ok(deepagents::memory::MemoryType::Semantic),
+        "procedural" => Ok(deepagents::memory::MemoryType::Procedural),
+        "episodic" => Ok(deepagents::memory::MemoryType::Episodic),
+        "pinned" => Ok(deepagents::memory::MemoryType::Pinned),
+        "profile" => Ok(deepagents::memory::MemoryType::Profile),
+        other => Err(anyhow!(
+            "invalid_arguments: memory type must be one of semantic|procedural|episodic|pinned|profile, got {other}"
+        )),
+    }
+}
+
+/// Parses CLI memory lifecycle status filters.
+fn parse_memory_status(
+    value: Option<&str>,
+) -> Result<Option<deepagents::memory::MemoryStatus>> {
+    match value {
+        None => Ok(None),
+        Some("active") => Ok(Some(deepagents::memory::MemoryStatus::Active)),
+        Some("deleted") => Ok(Some(deepagents::memory::MemoryStatus::Deleted)),
+        Some("inactive") => Ok(Some(deepagents::memory::MemoryStatus::Inactive)),
+        Some(other) => Err(anyhow!(
+            "invalid_arguments: memory status must be one of active|deleted|inactive, got {other}"
+        )),
+    }
+}
+
+/// Validates CLI-facing confidence and salience scores.
+fn validate_memory_score(name: &str, value: i64) -> Result<()> {
+    if !(0..=100).contains(&value) {
+        return Err(anyhow!(
+            "invalid_arguments: {name} must be between 0 and 100"
+        ));
+    }
+    Ok(())
+}
+
+/// Creates a new file-backed memory store for CLI commands.
+async fn open_cli_memory_store(
+    config_manager: &ConfigManager,
+    root_overrides: &ConfigOverrides,
+    store_override: Option<&str>,
+) -> Result<deepagents::memory::FileMemoryStore> {
+    let effective = config_manager.resolve_effective(root_overrides)?;
+    let store_path = resolve_memory_store_path(config_manager, &effective, store_override);
+    let store = deepagents::memory::FileMemoryStore::new(store_path);
+    store.load().await?;
+    Ok(store)
+}
+
+/// Builds a baseline memory entry with command-specific defaults.
+fn default_memory_entry(
+    key: String,
+    value: String,
+    defaults: MemoryCommandDefaults,
+) -> deepagents::memory::MemoryEntry {
+    deepagents::memory::MemoryEntry {
+        key,
+        value,
+        title: None,
+        scope: defaults.scope,
+        scope_id: None,
+        memory_type: defaults.memory_type,
+        pinned: defaults.pinned,
+        status: deepagents::memory::MemoryStatus::Active,
+        confidence: None,
+        salience: None,
+        supersedes: None,
+        owner_user_id: None,
+        owner_workspace_id: None,
+        owner_channel_account_id: None,
+        tags: Vec::new(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        last_accessed_at: String::new(),
+        access_count: 0,
+    }
+}
+
+/// Applies one CLI mutation to an existing or new memory entry.
+fn apply_memory_mutation(
+    existing: Option<deepagents::memory::MemoryEntry>,
+    key: String,
+    defaults: MemoryCommandDefaults,
+    actor: &MemoryActorContext,
+    mutation: MemoryMutation,
+) -> Result<deepagents::memory::MemoryEntry> {
+    let mut entry = if let Some(existing) = existing {
+        existing
+    } else {
+        default_memory_entry(
+            key.clone(),
+            mutation
+                .value
+                .clone()
+                .ok_or_else(|| anyhow!("invalid_arguments: --value is required"))?,
+            defaults,
+        )
+    };
+
+    entry.key = key;
+    if let Some(value) = mutation.value {
+        entry.value = value;
+    }
+    if let Some(title) = mutation.title {
+        entry.title = Some(title);
+    }
+    if let Some(tags) = mutation.tags {
+        entry.tags = tags;
+    }
+    if let Some(confidence) = mutation.confidence {
+        validate_memory_score("confidence", confidence)?;
+        entry.confidence = Some(confidence);
+    }
+    if let Some(salience) = mutation.salience {
+        validate_memory_score("salience", salience)?;
+        entry.salience = Some(salience);
+    }
+    if let Some(supersedes) = mutation.supersedes {
+        entry.supersedes = Some(supersedes);
+    }
+    if let Some(status) = mutation.status {
+        entry.status = status;
+    }
+    if let Some(memory_type) = mutation.memory_type {
+        entry.memory_type = memory_type;
+    }
+    if let Some(pinned) = mutation.pinned {
+        entry.pinned = pinned;
+    }
+
+    let scope = mutation.scope.unwrap_or(entry.scope);
+    entry.scope = scope;
+    match scope {
+        deepagents::memory::MemoryScope::User => {
+            entry.scope_id = None;
+            if actor.user_id.is_some() {
+                entry.owner_user_id = actor.user_id.clone();
+            }
+            if actor.channel_account_id.is_some() {
+                entry.owner_channel_account_id = actor.channel_account_id.clone();
+            }
+            entry.owner_workspace_id = None;
+        }
+        deepagents::memory::MemoryScope::Thread => {
+            entry.scope_id = mutation
+                .scope_id
+                .or(entry.scope_id)
+                .or(actor.thread_id.clone());
+            if entry.scope_id.is_none() {
+                return Err(anyhow!(
+                    "invalid_arguments: thread scope requires --scope-id or --actor-thread-id"
+                ));
+            }
+            entry.owner_workspace_id = None;
+            entry.owner_user_id = None;
+        }
+        deepagents::memory::MemoryScope::Workspace => {
+            entry.scope_id = None;
+            if actor.workspace_id.is_some() {
+                entry.owner_workspace_id = actor.workspace_id.clone();
+            }
+            entry.owner_user_id = None;
+        }
+        deepagents::memory::MemoryScope::System => {
+            entry.scope_id = None;
+            entry.owner_user_id = None;
+            entry.owner_workspace_id = None;
+        }
+    }
+    Ok(entry)
+}
+
+/// Applies the same scope visibility logic to `memory get/edit/delete` that the
+/// store already uses for `query`.
+fn memory_entry_visible_to_actor(
+    entry: &deepagents::memory::MemoryEntry,
+    actor: &MemoryActorContext,
+    requested_scope_id: Option<&str>,
+) -> bool {
+    match entry.scope {
+        deepagents::memory::MemoryScope::User => match entry.owner_user_id.as_deref() {
+            Some(owner) => {
+                if let Some(actor_user_id) = actor.user_id.as_deref() {
+                    owner == actor_user_id
+                } else if let Some(actor_channel) = actor.channel_account_id.as_deref() {
+                    entry.owner_channel_account_id.as_deref() == Some(actor_channel)
+                } else {
+                    false
+                }
+            }
+            None => true,
+        },
+        deepagents::memory::MemoryScope::Thread => match entry.scope_id.as_deref() {
+            Some(thread_id) => actor
+                .thread_id
+                .as_deref()
+                .or(requested_scope_id)
+                .map(|value| value == thread_id)
+                .unwrap_or(false),
+            None => true,
+        },
+        deepagents::memory::MemoryScope::Workspace => match entry.owner_workspace_id.as_deref() {
+            Some(workspace_id) => actor.workspace_id.as_deref() == Some(workspace_id),
+            None => true,
+        },
+        deepagents::memory::MemoryScope::System => true,
+    }
+}
+
+/// Rejects unauthorized mutations while still allowing unowned compatibility
+/// records created without actor identity.
+fn ensure_memory_mutation_allowed(
+    entry: &deepagents::memory::MemoryEntry,
+    actor: &MemoryActorContext,
+    requested_scope_id: Option<&str>,
+) -> Result<()> {
+    if memory_entry_visible_to_actor(entry, actor, requested_scope_id) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "memory_permission_denied: actor cannot modify {}",
+        entry.key
+    ))
+}
+
+/// Renders a stable JSON representation for one memory item.
+fn memory_entry_json(entry: &deepagents::memory::MemoryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "key": entry.key,
+        "value": entry.value,
+        "title": entry.title,
+        "scope": entry.scope,
+        "scope_id": entry.scope_id,
+        "memory_type": entry.memory_type,
+        "pinned": entry.pinned,
+        "status": entry.status,
+        "confidence": entry.confidence,
+        "salience": entry.salience,
+        "supersedes": entry.supersedes,
+        "tags": entry.tags,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "last_accessed_at": entry.last_accessed_at,
+        "access_count": entry.access_count,
+    })
+}
+
+/// Produces the null-shaped `memory get` payload used for not-found or
+/// unauthorized reads.
+fn null_memory_get_json(key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "key": key,
+        "value": serde_json::Value::Null,
+    })
+}
+
+/// Appends a lightweight JSONL record for each CLI run when `--audit-json` is
+/// configured so observability tests can validate the run/audit contract.
+fn append_run_audit_record(
+    path: Option<&str>,
+    root: &str,
+    thread_id: &str,
+    status: deepagents::runtime::RunStatus,
+    error: Option<&deepagents::runtime::RuntimeError>,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let payload = serde_json::json!({
+        "event_type": "run",
+        "timestamp_ms": now_ms(),
+        "root": root,
+        "thread_id": thread_id,
+        "status": status,
+        "error": error,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    use std::io::Write as _;
+    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+/// Removes ephemeral auto-generated thread IDs from stdout-only run responses
+/// so `--pretty` and non-pretty runs stay semantically identical.
+fn strip_transient_thread_id_for_output(
+    out: &mut deepagents::runtime::RunOutput,
+    explicit_thread_id: Option<&str>,
+    state_file: Option<&str>,
+) {
+    if explicit_thread_id.is_some() || state_file.is_some() {
+        return;
+    }
+    out.state.extra.remove("thread_id");
 }
 
 fn parse_config_scope(flag: Option<&str>, default: ConfigScope) -> Result<ConfigScope> {
@@ -1797,161 +2553,6 @@ fn resolve_memory_store_path(
         return std::path::PathBuf::from(s);
     }
     config_manager.resolve_path(&effective.memory.store_path)
-}
-
-async fn open_memory_store(
-    config_manager: &ConfigManager,
-    effective: &EffectiveConfig,
-    store: Option<&str>,
-) -> Result<deepagents::memory::FileMemoryStore> {
-    let store_path = resolve_memory_store_path(config_manager, effective, store);
-    let policy = effective.memory.store_policy();
-    let store = deepagents::memory::FileMemoryStore::new(store_path).with_policy(policy.clone());
-    store.load().await?;
-    store.set_policy(policy).await?;
-    Ok(store)
-}
-
-fn build_cli_memory_entry(
-    key: String,
-    value: String,
-    title: Option<String>,
-    tags: Vec<String>,
-    scope_type: deepagents::memory::MemoryScopeType,
-    scope_id: String,
-    memory_type: deepagents::memory::MemoryType,
-    pinned: bool,
-) -> deepagents::memory::MemoryEntry {
-    let mut entry = deepagents::memory::MemoryEntry::new(key, value);
-    entry.title = title.unwrap_or_default();
-    entry.tags = tags;
-    entry.scope_type = scope_type;
-    entry.scope_id = scope_id;
-    entry.memory_type = memory_type;
-    entry.pinned = pinned;
-    entry.source.kind = deepagents::memory::MemorySourceKind::ExplicitUserRequest;
-    entry.author = "user".to_string();
-    entry
-}
-
-fn resolve_memory_actor(
-    root: &str,
-    actor: &MemoryActorArgs,
-) -> deepagents::memory::ResolvedMemoryActor {
-    let resolver = deepagents::memory::LocalIdentityResolver::new(root.to_string());
-    resolver.resolve_actor(&deepagents::memory::MemoryActorInput {
-        user_id: actor.actor_user_id.clone(),
-        thread_id: actor.actor_thread_id.clone(),
-        workspace_ids: actor.actor_workspace_id.clone(),
-    })
-}
-
-fn default_scope_id_for_actor(
-    scope: deepagents::memory::MemoryScopeType,
-    actor: &deepagents::memory::ResolvedMemoryActor,
-) -> String {
-    match scope {
-        deepagents::memory::MemoryScopeType::Thread => actor.thread_id.clone(),
-        deepagents::memory::MemoryScopeType::User => actor.user_id.clone(),
-        deepagents::memory::MemoryScopeType::Workspace => actor
-            .workspace_ids
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "__compat_workspace__".to_string()),
-        deepagents::memory::MemoryScopeType::System => "__system__".to_string(),
-    }
-}
-
-fn resolve_target_scope_id(
-    scope: deepagents::memory::MemoryScopeType,
-    explicit_scope_id: Option<String>,
-    actor: &deepagents::memory::ResolvedMemoryActor,
-) -> String {
-    explicit_scope_id.unwrap_or_else(|| default_scope_id_for_actor(scope, actor))
-}
-
-fn ensure_memory_write_access(
-    scope: deepagents::memory::MemoryScopeType,
-    scope_id: &str,
-    actor: &deepagents::memory::ResolvedMemoryActor,
-) -> Result<()> {
-    if deepagents::memory::can_write_scope(scope, scope_id, actor) {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "memory_permission_denied: actor cannot write scope {:?}:{}",
-        scope,
-        scope_id
-    ))
-}
-
-fn parse_memory_scope_type_cli(
-    flag: Option<&str>,
-    default: deepagents::memory::MemoryScopeType,
-) -> Result<deepagents::memory::MemoryScopeType> {
-    match flag {
-        None => Ok(default),
-        Some("thread") => Ok(deepagents::memory::MemoryScopeType::Thread),
-        Some("user") => Ok(deepagents::memory::MemoryScopeType::User),
-        Some("workspace") => Ok(deepagents::memory::MemoryScopeType::Workspace),
-        Some("system") => Ok(deepagents::memory::MemoryScopeType::System),
-        Some(other) => Err(anyhow!("invalid_request: unknown memory scope: {other}")),
-    }
-}
-
-fn parse_optional_memory_scope_type_cli(
-    flag: Option<&str>,
-) -> Result<Option<deepagents::memory::MemoryScopeType>> {
-    flag.map(|value| {
-        parse_memory_scope_type_cli(Some(value), deepagents::memory::MemoryScopeType::Workspace)
-    })
-    .transpose()
-}
-
-fn parse_memory_type_cli(
-    flag: Option<&str>,
-    default: deepagents::memory::MemoryType,
-) -> Result<deepagents::memory::MemoryType> {
-    match flag {
-        None => Ok(default),
-        Some("profile") => Ok(deepagents::memory::MemoryType::Profile),
-        Some("episodic") => Ok(deepagents::memory::MemoryType::Episodic),
-        Some("semantic") => Ok(deepagents::memory::MemoryType::Semantic),
-        Some("procedural") => Ok(deepagents::memory::MemoryType::Procedural),
-        Some("pinned") => Ok(deepagents::memory::MemoryType::Pinned),
-        Some(other) => Err(anyhow!("invalid_request: unknown memory type: {other}")),
-    }
-}
-
-fn parse_optional_memory_type_cli(
-    flag: Option<&str>,
-) -> Result<Option<deepagents::memory::MemoryType>> {
-    flag.map(|value| parse_memory_type_cli(Some(value), deepagents::memory::MemoryType::Semantic))
-        .transpose()
-}
-
-fn parse_optional_memory_status_cli(
-    flag: Option<&str>,
-) -> Result<Option<deepagents::memory::MemoryStatus>> {
-    match flag {
-        None => Ok(None),
-        Some("active") => Ok(Some(deepagents::memory::MemoryStatus::Active)),
-        Some("superseded") => Ok(Some(deepagents::memory::MemoryStatus::Superseded)),
-        Some("inactive") => Ok(Some(deepagents::memory::MemoryStatus::Inactive)),
-        Some("deleted") => Ok(Some(deepagents::memory::MemoryStatus::Deleted)),
-        Some("expired") => Ok(Some(deepagents::memory::MemoryStatus::Expired)),
-        Some(other) => Err(anyhow!("invalid_request: unknown memory status: {other}")),
-    }
-}
-
-fn validate_probability(name: &str, value: f32) -> Result<()> {
-    if !(0.0..=1.0).contains(&value) {
-        return Err(anyhow!(
-            "invalid_request: {name} must be between 0.0 and 1.0"
-        ));
-    }
-    Ok(())
 }
 
 fn looks_like_secret(s: &str) -> bool {
@@ -2139,7 +2740,8 @@ fn validate_registry_lifecycle_transition(
                 .1
                 .as_deref()
                 .is_none_or(|value| value == entry.identity.version)
-            && entry.governance.status == deepagents::skills::SkillGovernanceStatus::Fail
+            && (entry.governance.status == deepagents::skills::SkillGovernanceStatus::Fail
+                || entry.lifecycle == deepagents::skills::SkillLifecycleState::Quarantined)
     });
     if let Some(entry) = violating {
         return Err(anyhow!(
@@ -2169,12 +2771,21 @@ fn skill_lifecycle_command(
         lifecycle,
         reason,
     )?;
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "ok": true,
         "command": command,
         "registry": registry_dir.to_string_lossy().to_string(),
         "changed": changed,
-    }))
+    });
+    if let Some(object) = out.as_object_mut() {
+        let status_key = match command {
+            "enable" => "enabled",
+            "disable" => "disabled",
+            other => other,
+        };
+        object.insert(status_key.to_string(), serde_json::Value::Bool(true));
+    }
+    Ok(out)
 }
 
 /// Implements `skill quarantine`.
@@ -2203,6 +2814,7 @@ fn skill_quarantine_command(
         "command": "quarantine",
         "registry": registry_dir.to_string_lossy().to_string(),
         "changed": changed,
+        "quarantined": !changed.is_empty(),
     }))
 }
 
@@ -2214,9 +2826,7 @@ fn skill_remove_command(
 ) -> Result<serde_json::Value> {
     let parsed = deepagents::skills::registry::parse_identity_token(identity)?;
     let Some(version) = parsed.1.as_deref() else {
-        return Err(anyhow!(
-            "invalid_arguments: skill remove requires name@version"
-        ));
+        return Err(anyhow!("invalid_arguments: skill remove requires name@version"));
     };
     let registry_dir = resolve_skill_registry_dir(root, registry);
     let removed =
@@ -2225,7 +2835,8 @@ fn skill_remove_command(
         "ok": true,
         "command": "remove",
         "registry": registry_dir.to_string_lossy().to_string(),
-        "removed": removed,
+        "removed": true,
+        "entry": removed,
     }))
 }
 
@@ -2241,16 +2852,12 @@ fn skill_resolve_command(
     skill_max_active: Option<usize>,
     refresh_skill_snapshot: bool,
 ) -> Result<serde_json::Value> {
-    let registry_dir = resolve_run_skill_registry_dir(
-        root,
-        registry,
-        !skills.is_empty() || !disabled_skills.is_empty(),
-    );
+    let registry_dir =
+        resolve_run_skill_registry_dir(root, registry, !skills.is_empty() || !disabled_skills.is_empty());
     let mut diagnostics = deepagents::skills::SkillsDiagnostics::default();
     if let Some(registry_dir) = registry_dir.as_deref() {
-        let loaded = deepagents::skills::registry::registry_loaded_skills(std::path::Path::new(
-            registry_dir,
-        ))?;
+        let loaded =
+            deepagents::skills::registry::registry_loaded_skills(std::path::Path::new(registry_dir))?;
         diagnostics.records.extend(loaded.diagnostics.records);
         diagnostics.overrides.extend(loaded.diagnostics.overrides);
     }
@@ -2297,6 +2904,7 @@ fn skill_resolve_command(
             "skipped": snapshot.as_ref().map(|value| value.selection.skipped.len()).unwrap_or(0),
             "candidates": snapshot.as_ref().map(|value| value.selection.candidates.len()).unwrap_or(0),
         },
+        "selection": snapshot.as_ref().map(|value| value.selection.clone()),
         "snapshot": snapshot,
         "diagnostics": diagnostics,
     }))
@@ -2327,10 +2935,7 @@ fn skill_audit_command(root: &str, thread_id: &str) -> Result<serde_json::Value>
 }
 
 /// Ensures every CLI `run` invocation carries a stable thread ID in state.
-fn ensure_cli_thread_id(
-    state: &mut deepagents::state::AgentState,
-    explicit: Option<&str>,
-) -> String {
+fn ensure_cli_thread_id(state: &mut deepagents::state::AgentState, explicit: Option<&str>) -> String {
     if let Some(thread_id) = explicit {
         state.extra.insert(
             "thread_id".to_string(),
@@ -2338,11 +2943,7 @@ fn ensure_cli_thread_id(
         );
         return thread_id.to_string();
     }
-    if let Some(thread_id) = state
-        .extra
-        .get("thread_id")
-        .and_then(|value| value.as_str())
-    {
+    if let Some(thread_id) = state.extra.get("thread_id").and_then(|value| value.as_str()) {
         return thread_id.to_string();
     }
     let generated = format!("thread-{}", now_ms());
@@ -2353,8 +2954,8 @@ fn ensure_cli_thread_id(
     generated
 }
 
-/// Persists run state and writes a thread-scoped skill audit record whenever a
-/// run produced skill-selection data.
+/// Persists run state and writes a thread-scoped skill audit record for every
+/// run so post-run audit lookup remains stable even when no skills were loaded.
 fn persist_run_state_and_skill_audit(
     state_file: Option<&str>,
     root: &str,
@@ -2380,11 +2981,6 @@ fn persist_run_state_and_skill_audit(
         .get(deepagents::skills::SKILLS_DIAGNOSTICS_KEY)
         .cloned();
     let trace_skills = trace.and_then(|trace| trace.get("skills")).cloned();
-    if snapshot.is_none() && selection.is_none() && diagnostics.is_none() && trace_skills.is_none()
-    {
-        return Ok(());
-    }
-
     let path = skill_audit_path(root, thread_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2419,6 +3015,7 @@ fn handle_skill_command(
             Ok(())
         }
         Err(error) => {
+            eprintln!("{}", format_error_chain(&error));
             print_json_value(skill_command_error_output(command, &error), pretty)?;
             std::process::exit(1);
         }
@@ -2688,9 +3285,6 @@ fn build_run_overrides(
     memory_source: &[String],
     memory_allow_host_paths: bool,
     memory_max_injected_chars: Option<usize>,
-    memory_max_source_bytes: Option<usize>,
-    memory_strict: Option<bool>,
-    memory_runtime_mode: Option<&str>,
     memory_disable: bool,
     max_steps: Option<usize>,
     provider_timeout_ms: Option<u64>,
@@ -2756,27 +3350,6 @@ fn build_run_overrides(
             &mut overrides,
             "memory.file.max_injected_chars",
             ConfigValue::Integer(max_chars as i64),
-        )?;
-    }
-    if let Some(max_source_bytes) = memory_max_source_bytes {
-        insert_override(
-            &mut overrides,
-            "memory.file.max_source_bytes",
-            ConfigValue::Integer(max_source_bytes as i64),
-        )?;
-    }
-    if let Some(strict) = memory_strict {
-        insert_override(
-            &mut overrides,
-            "memory.file.strict",
-            ConfigValue::Boolean(strict),
-        )?;
-    }
-    if let Some(runtime_mode) = memory_runtime_mode {
-        insert_override(
-            &mut overrides,
-            "memory.file.runtime_mode",
-            ConfigValue::String(runtime_mode.to_string()),
         )?;
     }
     if memory_disable {

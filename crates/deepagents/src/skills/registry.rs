@@ -68,6 +68,17 @@ pub fn install_sources_into_registry(
         if !source_path.exists() || !source_path.is_dir() {
             return Err(anyhow!("invalid_source: {}", source));
         }
+        if source_path.join("SKILL.md").exists() {
+            install_skill_dir_into_registry(
+                &mut registry,
+                &mut report,
+                registry_dir,
+                &source_path,
+                source,
+                &options,
+            )?;
+            continue;
+        }
         let mut entries = std::fs::read_dir(&source_path)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -76,69 +87,14 @@ pub fn install_sources_into_registry(
             if !path.is_dir() {
                 continue;
             }
-            let source_name = source_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or(source);
-            let mut package = load_skill_dir(
+            install_skill_dir_into_registry(
+                &mut registry,
+                &mut report,
+                registry_dir,
                 &path,
-                source_name,
-                SkillValidationOptions {
-                    strict: options.strict,
-                    allow_versionless_compat: false,
-                },
+                source,
+                &options,
             )?;
-            package.governance = review_skill_package(&package);
-            let hash = compute_package_hash(&path)?;
-            let lifecycle =
-                if package.governance.status == crate::skills::SkillGovernanceStatus::Fail {
-                    SkillLifecycleState::Quarantined
-                } else if package.manifest.default_enabled {
-                    SkillLifecycleState::Enabled
-                } else {
-                    SkillLifecycleState::Disabled
-                };
-
-            match registry
-                .entries
-                .iter()
-                .position(|entry| entry.identity == package.manifest.identity)
-            {
-                Some(index) => {
-                    if registry.entries[index].content_hash != hash {
-                        return Err(anyhow!(
-                            "registry_conflict: {} already installed with different content hash",
-                            package.manifest.identity.as_key()
-                        ));
-                    }
-                    report.unchanged.push(registry.entries[index].clone());
-                }
-                None => {
-                    let install_dir = registry_package_dir(
-                        registry_dir,
-                        &package.manifest.identity.name,
-                        &package.manifest.identity.version,
-                    );
-                    copy_dir_all(&path, &install_dir)?;
-                    let entry = SkillRegistryEntry {
-                        identity: package.manifest.identity.clone(),
-                        manifest: package.manifest.clone(),
-                        package_path: install_dir.to_string_lossy().to_string(),
-                        content_hash: hash,
-                        installed_from: vec![source.to_string()],
-                        installed_at_ms: Utc::now().timestamp_millis(),
-                        lifecycle,
-                        lifecycle_reason: if lifecycle == SkillLifecycleState::Quarantined {
-                            Some("semantic_review_failed".to_string())
-                        } else {
-                            None
-                        },
-                        governance: package.governance.clone(),
-                    };
-                    registry.entries.push(entry.clone());
-                    report.installed.push(entry);
-                }
-            }
         }
     }
 
@@ -152,11 +108,94 @@ pub fn install_sources_into_registry(
     Ok(report)
 }
 
+/// Installs one validated skill directory into the registry.
+fn install_skill_dir_into_registry(
+    registry: &mut SkillRegistry,
+    report: &mut SkillInstallReport,
+    registry_dir: &Path,
+    path: &Path,
+    source: &str,
+    options: &SkillsLoadOptions,
+) -> Result<()> {
+    let source_name = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or(source);
+    let mut package = load_skill_dir(
+        path,
+        source_name,
+        SkillValidationOptions {
+            strict: options.strict,
+            allow_versionless_compat: false,
+        },
+    )?;
+    package.governance = review_skill_package(&package);
+    let hash = compute_package_hash(path)?;
+    let lifecycle = if package.governance.status == crate::skills::SkillGovernanceStatus::Fail {
+        SkillLifecycleState::Quarantined
+    } else if package.manifest.default_enabled {
+        SkillLifecycleState::Enabled
+    } else {
+        SkillLifecycleState::Disabled
+    };
+
+    match registry
+        .entries
+        .iter()
+        .position(|entry| entry.identity == package.manifest.identity)
+    {
+        Some(index) => {
+            if registry.entries[index].content_hash != hash {
+                return Err(anyhow!(
+                    "registry_conflict: {} already installed with different content hash",
+                    package.manifest.identity.as_key()
+                ));
+            }
+            report.unchanged.push(registry.entries[index].clone());
+        }
+        None => {
+            let install_dir = registry_package_dir(
+                registry_dir,
+                &package.manifest.identity.name,
+                &package.manifest.identity.version,
+            );
+            copy_dir_all(path, &install_dir)?;
+
+            // Keep a versionless compatibility mirror for CLI/E2E callers that
+            // expect one package directory per skill directly under the registry.
+            let legacy_dir = registry_dir.join(&package.manifest.identity.name);
+            if legacy_dir.exists() {
+                std::fs::remove_dir_all(&legacy_dir)?;
+            }
+            copy_dir_all(path, &legacy_dir)?;
+
+            let entry = SkillRegistryEntry {
+                identity: package.manifest.identity.clone(),
+                manifest: package.manifest.clone(),
+                package_path: install_dir.to_string_lossy().to_string(),
+                content_hash: hash,
+                installed_from: vec![source.to_string()],
+                installed_at_ms: Utc::now().timestamp_millis(),
+                lifecycle,
+                lifecycle_reason: if lifecycle == SkillLifecycleState::Quarantined {
+                    Some("semantic_review_failed".to_string())
+                } else {
+                    None
+                },
+                governance: package.governance.clone(),
+            };
+            registry.entries.push(entry.clone());
+            report.installed.push(entry);
+        }
+    }
+
+    Ok(())
+}
+
 /// Loads installed registry packages together with the registry metadata that
 /// controls lifecycle behavior.
-pub fn load_registry_packages(
-    registry_dir: &Path,
-) -> Result<Vec<(SkillRegistryEntry, SkillPackage)>> {
+pub fn load_registry_packages(registry_dir: &Path) -> Result<Vec<(SkillRegistryEntry, SkillPackage)>> {
     let registry = load_registry(registry_dir)?;
     let mut out = Vec::new();
     for entry in registry.entries {
@@ -244,11 +283,7 @@ pub fn set_registry_lifecycle(
 }
 
 /// Removes a versioned package from the registry and deletes the installed files.
-pub fn remove_registry_entry(
-    registry_dir: &Path,
-    name: &str,
-    version: &str,
-) -> Result<SkillRegistryEntry> {
+pub fn remove_registry_entry(registry_dir: &Path, name: &str, version: &str) -> Result<SkillRegistryEntry> {
     let mut registry = load_registry(registry_dir)?;
     let Some(index) = registry
         .entries
@@ -261,6 +296,10 @@ pub fn remove_registry_entry(
     let package_dir = PathBuf::from(&entry.package_path);
     if package_dir.exists() {
         std::fs::remove_dir_all(&package_dir)?;
+    }
+    let legacy_dir = registry_dir.join(name);
+    if legacy_dir.exists() {
+        std::fs::remove_dir_all(&legacy_dir)?;
     }
     save_registry(registry_dir, &registry)?;
     Ok(entry)
@@ -277,17 +316,14 @@ pub fn registry_loaded_skills(registry_dir: &Path) -> Result<LoadedSkills> {
         }
         loaded.packages.push(package.clone());
         for finding in &package.governance.findings {
-            loaded
-                .diagnostics
-                .records
-                .push(crate::skills::SkillDiagnosticRecord {
-                    name: package.manifest.identity.name.clone(),
-                    version: package.manifest.identity.version.clone(),
-                    source: package.manifest.source.clone(),
-                    severity: format!("{:?}", finding.severity).to_ascii_lowercase(),
-                    code: finding.code.clone(),
-                    message: finding.message.clone(),
-                });
+            loaded.diagnostics.records.push(crate::skills::SkillDiagnosticRecord {
+                name: package.manifest.identity.name.clone(),
+                version: package.manifest.identity.version.clone(),
+                source: package.manifest.source.clone(),
+                severity: format!("{:?}", finding.severity).to_ascii_lowercase(),
+                code: finding.code.clone(),
+                message: finding.message.clone(),
+            });
         }
     }
     loaded.canonicalize();
@@ -325,10 +361,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(anyhow!(
-                "registry_install_symlink_not_allowed: {}",
-                entry.path().display()
-            ));
+            return Err(anyhow!("registry_install_symlink_not_allowed: {}", entry.path().display()));
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
@@ -350,10 +383,7 @@ fn compute_package_hash(root: &Path) -> Result<String> {
             continue;
         }
         if entry.file_type().is_symlink() {
-            return Err(anyhow!(
-                "registry_install_symlink_not_allowed: {}",
-                entry.path().display()
-            ));
+            return Err(anyhow!("registry_install_symlink_not_allowed: {}", entry.path().display()));
         }
         let relative = entry.path().strip_prefix(root)?.to_string_lossy();
         hasher.update(relative.as_bytes());

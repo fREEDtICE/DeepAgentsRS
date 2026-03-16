@@ -633,7 +633,10 @@ async fn pc_03_tools_change_causes_l1_miss() {
         steps: vec![],
         policy: deepagents::skills::SkillToolPolicy::default(),
         skill_name: "s".to_string(),
+        skill_version: "0.0.0".to_string(),
         source: "x".to_string(),
+        requires_isolation: false,
+        subagent_type: None,
     };
     state2.extra.insert(
         "skills_tools".to_string(),

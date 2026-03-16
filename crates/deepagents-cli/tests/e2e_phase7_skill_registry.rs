@@ -269,8 +269,8 @@ fn phase7_skill_registry_install_status_versions_and_lifecycle_are_scriptable() 
     assert!(status.success(), "stderr={stderr}");
     assert_eq!(
         remove_json
-            .get("removed")
-            .and_then(|removed| removed.get("identity"))
+            .get("entry")
+            .and_then(|entry| entry.get("identity"))
             .and_then(|identity| identity.get("version"))
             .and_then(|version| version.as_str()),
         Some("0.1.0")
