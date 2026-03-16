@@ -16,17 +16,20 @@ use chrono::{DateTime, Utc};
 
 use crate::memory::protocol::{
     MemoryEntry, MemoryError, MemoryErrorCode, MemoryEvictionPolicy, MemoryEvictionReport,
-    MemoryPolicy, MemoryQuery, MemoryScope, MemoryStatus, MemoryStore,
+    MemoryPolicy, MemoryQuery, MemoryStatus, MemoryStore, MemoryType,
 };
+
+const MEMORY_FILE_VERSION: u32 = 2;
+const COMPAT_SCOPE_ID: &str = "__compat_workspace__";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-/// 持久化文件的 v1 版本格式。
+/// 持久化文件格式。
 ///
-/// - version：用于向前/向后兼容（目前仅支持 1）
+/// - version：用于向前/向后兼容（目前支持 1 和 2）
 /// - policy：与文件绑定的策略快照
 /// - entries：条目列表
-struct MemoryFileV1 {
+struct MemoryFile {
     version: u32,
     policy: MemoryPolicy,
     #[serde(default)]
@@ -104,7 +107,7 @@ impl FileMemoryStore {
             let guard = self.state.lock().unwrap();
             guard.entries.clone()
         };
-        let md = render_agents_md_v1(&entries);
+        let md = render_agents_md_v2(&entries);
         write_atomic(&self.agents_md_path, md.as_bytes())
             .await
             .map_err(|e| {
@@ -122,20 +125,25 @@ impl FileMemoryStore {
 
         let (policy, entries) = match read_file_bytes(&self.path).await {
             Ok(Some(bytes)) => {
-                let f: MemoryFileV1 = serde_json::from_slice(&bytes).map_err(|e| {
+                let f: MemoryFile = serde_json::from_slice(&bytes).map_err(|e| {
                     MemoryError::new(
                         MemoryErrorCode::Corrupt,
                         "failed to parse memory store file",
                     )
                     .with_source(anyhow::Error::new(e))
                 })?;
-                if f.version != 1 {
+                if !(1..=MEMORY_FILE_VERSION).contains(&f.version) {
                     return Err(MemoryError::new(
                         MemoryErrorCode::Corrupt,
                         format!("unsupported_version: {}", f.version),
                     ));
                 }
-                (f.policy, f.entries)
+                let entries = f
+                    .entries
+                    .into_iter()
+                    .map(Self::normalize_loaded_entry)
+                    .collect();
+                (f.policy, entries)
             }
             Ok(None) => (self.default_policy.clone(), Vec::new()),
             Err(e) => {
@@ -165,17 +173,24 @@ impl FileMemoryStore {
     fn entry_size_bytes(e: &MemoryEntry) -> usize {
         e.key.len()
             + e.value.len()
-            + e.title.as_deref().map(str::len).unwrap_or(0)
-            + e.scope_id.as_deref().map(str::len).unwrap_or(0)
-            + e.supersedes.as_deref().map(str::len).unwrap_or(0)
-            + e.owner_user_id.as_deref().map(str::len).unwrap_or(0)
-            + e.owner_workspace_id.as_deref().map(str::len).unwrap_or(0)
-            + e.owner_channel_account_id.as_deref().map(str::len).unwrap_or(0)
+            + e.memory_id.len()
+            + e.scope_id.len()
+            + e.title.len()
+            + e.author.len()
+            + e.source
+                .message_ids
+                .iter()
+                .map(|id| id.len())
+                .sum::<usize>()
             + e.tags.iter().map(|t| t.len()).sum::<usize>()
             + e.created_at.len()
             + e.updated_at.len()
             + e.last_accessed_at.len()
-            + 16
+            + e.valid_from.len()
+            + e.valid_to.as_ref().map_or(0, |value| value.len())
+            + e.supersedes.as_ref().map_or(0, |value| value.len())
+            + e.embedding_ref.as_ref().map_or(0, |value| value.len())
+            + 64
     }
 
     fn bytes_total(entries: &[MemoryEntry]) -> usize {
@@ -189,8 +204,15 @@ impl FileMemoryStore {
             .map(|dt| dt.with_timezone(&Utc))
     }
 
-    /// 查询匹配：所有已设置条件都必须同时满足。
+    /// 查询匹配：prefix 与 tag 同时存在时必须都满足。
     fn matches_query(e: &MemoryEntry, q: &MemoryQuery) -> bool {
+        if let Some(status) = q.status {
+            if e.status != status {
+                return false;
+            }
+        } else if !q.include_inactive && !e.is_active() {
+            return false;
+        }
         if let Some(prefix) = &q.prefix {
             if !e.key.starts_with(prefix) {
                 return false;
@@ -201,13 +223,13 @@ impl FileMemoryStore {
                 return false;
             }
         }
-        if let Some(scope) = q.scope {
-            if e.scope != scope {
+        if let Some(scope_type) = q.scope_type {
+            if e.scope_type != scope_type {
                 return false;
             }
         }
         if let Some(scope_id) = &q.scope_id {
-            if e.scope_id.as_deref() != Some(scope_id.as_str()) {
+            if &e.scope_id != scope_id {
                 return false;
             }
         }
@@ -221,49 +243,148 @@ impl FileMemoryStore {
                 return false;
             }
         }
-        if let Some(status) = q.status {
-            if e.status != status {
-                return false;
-            }
-        } else if !q.include_inactive && e.status != MemoryStatus::Active {
-            return false;
-        }
-        Self::is_visible_to_actor(e, q)
+        true
     }
 
-    /// Scope-aware access control for query/list operations.
-    ///
-    /// The file store keeps this logic local so every CLI command sees one
-    /// consistent visibility policy.
-    fn is_visible_to_actor(e: &MemoryEntry, q: &MemoryQuery) -> bool {
-        match e.scope {
-            MemoryScope::User => match e.owner_user_id.as_deref() {
-                Some(owner) => {
-                    if let Some(actor) = q.actor_user_id.as_deref() {
-                        owner == actor
-                    } else if let Some(actor) = q.actor_channel_account_id.as_deref() {
-                        e.owner_channel_account_id.as_deref() == Some(actor)
+    fn default_memory_id(key: &str) -> String {
+        let mut id = String::from("mem_");
+        for ch in key.chars() {
+            if ch.is_ascii_alphanumeric() {
+                id.push(ch.to_ascii_lowercase());
+            } else {
+                id.push('_');
+            }
+        }
+        id
+    }
+
+    fn normalize_loaded_entry(mut entry: MemoryEntry) -> MemoryEntry {
+        let now = Self::now_rfc3339();
+        if entry.memory_id.is_empty() {
+            entry.memory_id = Self::default_memory_id(&entry.key);
+        }
+        if entry.scope_id.is_empty() {
+            entry.scope_id = COMPAT_SCOPE_ID.to_string();
+        }
+        if entry.title.is_empty() {
+            entry.title = entry.key.clone();
+        }
+        if entry.author.is_empty() {
+            entry.author = "system".to_string();
+        }
+        if entry.created_at.is_empty() {
+            entry.created_at = now.clone();
+        }
+        if entry.updated_at.is_empty() {
+            entry.updated_at = entry.created_at.clone();
+        }
+        if entry.last_accessed_at.is_empty() {
+            entry.last_accessed_at = entry.updated_at.clone();
+        }
+        if entry.valid_from.is_empty() {
+            entry.valid_from = entry.created_at.clone();
+        }
+        if entry.valid_to.is_none() && !entry.is_active() {
+            entry.valid_to = Some(entry.updated_at.clone());
+        }
+        if entry.pinned && entry.memory_type == MemoryType::Semantic {
+            entry.memory_type = MemoryType::Pinned;
+        }
+        entry
+    }
+
+    fn prepare_entry(mut entry: MemoryEntry, now: &str) -> MemoryEntry {
+        if entry.memory_id.is_empty() {
+            entry.memory_id = Self::default_memory_id(&entry.key);
+        }
+        if entry.scope_id.is_empty() {
+            entry.scope_id = COMPAT_SCOPE_ID.to_string();
+        }
+        if entry.title.is_empty() {
+            entry.title = entry.key.clone();
+        }
+        if entry.author.is_empty() {
+            entry.author = "system".to_string();
+        }
+        if entry.created_at.is_empty() {
+            entry.created_at = now.to_string();
+        }
+        if entry.updated_at.is_empty() {
+            entry.updated_at = now.to_string();
+        }
+        if entry.last_accessed_at.is_empty() {
+            entry.last_accessed_at = now.to_string();
+        }
+        if entry.valid_from.is_empty() {
+            entry.valid_from = entry.created_at.clone();
+        }
+        if entry.access_count == 0 {
+            entry.access_count = 1;
+        }
+        if entry.pinned && entry.memory_type == MemoryType::Semantic {
+            entry.memory_type = MemoryType::Pinned;
+        }
+        if entry.status == MemoryStatus::Deleted && entry.valid_to.is_none() {
+            entry.valid_to = Some(now.to_string());
+        }
+        entry
+    }
+
+    fn is_tombstoned(entry: &MemoryEntry) -> bool {
+        !entry.is_active()
+    }
+
+    fn eviction_candidate_index(
+        entries: &[MemoryEntry],
+        policy: &MemoryPolicy,
+        over_entries: bool,
+        over_bytes: bool,
+    ) -> Option<usize> {
+        let tombstone_idx = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| Self::is_tombstoned(entry))
+            .min_by_key(|(_, entry)| Self::parse_ts(&entry.updated_at).unwrap_or_else(Utc::now))
+            .map(|(idx, _)| idx);
+        if tombstone_idx.is_some() {
+            return tombstone_idx;
+        }
+
+        match policy.eviction {
+            MemoryEvictionPolicy::Fifo if over_entries || over_bytes => entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| Self::parse_ts(&e.created_at).unwrap_or_else(Utc::now))
+                .map(|(i, _)| i),
+            MemoryEvictionPolicy::Lru if over_entries || over_bytes => entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| Self::parse_ts(&e.last_accessed_at).unwrap_or_else(Utc::now))
+                .map(|(i, _)| i),
+            MemoryEvictionPolicy::Ttl { ttl_secs } => {
+                let cutoff = Utc::now() - chrono::Duration::seconds(ttl_secs as i64);
+                let mut ttl_candidates: Vec<(usize, DateTime<Utc>)> = entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| Self::parse_ts(&e.updated_at).map(|t| (i, t)))
+                    .filter(|(_, t)| *t < cutoff)
+                    .collect();
+                ttl_candidates.sort_by_key(|(_, t)| *t);
+                ttl_candidates.first().map(|(i, _)| *i).or_else(|| {
+                    if over_entries || over_bytes {
+                        entries
+                            .iter()
+                            .enumerate()
+                            .min_by_key(|(_, e)| {
+                                Self::parse_ts(&e.updated_at).unwrap_or_else(Utc::now)
+                            })
+                            .map(|(i, _)| i)
                     } else {
-                        false
+                        None
                     }
-                }
-                None => true,
-            },
-            MemoryScope::Thread => match e.scope_id.as_deref() {
-                Some(thread_id) => {
-                    let actor_thread = q
-                        .actor_thread_id
-                        .as_deref()
-                        .or(q.scope_id.as_deref());
-                    actor_thread == Some(thread_id)
-                }
-                None => true,
-            },
-            MemoryScope::Workspace => match e.owner_workspace_id.as_deref() {
-                Some(workspace_id) => q.actor_workspace_id.as_deref() == Some(workspace_id),
-                None => true,
-            },
-            MemoryScope::System => true,
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -275,12 +396,24 @@ impl MemoryStore for FileMemoryStore {
     }
 
     fn policy(&self) -> MemoryPolicy {
-        self.default_policy.clone()
+        let guard = self.state.lock().unwrap();
+        if guard.loaded {
+            guard.policy.clone()
+        } else {
+            self.default_policy.clone()
+        }
     }
 
     /// 显式触发加载（通常也会在首次读写时自动触发）。
     async fn load(&self) -> Result<(), MemoryError> {
         self.ensure_loaded().await
+    }
+
+    async fn set_policy(&self, policy: MemoryPolicy) -> Result<(), MemoryError> {
+        self.ensure_loaded().await?;
+        let mut guard = self.state.lock().unwrap();
+        guard.policy = policy;
+        Ok(())
     }
 
     /// 将当前状态刷盘为 JSON。
@@ -298,8 +431,8 @@ impl MemoryStore for FileMemoryStore {
             })?;
         }
 
-        let f = MemoryFileV1 {
-            version: 1,
+        let f = MemoryFile {
+            version: MEMORY_FILE_VERSION,
             policy,
             entries,
         };
@@ -317,48 +450,39 @@ impl MemoryStore for FileMemoryStore {
     ///
     /// - 对同 key 的条目执行覆盖更新，并更新时间/访问统计字段
     /// - 写入后会按策略执行淘汰，确保不超过配额
-    async fn put(&self, mut entry: MemoryEntry) -> Result<(), MemoryError> {
+    async fn put(&self, entry: MemoryEntry) -> Result<(), MemoryError> {
+        let _ = self.put_with_report(entry).await?;
+        Ok(())
+    }
+
+    async fn put_with_report(
+        &self,
+        mut entry: MemoryEntry,
+    ) -> Result<MemoryEvictionReport, MemoryError> {
         self.ensure_loaded().await?;
         {
             let mut guard = self.state.lock().unwrap();
             let now = Self::now_rfc3339();
-            if entry.created_at.is_empty() {
-                entry.created_at = now.clone();
-            }
-            if entry.updated_at.is_empty() {
-                entry.updated_at = now.clone();
-            }
-            if entry.last_accessed_at.is_empty() {
-                entry.last_accessed_at = now.clone();
-            }
-            if entry.access_count == 0 {
-                entry.access_count = 1;
-            }
+            entry = Self::prepare_entry(entry, &now);
 
             if let Some(existing) = guard.entries.iter_mut().find(|e| e.key == entry.key) {
-                existing.value = entry.value;
-                existing.title = entry.title;
-                existing.scope = entry.scope;
-                existing.scope_id = entry.scope_id;
-                existing.memory_type = entry.memory_type;
-                existing.pinned = entry.pinned;
-                existing.status = entry.status;
-                existing.confidence = entry.confidence;
-                existing.salience = entry.salience;
-                existing.supersedes = entry.supersedes;
-                existing.owner_user_id = entry.owner_user_id;
-                existing.owner_workspace_id = entry.owner_workspace_id;
-                existing.owner_channel_account_id = entry.owner_channel_account_id;
-                existing.tags = entry.tags;
+                let memory_id = existing.memory_id.clone();
+                let created_at = existing.created_at.clone();
+                let access_count = existing.access_count.saturating_add(1);
+                let mut replacement = entry;
+                replacement.memory_id = memory_id;
+                replacement.created_at = created_at;
                 existing.updated_at = now.clone();
-                existing.last_accessed_at = now;
-                existing.access_count = existing.access_count.saturating_add(1);
+                replacement.last_accessed_at = now;
+                replacement.access_count = access_count;
+                replacement.status = MemoryStatus::Active;
+                replacement.valid_to = None;
+                *existing = replacement;
             } else {
                 guard.entries.push(entry);
             }
         }
-        let _ = self.evict_if_needed().await?;
-        Ok(())
+        self.evict_if_needed().await
     }
 
     /// 获取条目（命中则更新 last_accessed_at 与 access_count）。
@@ -367,11 +491,20 @@ impl MemoryStore for FileMemoryStore {
         let mut guard = self.state.lock().unwrap();
         let now = Self::now_rfc3339();
         if let Some(e) = guard.entries.iter_mut().find(|e| e.key == key) {
+            if !e.is_active() {
+                return Ok(None);
+            }
             e.last_accessed_at = now;
             e.access_count = e.access_count.saturating_add(1);
             return Ok(Some(e.clone()));
         }
         Ok(None)
+    }
+
+    async fn inspect(&self, key: &str) -> Result<Option<MemoryEntry>, MemoryError> {
+        self.ensure_loaded().await?;
+        let guard = self.state.lock().unwrap();
+        Ok(guard.entries.iter().find(|entry| entry.key == key).cloned())
     }
 
     /// 查询条目：
@@ -402,7 +535,32 @@ impl MemoryStore for FileMemoryStore {
                 e.access_count = e.access_count.saturating_add(1);
             }
         }
+        for entry in &mut out {
+            if let Some(updated) = guard
+                .entries
+                .iter()
+                .find(|candidate| candidate.key == entry.key)
+            {
+                *entry = updated.clone();
+            }
+        }
         Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> Result<bool, MemoryError> {
+        self.ensure_loaded().await?;
+        let mut guard = self.state.lock().unwrap();
+        let now = Self::now_rfc3339();
+        if let Some(entry) = guard.entries.iter_mut().find(|entry| entry.key == key) {
+            if entry.status == MemoryStatus::Deleted {
+                return Ok(false);
+            }
+            entry.status = MemoryStatus::Deleted;
+            entry.updated_at = now.clone();
+            entry.valid_to = Some(now);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// 按策略淘汰直到满足 max_entries 与 max_bytes_total。
@@ -422,42 +580,14 @@ impl MemoryStore for FileMemoryStore {
             let bytes_total = Self::bytes_total(&guard.entries);
             let over_entries = guard.entries.len() > policy.max_entries;
             let over_bytes = bytes_total > policy.max_bytes_total;
-            if !over_entries && !over_bytes {
-                break;
-            }
             if guard.entries.is_empty() {
                 break;
             }
 
-            let idx = match policy.eviction {
-                MemoryEvictionPolicy::Fifo => guard
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| Self::parse_ts(&e.created_at).unwrap_or_else(Utc::now))
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-                MemoryEvictionPolicy::Lru => guard
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, e)| {
-                        Self::parse_ts(&e.last_accessed_at).unwrap_or_else(Utc::now)
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(0),
-                MemoryEvictionPolicy::Ttl { ttl_secs } => {
-                    let cutoff = Utc::now() - chrono::Duration::seconds(ttl_secs as i64);
-                    let mut ttl_candidates: Vec<(usize, DateTime<Utc>)> = guard
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, e)| Self::parse_ts(&e.updated_at).map(|t| (i, t)))
-                        .filter(|(_, t)| *t < cutoff)
-                        .collect();
-                    ttl_candidates.sort_by_key(|(_, t)| *t);
-                    ttl_candidates.first().map(|(i, _)| *i).unwrap_or(0)
-                }
+            let idx =
+                Self::eviction_candidate_index(&guard.entries, &policy, over_entries, over_bytes);
+            let Some(idx) = idx else {
+                break;
             };
             let removed = guard.entries.remove(idx);
             evicted_keys.push(removed.key);
@@ -476,22 +606,23 @@ impl MemoryStore for FileMemoryStore {
     }
 }
 
-/// 把 memory entries 渲染为 AGENTS.md 的 v1 片段。
-fn render_agents_md_v1(entries: &[MemoryEntry]) -> String {
+/// 把 memory entries 渲染为 AGENTS.md 的兼容导出片段。
+fn render_agents_md_v2(entries: &[MemoryEntry]) -> String {
     let mut buf = String::new();
-    buf.push_str("<auto_generated_memory_v1>\n");
+    buf.push_str("<auto_generated_memory_v2>\n");
     buf.push_str("This section is generated from memory_store.json.\n\n");
-    for e in entries {
-        if e.status != MemoryStatus::Active {
-            continue;
-        }
+    for e in entries.iter().filter(|entry| entry.is_active()) {
         buf.push_str("## ");
-        buf.push_str(&e.key);
+        buf.push_str(&e.title);
         buf.push('\n');
+        buf.push_str(&format!(
+            "key: {}\nscope: {:?}/{}\ntype: {:?}\nprivacy: {:?}\npinned: {}\n\n",
+            e.key, e.scope_type, e.scope_id, e.memory_type, e.privacy_level, e.pinned
+        ));
         buf.push_str(e.value.trim());
         buf.push_str("\n\n");
     }
-    buf.push_str("</auto_generated_memory_v1>\n");
+    buf.push_str("</auto_generated_memory_v2>\n");
     buf
 }
 

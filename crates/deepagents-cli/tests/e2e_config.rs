@@ -50,10 +50,9 @@ fn e2e_config_set_get_and_doctor() {
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["key"], "providers.openai-compatible.api_key_env");
-    assert!(value["value"].is_null());
+    assert_eq!(value["value"], env_name);
     assert_eq!(value["secret_status"], "set");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains(env_name));
     assert!(!stdout.contains("sk-secret-should-not-print"));
 
     let out = Command::new(bin)

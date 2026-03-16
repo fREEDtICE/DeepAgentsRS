@@ -5,12 +5,24 @@
 //!
 //! 对外主要通过 re-export 暴露稳定 API，减少上层对内部文件布局的耦合。
 
+pub mod access;
+pub mod identity;
 pub mod protocol;
+pub mod retrieval;
 pub mod store_file;
 
+pub use access::{can_access_scope, can_read_entry, can_write_scope, filter_readable_entries};
+pub use identity::{
+    LocalIdentityResolver, MemoryActorInput, MemoryIdentityResolver, ResolvedMemoryActor,
+};
 pub use protocol::{
     MemoryDiagnostics, MemoryEntry, MemoryError, MemoryErrorCode, MemoryEvictionPolicy,
-    MemoryEvictionReport, MemoryPolicy, MemoryQuery, MemoryScope, MemoryStatus, MemoryStore,
-    MemoryType,
+    MemoryEvictionReport, MemoryPolicy, MemoryPrivacyLevel, MemoryQuery, MemoryRuntimeMode,
+    MemoryScopeType, MemorySource, MemorySourceKind, MemoryStatus, MemoryStore, MemoryType,
+};
+pub use retrieval::{
+    build_memory_pack, render_memory_pack, MemoryIntent, MemoryPack, MemoryPackItem,
+    MemoryPackSection, MemoryRetrievalActorView, MemoryRetrievalDiagnostics,
+    MemorySelectionDiagnostic, RetrievalQueryPlan,
 };
 pub use store_file::FileMemoryStore;
