@@ -867,6 +867,10 @@ async fn main() -> Result<()> {
             stream_events,
             pretty,
         } => {
+            let canonical_provider = canonical_provider_id(&provider);
+            if matches!(canonical_provider, "openai-compatible" | "openrouter") && model.is_none() {
+                return Err(anyhow!("--model is required for --provider {canonical_provider}"));
+            }
             let mut overrides = root_overrides.clone();
             overrides.extend(build_run_overrides(
                 &provider,
